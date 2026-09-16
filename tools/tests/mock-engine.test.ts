@@ -1,6 +1,27 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type {
+  CatalogImportResult,
+  CatalogListResult,
+  CatalogRemoveResult,
+  CatalogThumbnailsResult,
+  EngineHelloResult,
+  OpsDescribeResult,
+  StackChangedParams,
+  StackGetResult,
+  CatalogPhoto,
+  JobCancelResult,
+  JobProgressParams,
+  PhotoOpenResult,
+  PythonFinishedParams,
+  PythonRunResult,
+  ViewOpenResult,
+  ViewRenderResult,
+} from "@latent/protocol";
 import { FRAME_HEADER_BYTES } from "@latent/protocol";
-import { PhotoState, renderFrame } from "../mock-engine";
+import { PhotoState, renderFrame, startMockEngine } from "../mock-engine";
 
 function exposureOf(photo: PhotoState): number {
   const entry = photo.stack.find((candidate) => candidate.op === "exposure");
@@ -98,5 +119,517 @@ describe("frames", () => {
     photo.addOp("exposure", { value: 2 });
     const bright = new Uint8Array(renderFrame(8, 4, 2, 1, photo.stack), FRAME_HEADER_BYTES);
     expect(bright[0]).toBeGreaterThan(Number(dark[0]));
+  });
+});
+
+/** Minimal JSON-RPC client over the mock's socket, for the end-to-end catalog tests. */
+class TestClient {
+  readonly notifications: { method: string; params: Record<string, unknown> }[] = [];
+  readonly frames: ArrayBuffer[] = [];
+  private nextId = 1;
+  private readonly pending = new Map<number, (message: RpcReply) => void>();
+
+  private constructor(private readonly socket: WebSocket) {}
+
+  static async connect(port: number): Promise<TestClient> {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    socket.binaryType = "arraybuffer";
+    const client = new TestClient(socket);
+    socket.addEventListener("message", (event) => client.receive(event.data));
+    await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+    return client;
+  }
+
+  call<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    const id = this.nextId++;
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, (message) => {
+        if (message.error) reject(new Error(message.error.message));
+        else resolve(message.result as T);
+      });
+      this.socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    });
+  }
+
+  /** Resolves once a notification the predicate accepts has arrived. */
+  async waitFor<T = Record<string, unknown>>(
+    method: string,
+    accept: (params: Record<string, unknown>) => boolean,
+  ): Promise<T> {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const match = this.notifications.find(
+        (entry) => entry.method === method && accept(entry.params),
+      );
+      if (match) return match.params as T;
+      await Bun.sleep(10);
+    }
+    throw new Error(`no ${method} notification matched within 5s`);
+  }
+
+  close(): void {
+    this.socket.close();
+  }
+
+  private receive(data: unknown): void {
+    if (data instanceof ArrayBuffer) {
+      this.frames.push(data);
+      return;
+    }
+    const message: RpcReply = JSON.parse(String(data));
+    if (message.id !== undefined) {
+      this.pending.get(message.id)?.(message);
+      this.pending.delete(message.id);
+      return;
+    }
+    if (message.method)
+      this.notifications.push({ method: message.method, params: message.params ?? {} });
+  }
+}
+
+interface RpcReply {
+  id?: number;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: unknown;
+  error?: { message: string };
+}
+
+describe("catalog over the socket", () => {
+  test("import walks the directory, reports progress and ends with the photos listed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "latent-import-"));
+    for (const name of ["a.arw", "b.nef", "c.dng", "skip.txt"]) {
+      writeFileSync(join(root, name), "");
+    }
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const started = await client.call<{ jobId: number }>("catalog.import", { paths: [root] });
+      expect(started.jobId).toBeGreaterThan(0);
+
+      const finished = await client.waitFor("job.progress", (params) => params.finished === true);
+      expect(finished).toMatchObject({ jobId: started.jobId, kind: "import", total: 3, done: 3 });
+      await client.waitFor("catalog.changed", (params) => params.reason === "import");
+
+      const listed = await client.call<CatalogListResult>("catalog.list", { sort: "filename" });
+      expect(listed.total).toBe(3);
+      expect(listed.photos.map((photo) => photo.filename)).toEqual(["a.arw", "b.nef", "c.dng"]);
+
+      // photo.open on an imported file reuses that row's id.
+      const opened = await client.call<PhotoOpenResult>("photo.open", {
+        path: join(root, "a.arw"),
+      });
+      expect(opened.photoId).toBe(listed.photos[0]?.photoId ?? -1);
+
+      const rated = await client.call<CatalogPhoto>("catalog.setRating", {
+        photoId: opened.photoId,
+        rating: 4,
+      });
+      expect(rated.rating).toBe(4);
+      await client.waitFor("catalog.changed", (params) => params.reason === "rating");
+
+      const thumbnail = await client.call<{ width: number }>("catalog.thumbnail", {
+        photoId: opened.photoId,
+        size: 128,
+      });
+      expect(thumbnail.width).toBeGreaterThan(0);
+      expect(client.frames).toHaveLength(1);
+      const header = new DataView(client.frames[0] ?? new ArrayBuffer(0));
+      expect(header.getUint32(16, true)).toBe(opened.photoId);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("python.run applies an exposure assignment and publishes it as source python", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      const result = await client.call<PythonRunResult>("python.run", {
+        code: "latent.photo.develop.exposure = 1.0",
+        photoId: opened.photoId,
+      });
+      expect(result.ok).toBe(true);
+      expect(result.stdout).toContain("1.00");
+
+      const changed = await client.waitFor<StackChangedParams>(
+        "stack.changed",
+        (params) => params.source === "python",
+      );
+      expect(changed.stack[0]?.op).toBe("exposure");
+      expect(changed.stack[0]?.params.value).toBe(1);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("photo.open carries the catalog row, so no catalog.get follows it", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      expect(opened.catalog?.photoId).toBe(opened.photoId);
+      expect(opened.catalog?.filename).toBe("x.arw");
+      expect(opened.catalog?.camera).toBe(opened.camera);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("catalog.thumbnails sends one frame per photo and lists what it could not send", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const ids: number[] = [];
+      for (const name of ["a", "b", "c"]) {
+        const opened = await client.call<PhotoOpenResult>("photo.open", {
+          path: `/photos/${name}.arw`,
+        });
+        ids.push(opened.photoId);
+      }
+      const batch = await client.call<CatalogThumbnailsResult>("catalog.thumbnails", {
+        photoIds: [...ids, ids[0], 9999],
+        size: 64,
+      });
+      // The duplicate is collapsed, the unknown id is missing, and every frame arrived
+      // before this result.
+      expect(batch).toEqual({ requested: 4, sent: 3, missing: [9999] });
+      expect(client.frames).toHaveLength(3);
+      const targets = client.frames.map((frame) => new DataView(frame).getUint32(16, true));
+      expect(targets).toEqual(ids);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("catalog.remove drops rows, publishes the reason and leaves the files alone", async () => {
+    const root = mkdtempSync(join(tmpdir(), "latent-remove-"));
+    for (const name of ["a.arw", "b.arw"]) writeFileSync(join(root, name), "");
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      await client.call("catalog.import", { paths: [root] });
+      await client.waitFor("job.progress", (params) => params.finished === true);
+      const listed = await client.call<CatalogListResult>("catalog.list", { sort: "filename" });
+      const [first] = listed.photos;
+
+      const removed = await client.call<CatalogRemoveResult>("catalog.remove", {
+        photoIds: [first?.photoId ?? 0, 4242],
+      });
+      expect(removed.removed).toBe(1);
+      await client.waitFor("catalog.changed", (params) => params.reason === "remove");
+      expect((await client.call<CatalogListResult>("catalog.list", {})).total).toBe(1);
+      expect(existsSync(join(root, "a.arw"))).toBe(true);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("catalog.list narrows by photoIds and by a case-insensitive query", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const ids: number[] = [];
+      for (const name of ["alpha", "beta", "gamma"]) {
+        const opened = await client.call<PhotoOpenResult>("photo.open", {
+          path: `/photos/${name}.arw`,
+        });
+        ids.push(opened.photoId);
+      }
+      const picked = await client.call<CatalogListResult>("catalog.list", {
+        photoIds: [ids[2], ids[0]],
+        sort: "filename",
+      });
+      expect(picked.photos.map((photo) => photo.filename)).toEqual(["alpha.arw", "gamma.arw"]);
+
+      const searched = await client.call<CatalogListResult>("catalog.list", { query: "BET" });
+      expect(searched.photos.map((photo) => photo.filename)).toEqual(["beta.arw"]);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("job.cancel stops an import between ticks and the job ends as cancelled", async () => {
+    const root = mkdtempSync(join(tmpdir(), "latent-cancel-"));
+    for (let index = 0; index < 60; index++) {
+      writeFileSync(join(root, `f${String(index).padStart(3, "0")}.arw`), "");
+    }
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const started = await client.call<{ jobId: number }>("catalog.import", { paths: [root] });
+      const cancelled = await client.call<JobCancelResult>("job.cancel", {
+        jobId: started.jobId,
+      });
+      expect(cancelled.cancelled).toBe(true);
+
+      const last = await client.waitFor<JobProgressParams>(
+        "job.progress",
+        (params) => params.finished === true,
+      );
+      expect(last.state).toBe("cancelled");
+      expect(last.done).toBeLessThan(last.total);
+      // Cancelling twice, or cancelling a job that is over, is false rather than an error.
+      expect(
+        (await client.call<JobCancelResult>("job.cancel", { jobId: started.jobId })).cancelled,
+      ).toBe(false);
+      expect((await client.call<JobCancelResult>("job.cancel", { jobId: 999 })).cancelled).toBe(
+        false,
+      );
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("python.run streams its output before the result carries it", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      const result = await client.call<PythonRunResult>("python.run", {
+        code: "latent.photo.develop.exposure = 1.0",
+        photoId: opened.photoId,
+        timeoutMs: 5000,
+      });
+      expect(result.runId).toBeGreaterThan(0);
+
+      // Already in the log when the result resolved: the notification went out first.
+      const streamed = client.notifications.filter((entry) => entry.method === "python.output");
+      expect(streamed).toHaveLength(1);
+      expect(streamed[0]?.params).toEqual({
+        runId: result.runId,
+        stream: "stdout",
+        text: result.stdout,
+      });
+
+      const failed = await client.call<PythonRunResult>("python.run", {
+        code: "latent.photo.develop.exposure = 1.0",
+      });
+      const errors = client.notifications.filter(
+        (entry) => entry.method === "python.output" && entry.params.stream === "stderr",
+      );
+      expect(errors[0]?.params).toEqual({
+        runId: failed.runId,
+        stream: "stderr",
+        text: failed.stderr,
+      });
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("engine.hello names the catalog it opened and has no MCP url", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const hello = await client.call<EngineHelloResult>("engine.hello", { client: "test" });
+      expect(hello.catalogPath).toMatch(/catalog\.db$/);
+      // The mock has no interpreter, the same shape a client sees from latentd --no-mcp.
+      expect(hello.mcpUrl).toBeUndefined();
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("an import names its thumbnail job, which reports with parentJobId", async () => {
+    const root = mkdtempSync(join(tmpdir(), "latent-thumbjob-"));
+    for (const name of ["a.arw", "b.arw"]) writeFileSync(join(root, name), "");
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const started = await client.call<CatalogImportResult>("catalog.import", { paths: [root] });
+      expect(started.thumbnailJobId).toBeGreaterThan(started.jobId);
+
+      const thumbnails = await client.waitFor<JobProgressParams>(
+        "job.progress",
+        (params) => params.jobId === started.thumbnailJobId,
+      );
+      expect(thumbnails.parentJobId).toBe(started.jobId);
+      expect(thumbnails).toMatchObject({ kind: "thumbnails", finished: true, state: "done" });
+      expect(thumbnails.done).toBe(2);
+      // The import's own progress never claims a parent.
+      const imports = client.notifications.filter(
+        (entry) => entry.method === "job.progress" && entry.params.jobId === started.jobId,
+      );
+      expect(imports.every((entry) => entry.params.parentJobId === undefined)).toBe(true);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("an import that finds nothing still closes the thumbnail job it promised", async () => {
+    const root = mkdtempSync(join(tmpdir(), "latent-nothumbs-"));
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const started = await client.call<CatalogImportResult>("catalog.import", { paths: [root] });
+      const thumbnails = await client.waitFor<JobProgressParams>(
+        "job.progress",
+        (params) => params.jobId === started.thumbnailJobId,
+      );
+      expect(thumbnails).toMatchObject({ finished: true, total: 0, parentJobId: started.jobId });
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("python.finished closes the stream before the result arrives", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      const result = await client.call<PythonRunResult>("python.run", {
+        code: "latent.photo.develop.exposure = 1.0",
+        photoId: opened.photoId,
+      });
+      // Already logged when the result resolved, and after the run's last output chunk.
+      const run = client.notifications.filter((entry) => entry.method.startsWith("python."));
+      expect(run.map((entry) => entry.method)).toEqual(["python.output", "python.finished"]);
+      const finished = run[1]?.params as unknown as PythonFinishedParams;
+      expect(finished.runId).toBe(result.runId ?? 0);
+      expect(finished.ok).toBe(true);
+      expect(finished.durationMs).toBe(result.durationMs ?? -1);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("view.render reports the revision its pixels came from", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      const view = await client.call<ViewOpenResult>("view.open", {
+        photoId: opened.photoId,
+        width: 32,
+        height: 16,
+      });
+      const first = await client.call<ViewRenderResult>("view.render", { viewId: view.viewId });
+      const edited = await client.call<StackGetResult>("op.add", {
+        photoId: opened.photoId,
+        op: "exposure",
+        params: { value: 1 },
+      });
+      const second = await client.call<ViewRenderResult>("view.render", { viewId: view.viewId });
+      expect(second.revision).toBe(edited.revision);
+      expect(second.revision).toBeGreaterThan(first.revision);
+      // seq counts frames, revision counts states: they are not the same number.
+      expect(second.seq).toBe(first.seq + 1);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("stack.changed names the client, one step finer than the source", async () => {
+    const engine = startMockEngine(0);
+    const writer = await TestClient.connect(engine.port);
+    const observer = await TestClient.connect(engine.port);
+    try {
+      const opened = await writer.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      await writer.call("op.add", { photoId: opened.photoId, op: "contrast", params: {} });
+      const own = await writer.waitFor<StackChangedParams>(
+        "stack.changed",
+        (params) => params.source === "ui",
+      );
+      const seen = await observer.waitFor<StackChangedParams>(
+        "stack.changed",
+        (params) => params.source !== "ui",
+      );
+      expect(own.client).toBe("ui");
+      expect(seen.client).toBe("mcp:run_python");
+      expect(own.revision).toBe(seen.revision);
+    } finally {
+      writer.close();
+      observer.close();
+      engine.stop();
+    }
+  });
+
+  test("a photoId too large for an LTHM frame is refused, not truncated", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const tooBig = 0x1_0000_0000;
+      const failed = (error: unknown): string =>
+        error instanceof Error ? error.message : String(error);
+      const single = await client.call("catalog.thumbnail", { photoId: tooBig }).catch(failed);
+      const batch = await client.call("catalog.thumbnails", { photoIds: [tooBig] }).catch(failed);
+      expect(single).toMatch(/thumbnail frame limit/);
+      expect(batch).toMatch(/thumbnail frame limit/);
+      // Neither call may have put a frame with a wrapped-around target on the wire.
+      expect(client.frames).toHaveLength(0);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("ops.describe carries the Lightroom section, order and display hints", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const described = await client.call<OpsDescribeResult>("ops.describe", {});
+      for (const op of described.ops) {
+        expect(op.section).toBeDefined();
+        expect(op.order).toBeGreaterThan(0);
+        // An enum is drawn as a select from `values`; everything else says which control
+        // and which track gradient it wants, exactly as the engine's registry does.
+        for (const param of op.params) {
+          if (param.type === "enum") expect(param.values?.length).toBeGreaterThan(0);
+          else expect(param.display?.kind).toBeDefined();
+        }
+      }
+      // Lightroom's panel order, so a generated panel can render the list as it arrives.
+      const sections = described.ops.map((op) => op.section);
+      expect([...new Set(sections)]).toEqual([
+        "Light",
+        "Color",
+        "Effects",
+        "Detail",
+        "Optics",
+        "Geometry",
+      ]);
+      const whiteBalance = described.ops.find((op) => op.name === "white_balance");
+      expect(whiteBalance?.section).toBe("Color");
+      expect(whiteBalance?.params[0]?.name).toBe("mode");
+      expect(whiteBalance?.params[2]?.display).toEqual({ kind: "kelvin", tint: "temperature" });
+      expect(described.ops.find((op) => op.name === "exposure")?.order).toBe(1);
+      expect(described.ops.find((op) => op.name === "color_mixer")?.params).toHaveLength(24);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("a script that needs a photo fails with stderr instead of throwing", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const result = await client.call<PythonRunResult>("python.run", {
+        code: "latent.photo.develop.exposure = 1.0",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.stderr).toContain("no photo is open");
+
+      const canned = await client.call<PythonRunResult>("python.run", { code: "latent.undo()" });
+      expect(canned).toMatchObject({ ok: true, value: "None" });
+    } finally {
+      client.close();
+      engine.stop();
+    }
   });
 });

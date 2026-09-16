@@ -1,0 +1,4 @@
+# The embedded interpreter imports engine/python/latent straight from the source tree, so
+# CPython writes its bytecode cache here. Nothing in it belongs in git.
+__pycache__/
+*.pyc

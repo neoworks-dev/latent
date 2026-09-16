@@ -29,6 +29,9 @@ export interface MethodMap {
   "catalog.collections": { params: G.CatalogCollectionsParams; result: G.CatalogCollectionsResult };
   "catalog.collectionSet": { params: G.CatalogCollectionSetParams; result: G.CatalogCollectionsResult };
   "catalog.thumbnail": { params: G.CatalogThumbnailParams; result: G.CatalogThumbnailResult };
+  "catalog.thumbnails": { params: G.CatalogThumbnailsParams; result: G.CatalogThumbnailsResult };
+  "catalog.remove": { params: G.CatalogRemoveParams; result: G.CatalogRemoveResult };
+  "job.cancel": { params: G.JobCancelParams; result: G.JobCancelResult };
 }
 
 export interface NotificationMap {
@@ -36,6 +39,8 @@ export interface NotificationMap {
   "engine.log": G.EngineLogParams;
   "catalog.changed": G.CatalogChangedParams;
   "job.progress": G.JobProgressParams;
+  "python.output": G.PythonOutputParams;
+  "python.finished": G.PythonFinishedParams;
 }
 
 export type MethodName = keyof MethodMap;
@@ -67,6 +72,9 @@ export const methods: readonly MethodName[] = [
   "catalog.collections",
   "catalog.collectionSet",
   "catalog.thumbnail",
+  "catalog.thumbnails",
+  "catalog.remove",
+  "job.cancel",
 ];
 
 export const notifications: readonly NotificationName[] = [
@@ -74,4 +82,6 @@ export const notifications: readonly NotificationName[] = [
   "engine.log",
   "catalog.changed",
   "job.progress",
+  "python.output",
+  "python.finished",
 ];

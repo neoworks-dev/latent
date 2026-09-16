@@ -83,10 +83,15 @@
         "catalog.collections",
         "catalog.collectionSet",
         "catalog.thumbnail",
+        "catalog.thumbnails",
+        "catalog.remove",
+        "job.cancel",
         "stack.changed",
         "engine.log",
         "catalog.changed",
-        "job.progress"
+        "job.progress",
+        "python.output",
+        "python.finished"
       ]
     },
     "NotificationName": {
@@ -96,11 +101,13 @@
         "stack.changed",
         "engine.log",
         "catalog.changed",
-        "job.progress"
+        "job.progress",
+        "python.output",
+        "python.finished"
       ]
     },
     "PhotoId": {
-      "description": "Stable catalog id (SQLite rowid). photo.open returns the same id for the same file; a file not yet in the catalog is added on open.",
+      "description": "Stable catalog id (SQLite rowid), so an i64. LTHM binary frames carry it in a u32 slot (protocol/frames.md), which caps thumbnails at 4294967295: catalog.thumbnail and catalog.thumbnails answer -32602 for a larger id instead of sending a frame with a truncated target. Every other method takes the full range.",
       "type": "integer",
       "minimum": 1
     },
@@ -203,6 +210,40 @@
           "items": {
             "type": "string"
           }
+        },
+        "display": {
+          "$ref": "#/definitions/OpParamDisplay"
+        }
+      }
+    },
+    "OpParamDisplay": {
+      "description": "How a generated panel should draw this param. Advisory: a UI that ignores it still renders a correct control from `type`, `min`, `max` and `step`.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "`slider` is the default control. `kelvin` is a white-balance temperature slider, `curve` a tone-curve editor, `hsl` an eight-band colour mixer, `toggle` a checkbox.",
+          "enum": [
+            "slider",
+            "kelvin",
+            "curve",
+            "hsl",
+            "toggle"
+          ]
+        },
+        "tint": {
+          "type": "string",
+          "description": "Gradient to paint under the track, the way Lightroom tints Temp blue→yellow and Tint green→magenta.",
+          "enum": [
+            "temperature",
+            "tint",
+            "hue",
+            "saturation"
+          ]
         }
       }
     },
@@ -218,6 +259,22 @@
       "properties": {
         "name": {
           "type": "string"
+        },
+        "section": {
+          "type": "string",
+          "description": "Lightroom's Edit-panel section this op is drawn in. The display name of `panel`, and the heading a generated panel groups under.",
+          "enum": [
+            "Light",
+            "Color",
+            "Effects",
+            "Detail",
+            "Optics",
+            "Geometry"
+          ]
+        },
+        "order": {
+          "type": "integer",
+          "description": "Position inside `section`, ascending, following Lightroom's slider order. Ops without one sort last, then by name."
         },
         "panel": {
           "type": "string",
@@ -296,7 +353,8 @@
       "required": [
         "engineVersion",
         "protocolVersion",
-        "gpu"
+        "gpu",
+        "catalogPath"
       ],
       "properties": {
         "engineVersion": {
@@ -304,6 +362,14 @@
         },
         "protocolVersion": {
           "type": "integer"
+        },
+        "catalogPath": {
+          "type": "string",
+          "description": "Absolute path of the SQLite catalog this daemon opened. A UI shows which catalog it is on; a test asserts it is the throwaway one and not ~/.local/share/latent/catalog.db."
+        },
+        "mcpUrl": {
+          "type": "string",
+          "description": "Streamable-HTTP endpoint of the engine's MCP server, e.g. http://127.0.0.1:7801/mcp. Absent when the daemon was started with --no-mcp or the SDK failed to load."
         },
         "gpu": {
           "type": "object",
@@ -357,6 +423,7 @@
       }
     },
     "PhotoOpenResult": {
+      "description": "Opening a file catalogs it, so `catalog` carries the row and a client never has to follow photo.open with catalog.get. It is absent only when the engine opened a file it did not catalog.",
       "type": "object",
       "required": [
         "photoId",
@@ -386,6 +453,9 @@
         "sidecarLoaded": {
           "type": "boolean",
           "description": "True when an existing .latent sidecar was read and its stack restored."
+        },
+        "catalog": {
+          "$ref": "#/definitions/CatalogPhoto"
         }
       }
     },
@@ -484,6 +554,10 @@
         "index": {
           "type": "integer",
           "description": "Insert position; end of stack when omitted."
+        },
+        "transient": {
+          "type": "boolean",
+          "description": "True when the add is the first tick of a slider drag: no history snapshot, no sidecar write, so the whole drag undoes as one step. The first non-transient update after it snapshots."
         }
       }
     },
@@ -629,11 +703,16 @@
         "width",
         "height",
         "renderMs",
-        "readbackMs"
+        "readbackMs",
+        "revision"
       ],
       "properties": {
         "seq": {
           "type": "integer"
+        },
+        "revision": {
+          "type": "integer",
+          "description": "Stack revision the frame was rendered from — the same counter as StackGetResult.revision. A client that coalesced slider drags compares it with the revision of the last stack.changed it saw to know whether the frame it is holding is the newest state or one render behind."
         },
         "width": {
           "type": "integer",
@@ -663,6 +742,12 @@
         "photoId": {
           "$ref": "#/definitions/PhotoId",
           "description": "Bound to `latent.photo` for the run."
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30000,
+          "description": "Wall-clock budget for the script. On expiry the engine interrupts it with KeyboardInterrupt and answers with an error result (`ok: false`, the traceback in `stderr`), never by dropping the call. Default 30000."
         }
       }
     },
@@ -677,6 +762,10 @@
         "ok": {
           "type": "boolean"
         },
+        "durationMs": {
+          "type": "number",
+          "description": "Wall-clock time the script took, measured around the interpreter call. The same number the run's python.finished carries. Optional only so a client written against an older engine still typechecks; latentd and the mock always send it."
+        },
         "stdout": {
           "type": "string"
         },
@@ -686,6 +775,57 @@
         "value": {
           "description": "repr() of the script's last expression, if any.",
           "type": "string"
+        },
+        "runId": {
+          "$ref": "#/definitions/RunId",
+          "description": "Set when the engine streamed the run's output as python.output notifications. `stdout`/`stderr` still carry the complete streams, so a client that showed the live output replaces it with these when the call returns."
+        }
+      }
+    },
+    "PythonOutputParams": {
+      "description": "Notification: output a still-running script has produced. Sent to the socket that issued python.run, before that call's result. Long scripts stream; a short one may answer with the result alone.",
+      "type": "object",
+      "required": [
+        "runId",
+        "stream",
+        "text"
+      ],
+      "properties": {
+        "runId": {
+          "$ref": "#/definitions/RunId"
+        },
+        "stream": {
+          "type": "string",
+          "enum": [
+            "stdout",
+            "stderr"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "description": "The chunk as written, newlines included. Never re-sent, never trimmed."
+        }
+      }
+    },
+    "PythonFinishedParams": {
+      "description": "Notification: a run ended. Sent to the socket that issued python.run, after that run's last python.output and before the RPC result, so a console can close the output stream without waiting for the result to arrive.",
+      "type": "object",
+      "required": [
+        "runId",
+        "durationMs",
+        "ok"
+      ],
+      "properties": {
+        "runId": {
+          "$ref": "#/definitions/RunId"
+        },
+        "durationMs": {
+          "type": "number",
+          "description": "Wall-clock time the script took. Matches the run's PythonRunResult.durationMs."
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "False when the script raised or ran out of its timeoutMs budget; the traceback is in the result's stderr, not here."
         }
       }
     },
@@ -716,6 +856,10 @@
                 "history",
                 "load"
               ]
+            },
+            "client": {
+              "type": "string",
+              "description": "Who caused the change, one step more specific than `source` and free-form so it can name a tool: `ui`, `external`, `python`, `mcp:<tool>` (e.g. `mcp:run_python`), `history`, `load`. Per socket like `source` is — the writer sees `ui`, the others `external`. A console prints it; nothing branches on it."
             }
           }
         }
@@ -770,6 +914,10 @@
         "rating": { "type": "integer", "minimum": 0, "maximum": 5 },
         "flag": { "$ref": "#/definitions/PhotoFlag" },
         "hasSidecar": { "type": "boolean" },
+        "hash": {
+          "type": "string",
+          "description": "SHA-256 hex of the raw file, the same value photo.open returns. Present once the engine has hashed the file — an import registers a row before hashing it, so a freshly imported row can lack it until it is opened."
+        },
         "iso": { "type": "integer" },
         "shutter": { "type": "string", "description": "e.g. \"1/250\"" },
         "aperture": { "type": "number" },
@@ -786,6 +934,11 @@
       }
     },
     "JobId": { "type": "integer", "minimum": 1 },
+    "RunId": {
+      "description": "One python.run execution. Unique per engine process, so a client can tell its own run's output from another socket's.",
+      "type": "integer",
+      "minimum": 1
+    },
 
     "CatalogImportParams": {
       "description": "Registers files (or every raw in the given directories) in the catalog and queues thumbnails. Returns immediately; progress arrives as job.progress notifications.",
@@ -794,19 +947,39 @@
       "additionalProperties": false,
       "properties": {
         "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-        "recursive": { "type": "boolean", "description": "Descend into subdirectories. Default true." }
+        "recursive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Descend into subdirectories. Default true; only directories in `paths` are affected."
+        }
       }
     },
     "CatalogImportResult": {
       "type": "object",
       "required": ["jobId"],
-      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+      "properties": {
+        "jobId": { "$ref": "#/definitions/JobId" },
+        "thumbnailJobId": {
+          "$ref": "#/definitions/JobId",
+          "description": "The thumbnail job the import queues behind itself, reserved up front so a client can follow both from the one result. Its job.progress carries parentJobId = jobId. It always reports, even when the import found nothing or was cancelled — then with total 0. Absent from an engine that does not queue thumbnails."
+        }
+      }
     },
     "CatalogListParams": {
+      "description": "Catalog rows, filtered and sorted. Every property narrows the result; combining them is an AND. Rows with equal sort keys are ordered by filename ascending, then by photoId ascending, so paging is stable and the same list never reshuffles between calls.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "folder": { "type": "string", "description": "Exact folder match; omit for every photo." },
+        "photoIds": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "Exactly these rows, in the list's sort order. Ids that are not in the catalog are left out rather than erroring. Useful for refreshing a selection without re-listing a page."
+        },
+        "query": {
+          "type": "string",
+          "description": "Case-insensitive substring match over filename and camera. Empty string matches everything."
+        },
         "collectionId": { "type": "integer" },
         "flag": { "$ref": "#/definitions/PhotoFlag" },
         "minRating": { "type": "integer", "minimum": 0, "maximum": 5 },
@@ -888,7 +1061,7 @@
     },
     "CatalogCollectionSetResult": { "$ref": "#/definitions/CatalogCollectionsResult" },
     "CatalogThumbnailParams": {
-      "description": "Sends an LTHM binary frame (JPEG, target = photoId) before the result. Cached on disk by the engine; generated from the embedded preview when the raw has one, else from a fast half-size decode.",
+      "description": "Sends an LTHM binary frame (JPEG, target = photoId) before the result. Cached on disk by the engine; generated from the embedded preview when the raw has one, else from a fast half-size decode. A photoId above 4294967295 does not fit the frame's u32 target and is refused with -32602.",
       "type": "object",
       "required": ["photoId"],
       "additionalProperties": false,
@@ -906,6 +1079,65 @@
         "height": { "type": "integer" }
       }
     },
+    "CatalogThumbnailsParams": {
+      "description": "Batch form of catalog.thumbnail: one LTHM binary frame per photo that has one, all sent before the result. A filmstrip asks for the page it is about to draw in one call instead of one call per cell. An id above 4294967295 does not fit the frame's u32 target: the whole call is refused with -32602 rather than listed in `missing`, because it is a malformed request and not a photo that failed to render.",
+      "type": "object",
+      "required": ["photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } },
+        "size": {
+          "type": "integer",
+          "minimum": 32,
+          "maximum": 2048,
+          "default": 256,
+          "description": "Long edge in px, the same for every photo in the batch. Default 256."
+        }
+      }
+    },
+    "CatalogThumbnailsResult": {
+      "description": "Sent after the frames. A photo that produced no thumbnail — unknown id, unreadable file, decode failure — is listed in `missing` and has no frame; the call itself does not fail.",
+      "type": "object",
+      "required": ["requested", "sent", "missing"],
+      "properties": {
+        "requested": { "type": "integer", "description": "photoIds after de-duplication." },
+        "sent": { "type": "integer", "description": "Frames sent before this result." },
+        "missing": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } }
+      }
+    },
+    "CatalogRemoveParams": {
+      "description": "Removes catalog rows: the database entries, their thumbnails and their collection memberships. Files on disk and their .latent sidecars are never touched — re-importing the same path brings the photo back (with a new photoId). Ids that are not in the catalog are ignored.",
+      "type": "object",
+      "required": ["photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } }
+      }
+    },
+    "CatalogRemoveResult": {
+      "type": "object",
+      "required": ["removed"],
+      "properties": {
+        "removed": { "type": "integer", "description": "Rows actually deleted." }
+      }
+    },
+    "JobCancelParams": {
+      "description": "Asks a running job to stop at its next safe point. Work already done stands: a cancelled import keeps the photos it registered.",
+      "type": "object",
+      "required": ["jobId"],
+      "additionalProperties": false,
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "JobCancelResult": {
+      "type": "object",
+      "required": ["cancelled"],
+      "properties": {
+        "cancelled": {
+          "type": "boolean",
+          "description": "True when a running job was asked to stop; false when the job is unknown or already finished. The job's last job.progress then has `finished: true` and `state: \"cancelled\"`."
+        }
+      }
+    },
     "CatalogChangedParams": {
       "description": "Notification: catalog rows changed. Clients re-list what they show.",
       "type": "object",
@@ -921,10 +1153,19 @@
       "required": ["jobId", "kind", "done", "total", "finished"],
       "properties": {
         "jobId": { "$ref": "#/definitions/JobId" },
+        "parentJobId": {
+          "$ref": "#/definitions/JobId",
+          "description": "The job that queued this one — set on the thumbnail job an import spawns, absent on a job nobody spawned. A progress UI nests the child under its parent instead of showing two unrelated bars."
+        },
         "kind": { "type": "string", "enum": ["import", "thumbnails", "export"] },
         "done": { "type": "integer" },
         "total": { "type": "integer" },
         "finished": { "type": "boolean" },
+        "state": {
+          "type": "string",
+          "enum": ["running", "done", "cancelled", "error"],
+          "description": "How the job stands. `running` while `finished` is false; one of the other three on the last notification. Absent means `running` until finished, then `done` — so a client written before this field keeps working."
+        },
         "message": { "type": "string" },
         "error": { "type": "string" }
       }

@@ -9,7 +9,9 @@ export const viewerPlugin: Plugin.Object<void> = {
   name: "viewer",
   inject: ["engine", "panes"],
   apply(ctx: Context) {
-    const state = new ViewerState(ctx.engine);
+    // Dev hook: `?frametrace=<n>` prints a p50/p95 stage breakdown every n frames.
+    const trace = Number(new URLSearchParams(location.search).get("frametrace") ?? 0);
+    const state = new ViewerState(ctx.engine, Number.isFinite(trace) ? trace : 0);
     ctx.provide("viewer", state);
     ctx.effect(() =>
       ctx.panes.register({ id: "viewer", title: "Viewer", region: "center", component: Viewer }),

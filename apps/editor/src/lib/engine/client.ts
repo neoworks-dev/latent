@@ -1,8 +1,15 @@
 // WebSocket client for latentd: JSON-RPC 2.0 on text frames, LFRM pixels on binary
 // frames. Reconnects on its own; pending calls reject when the socket drops.
-import type { EngineClient, EngineConnectionState, FrameListener } from "@latent/contracts";
+import type {
+  EngineClient,
+  EngineConnectionState,
+  FrameListener,
+  ThumbnailListener,
+} from "@latent/contracts";
 import {
   FRAME_HEADER_BYTES,
+  FRAME_MAGIC_THUMBNAIL,
+  frameBody,
   type MethodMap,
   type MethodName,
   type NotificationMap,
@@ -29,6 +36,7 @@ export class WebSocketEngineClient implements EngineClient {
   private readonly pending = new Map<number, Pending>();
   private readonly notificationListeners = new Map<string, Set<(params: unknown) => void>>();
   private readonly frameListeners = new Map<number, Set<FrameListener>>();
+  private readonly thumbnailListeners = new Map<number, Set<ThumbnailListener>>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
   private readonly openWaiters = new Set<() => void>();
@@ -80,6 +88,16 @@ export class WebSocketEngineClient implements EngineClient {
     };
   }
 
+  onThumbnail(photoId: number, listener: ThumbnailListener): () => void {
+    const listeners = this.thumbnailListeners.get(photoId) ?? new Set();
+    listeners.add(listener);
+    this.thumbnailListeners.set(photoId, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) this.thumbnailListeners.delete(photoId);
+    };
+  }
+
   private connect(): void {
     const socket = new WebSocket(this.url);
     socket.binaryType = "arraybuffer";
@@ -91,7 +109,10 @@ export class WebSocketEngineClient implements EngineClient {
       this.openWaiters.clear();
       for (const resolve of waiters) resolve();
     });
-    socket.addEventListener("message", (event) => this.receive(event.data as string | ArrayBuffer));
+    // The arrival mark has to be taken here: everything downstream is already later.
+    socket.addEventListener("message", (event) =>
+      this.receive(event.data as string | ArrayBuffer, performance.now()),
+    );
     socket.addEventListener("close", () => {
       this.state = "closed";
       this.failPending(new Error("engine connection closed"));
@@ -100,9 +121,9 @@ export class WebSocketEngineClient implements EngineClient {
     });
   }
 
-  private receive(data: string | ArrayBuffer): void {
+  private receive(data: string | ArrayBuffer, receivedAt: number): void {
     if (data instanceof ArrayBuffer) {
-      this.receiveFrame(data);
+      this.receiveFrame(data, receivedAt);
       return;
     }
     const message: RpcMessage = JSON.parse(data);
@@ -121,12 +142,22 @@ export class WebSocketEngineClient implements EngineClient {
     }
   }
 
-  private receiveFrame(buffer: ArrayBuffer): void {
+  private receiveFrame(buffer: ArrayBuffer, receivedAt: number): void {
     const header = parseFrameHeader(buffer);
+    const parsedAt = performance.now();
+    if (header.magic === FRAME_MAGIC_THUMBNAIL) {
+      const listeners = this.thumbnailListeners.get(header.target);
+      if (!listeners) return;
+      // The payload stays binary all the way to the <img>: a Blob, never a data URL.
+      const jpeg = new Blob([frameBody(buffer)], { type: "image/jpeg" });
+      for (const listener of listeners) listener(header, jpeg);
+      return;
+    }
     const listeners = this.frameListeners.get(header.target);
     if (!listeners) return;
-    const pixels = new Uint8ClampedArray(buffer, FRAME_HEADER_BYTES, header.width * header.height * 4);
-    for (const listener of listeners) listener(header, pixels);
+    // A view, not a copy: the painter uploads straight out of the socket's buffer.
+    const pixels = new Uint8Array(buffer, FRAME_HEADER_BYTES, header.width * header.height * 4);
+    for (const listener of listeners) listener({ header, pixels, receivedAt, parsedAt });
   }
 
   private failPending(error: Error): void {

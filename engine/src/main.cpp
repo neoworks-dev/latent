@@ -1,6 +1,6 @@
-// latentd — the Latent engine daemon. Owns the GPU, the op-stack and the socket; the
-// Electron client is a view. `--port 0` (the default) asks the OS for a free port and
-// prints it, which is how apps/desktop finds us.
+// latentd — the Latent engine daemon. Owns the GPU, the op-stack, the catalog and the
+// socket; the Electron client is a view. `--port 0` (the default) asks the OS for a free
+// port and prints it, which is how apps/desktop finds us.
 #include "pipeline/renderer.h"
 #include "server/server.h"
 
@@ -20,14 +20,18 @@ namespace {
 constexpr uint32_t kRequiredTextureDimension = 16384;
 
 struct Options {
-  int port = 0;
+  latent::ServerOptions server;
   bool valid = true;
 };
 
 void print_usage() {
-  std::fprintf(stderr, "usage: latentd [--port N] [--no-ui]\n");
-  std::fprintf(stderr, "  --port N   listen on N; 0 (default) picks a free port\n");
-  std::fprintf(stderr, "  --no-ui    accepted for compatibility; latentd is always headless\n");
+  std::fprintf(stderr, "usage: latentd [--port N] [--mcp-port N] [--no-mcp] [--catalog PATH]\n");
+  std::fprintf(stderr, "  --port N       listen on N; 0 (default) picks a free port\n");
+  std::fprintf(stderr, "  --mcp-port N   MCP streamable-HTTP port; 0 (default) picks a free one\n");
+  std::fprintf(stderr, "  --no-mcp       do not start the MCP server\n");
+  std::fprintf(stderr,
+               "  --catalog PATH SQLite catalog; default ~/.local/share/latent/catalog.db\n");
+  std::fprintf(stderr, "  --no-ui        accepted for compatibility; latentd is always headless\n");
 }
 
 bool parse_port(const char* text, int& port) {
@@ -39,14 +43,35 @@ bool parse_port(const char* text, int& port) {
   return true;
 }
 
+// `--flag N` is folded into `--flag=N` so both spellings take one path.
+std::string fold_value(int argc, char** argv, int& index) {
+  std::string argument = argv[index];
+  const bool takes_value =
+      argument == "--port" || argument == "--mcp-port" || argument == "--catalog";
+  if (takes_value && index + 1 < argc) argument += "=" + std::string(argv[++index]);
+  return argument;
+}
+
 Options parse_options(int argc, char** argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
-    std::string argument = argv[i];
+    const std::string argument = fold_value(argc, argv, i);
     if (argument == "--no-ui") continue;
-    // `--port N` is folded into `--port=N` so both spellings take one path.
-    if (argument == "--port" && i + 1 < argc) argument += "=" + std::string(argv[++i]);
-    if (argument.starts_with("--port=") && parse_port(argument.c_str() + 7, options.port)) continue;
+    if (argument == "--no-mcp") {
+      options.server.enable_mcp = false;
+      continue;
+    }
+    if (argument.starts_with("--port=") && parse_port(argument.c_str() + 7, options.server.port)) {
+      continue;
+    }
+    if (argument.starts_with("--mcp-port=") &&
+        parse_port(argument.c_str() + 11, options.server.mcp_port)) {
+      continue;
+    }
+    if (argument.starts_with("--catalog=")) {
+      options.server.catalog_path = argument.substr(10);
+      continue;
+    }
     std::fprintf(stderr, "latentd: bad argument '%s'\n", argument.c_str());
     options.valid = false;
     return options;
@@ -77,7 +102,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "gpu %s, maxTextureDimension2D %u, shader-f16 %s\n", gpu.adapter.c_str(),
                  gpu.max_texture_dimension_2d, gpu.shader_f16 ? "yes" : "no");
 
-    latent::Server server(renderer, options.port);
+    latent::Server server(renderer, options.server);
     std::thread signal_thread([&signals, &server] {
       int received = 0;
       sigwait(&signals, &received);

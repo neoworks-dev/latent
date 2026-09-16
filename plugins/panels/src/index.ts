@@ -1,9 +1,9 @@
 // Generated panels: on connect the plugin asks the engine what it can do (`ops.describe`)
-// and builds one right-hand section per Lightroom panel, one control per parameter. There
-// is no hardcoded op list here — the engine's answer is the UI.
+// and builds the Edit column from the answer — one collapsible section per Lightroom
+// panel, one control per parameter. There is no hardcoded op list here.
 import type { Context, Plugin } from "@neoworks/extension-system";
 import GeneratedPanel from "./GeneratedPanel.svelte";
-import { groupByPanel, historyShortcut } from "./panels";
+import { historyShortcut } from "./panels";
 import { PanelsState } from "./state.svelte";
 import StackStatus from "./StackStatus.svelte";
 
@@ -20,21 +20,23 @@ export const panelsPlugin: Plugin.Object<void> = {
     const state = new PanelsState();
     ctx.provide("panels", state);
 
+    // One pane, not one per panel: Lightroom's Edit column is a single scroller whose
+    // section headers stick to its top, which a pane per group cannot do.
     ctx.effect(async () => {
       await ctx.engine.whenOpen();
       const described = await ctx.engine.call("ops.describe", {});
       state.ops = described.ops;
-      const panes = groupByPanel(described.ops).map((group, index) =>
-        ctx.panes.register({
-          id: group.panel,
-          title: group.label,
-          region: "right",
-          order: 10 + index * 10,
-          component: GeneratedPanel,
-        }),
-      );
+      const pane = ctx.panes.register({
+        id: "edit",
+        title: "Edit",
+        region: "right",
+        order: 10,
+        // The Edit column is the rail's "edit" mode; Info and the later modes replace it.
+        mode: "edit",
+        component: GeneratedPanel,
+      });
       return () => {
-        for (const dispose of panes) dispose();
+        pane();
         state.ops = [];
       };
     }, "generated-panels");

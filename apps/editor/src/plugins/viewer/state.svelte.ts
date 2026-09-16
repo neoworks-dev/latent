@@ -1,5 +1,6 @@
-import type { EngineClient, ViewerService } from "@latent/contracts";
-import type { FrameHeader, Op, StackGetResult } from "@latent/protocol";
+import type { EngineClient, EngineFrame, FrameSink, ViewerService } from "@latent/contracts";
+import type { Op, StackGetResult } from "@latent/protocol";
+import { FrameTimingLog } from "../../lib/engine/frame-timing";
 
 interface QueuedUpdate {
   opId: string;
@@ -26,20 +27,32 @@ export class ViewerState implements ViewerService {
   canUndo = $state(false);
   canRedo = $state(false);
   status = $state("no photo");
-  lastFrame = $state<{ header: FrameHeader; pixels: Uint8ClampedArray } | null>(null);
   latencyMs = $state(0);
+  engineMs = $state(0);
 
   private renderWidth = 1;
   private renderHeight = 1;
   private renderInFlight = false;
   private renderQueued = false;
+  private renderSentAt = 0;
+  private presentHandle: number | null = null;
+  private tracedFrames = 0;
+  private frameSink: FrameSink | null = null;
+  private readonly timings = new FrameTimingLog();
   private updateInFlight = false;
   private readonly queuedUpdates: QueuedUpdate[] = [];
   private readonly addsInFlight: PendingAdd[] = [];
   private unsubscribeFrame: (() => void) | null = null;
   private readonly unsubscribeStack: () => void;
 
-  constructor(private readonly engine: EngineClient) {
+  /**
+   * `traceEvery > 0` prints a p50/p95 stage breakdown every that many frames. Off by
+   * default so a normal session allocates nothing per frame.
+   */
+  constructor(
+    private readonly engine: EngineClient,
+    private readonly traceEvery = 0,
+  ) {
     this.unsubscribeStack = engine.on("stack.changed", (params) => {
       if (params.photoId !== this.photoId) return;
       // Our own writes already applied their reply; anything newer came from another
@@ -51,23 +64,77 @@ export class ViewerState implements ViewerService {
   }
 
   dispose(): void {
+    if (this.presentHandle !== null) cancelAnimationFrame(this.presentHandle);
+    this.presentHandle = null;
     this.unsubscribeFrame?.();
     this.unsubscribeStack();
   }
 
-  async open(path: string, width: number, height: number): Promise<void> {
+  attachFrameSink(sink: FrameSink): () => void {
+    this.frameSink = sink;
+    // A fresh canvas is empty and the engine holds the only copy of the picture.
+    this.requestRender();
+    return () => {
+      if (this.frameSink === sink) this.frameSink = null;
+    };
+  }
+
+  /**
+   * Straight off the socket: upload and draw in the same task the message arrived in, then
+   * take the presentation mark on the next animation frame. Everything reactive — the
+   * readout, the trace — happens there, after the pixels are already on their way out.
+   */
+  private paint(frame: EngineFrame): void {
+    const marks = this.frameSink?.(frame);
+    const sent = this.renderSentAt;
+    if (!marks || sent === 0) return;
+    if (this.presentHandle !== null) cancelAnimationFrame(this.presentHandle);
+    this.presentHandle = requestAnimationFrame(() => {
+      this.presentHandle = null;
+      const presented = performance.now();
+      this.latencyMs = presented - sent;
+      if (this.traceEvery <= 0) return;
+      // The reply carrying renderMs lands between the frame and this callback, so
+      // `engineMs` is already this frame's number.
+      this.timings.record({
+        sent,
+        received: frame.receivedAt,
+        parsed: frame.parsedAt,
+        drawStarted: marks.drawStarted,
+        uploaded: marks.uploaded,
+        drawn: marks.drawn,
+        presented,
+        engine: this.engineMs,
+      });
+      this.tracedFrames++;
+      if (this.tracedFrames % this.traceEvery !== 0) return;
+      // The console is the whole point of `?frametrace`: the screenshot driver reads these
+      // lines off the renderer to report the frame path's p50/p95.
+      // oxlint-disable-next-line no-console
+      console.log(this.timings.format());
+    });
+  }
+
+  async open(path: string, width?: number, height?: number): Promise<void> {
     this.status = `opening ${path}`;
-    this.renderWidth = width;
-    this.renderHeight = height;
+    // Callers that know the canvas size pass it; the filmstrip reuses the size the
+    // canvas' ResizeObserver already reported through `resize`.
+    if (width !== undefined) this.renderWidth = width;
+    if (height !== undefined) this.renderHeight = height;
     await this.engine.whenOpen();
     const photo = await this.engine.call("photo.open", { path });
     this.photoId = photo.photoId;
-    const view = await this.engine.call("view.open", { photoId: photo.photoId, width, height });
+    // Switching photos: the previous view is the engine's to free, not ours to leak.
+    const previousView = this.viewId;
+    if (previousView !== null) await this.engine.call("view.close", { viewId: previousView });
+    const view = await this.engine.call("view.open", {
+      photoId: photo.photoId,
+      width: this.renderWidth,
+      height: this.renderHeight,
+    });
     this.viewId = view.viewId;
     this.unsubscribeFrame?.();
-    this.unsubscribeFrame = this.engine.onFrame(view.viewId, (header, pixels) => {
-      this.lastFrame = { header, pixels };
-    });
+    this.unsubscribeFrame = this.engine.onFrame(view.viewId, (frame) => this.paint(frame));
     this.applyStack(await this.engine.call("stack.get", { photoId: photo.photoId }));
     this.status = `${photo.camera} ${photo.width}×${photo.height}`;
     this.requestRender();
@@ -87,15 +154,15 @@ export class ViewerState implements ViewerService {
       return;
     }
     this.renderInFlight = true;
-    const started = performance.now();
+    this.renderSentAt = performance.now();
     void this.engine
       .call("view.render", {
         viewId: this.viewId,
         width: this.renderWidth,
         height: this.renderHeight,
       })
-      .then(() => {
-        this.latencyMs = performance.now() - started;
+      .then((result) => {
+        this.engineMs = result.renderMs + result.readbackMs;
       })
       .catch((error: Error) => {
         this.status = error.message;
@@ -117,7 +184,7 @@ export class ViewerState implements ViewerService {
     if (pendingAdd) await pendingAdd.request;
     const existing = this.stack.find((entry) => entry.op === op);
     if (existing) return this.updateOp(existing.id, params, transient);
-    return this.addOp(op, params);
+    return this.addOp(op, params, transient);
   }
 
   async undo(): Promise<void> {
@@ -132,11 +199,12 @@ export class ViewerState implements ViewerService {
     this.requestRender();
   }
 
-  private addOp(op: string, params: Record<string, unknown>): Promise<void> {
+  // The first tick of a drag adds the op transiently, so the whole drag undoes as one step.
+  private addOp(op: string, params: Record<string, unknown>, transient: boolean): Promise<void> {
     const photoId = this.photoId;
     if (photoId === null) return Promise.resolve();
     const request = this.engine
-      .call("op.add", { photoId, op, params })
+      .call("op.add", { photoId, op, params, transient })
       .then((state) => {
         this.applyStack(state);
         this.requestRender();

@@ -37,6 +37,8 @@
       "version": "0.0.0",
       "dependencies": {
         "@latent/contracts": "workspace:*",
+        "@latent/plugin-catalog": "workspace:*",
+        "@latent/plugin-console": "workspace:*",
         "@latent/plugin-panels": "workspace:*",
         "@latent/protocol": "workspace:*",
         "@neoworks-dev/ui": "link:@neoworks-dev/ui",
@@ -75,6 +77,44 @@
       "devDependencies": {
         "json-schema-to-typescript": "^15.0.4",
         "typescript": "^5.9.3",
+      },
+    },
+    "plugins/catalog": {
+      "name": "@latent/plugin-catalog",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
+    "plugins/console": {
+      "name": "@latent/plugin-console",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
       },
     },
     "plugins/panels": {
@@ -254,6 +294,10 @@
     "@latent/desktop": ["@latent/desktop@workspace:apps/desktop"],
 
     "@latent/editor": ["@latent/editor@workspace:apps/editor"],
+
+    "@latent/plugin-catalog": ["@latent/plugin-catalog@workspace:plugins/catalog"],
+
+    "@latent/plugin-console": ["@latent/plugin-console@workspace:plugins/console"],
 
     "@latent/plugin-panels": ["@latent/plugin-panels@workspace:plugins/panels"],
 

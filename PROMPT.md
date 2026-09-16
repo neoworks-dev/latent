@@ -192,6 +192,58 @@ final pass, ICC embedded via lcms2. Batch export is an engine job queue; the UI 
 progress and stays responsive because the engine is a separate process. DNG export is
 Phase 3.
 
+### 3.7 Masks and layers
+
+There are no pixel layers. A **layer** in the UI is one op of the stack with a mask,
+`opacity` and `enabled`. The stack already is the layer stack: ordered, reorderable,
+toggleable, each entry with its own mask. Luminar's layer list and Lightroom's masking panel
+are two views over the same data.
+
+**Mask model.** `Op.mask` is optional. A mask is a list of components combined top-down:
+
+```json
+{
+  "components": [
+    { "id": "m1", "kind": "subject", "mode": "add", "invert": false, "feather": 0, "opacity": 100 },
+    { "id": "m2", "kind": "luminance", "mode": "intersect", "range": [0.4, 1.0], "smoothness": 0.1 },
+    { "id": "m3", "kind": "brush", "mode": "subtract", "strokes": "brush/m3.bin", "size": 40, "flow": 80 }
+  ]
+}
+```
+
+Component kinds, mirroring Lightroom's Masking panel (`reference/lightroom/masking.md`):
+`subject`, `sky`, `background`, `objects` (box or brush hint → SAM 2), `people` (per person,
+parts later), `text` (prompt → Florence-2 box → SAM 2), `brush` (strokes with size/feather/
+flow, erase), `linear` (two points + feather), `radial` (centre, radii, angle, feather,
+invert), `luminance` (range + smoothness), `color` (sampled colours + range), `depth`
+(Phase 2). `mode` ∈ `add | subtract | intersect`. Every component has `invert`, `feather`,
+`opacity`.
+
+**Rasters live in the engine.** Each component rasterises to an `r8unorm` texture at proxy
+and at full res, cached under `photo.raf.latent.d/masks/<componentId>.<hash>.png` where
+`hash` covers the component params and, for AI kinds, the model id and the source hash.
+Combining components is a compute pass; the combined mask is what the op's pass samples.
+An op with a mask runs as `out = mix(in, op(in), mask * opacity)`. AI components are jobs
+(`job.progress`), never inline in a slider tick; until a job lands the component contributes
+nothing and the UI shows it pending. Stale ≠ auto re-run, same rule as generative ops.
+
+**Protocol.** `op.update` accepts the full `mask`; `mask.preview { photoId, opId,
+componentId? }` returns an `LMSK` binary frame (r8, proxy size) for the overlay; `mask.detect
+{ photoId, kind, hint }` starts the AI job and returns `jobId`; brush strokes go up as
+`mask.stroke { photoId, opId, componentId, points, erase }` appended incrementally and
+persisted by the engine, never as a raster from the UI. `ops.describe` marks which ops are
+maskable (all develop ops; not geometry).
+
+**UI.** A Masks rail mode: mask list per op, component list per mask, overlay in the viewer
+(red tint, `O` toggles, `Shift+O` cycles overlay style), brush/gradient tools drawn in the
+viewer, local-adjustment sliders reuse the generated panels with the op's mask selected.
+A Layers rail mode: the stack top-down, one row per op with mask thumbnail, eye, opacity,
+drag to reorder, duplicate, delete. Selecting a row selects its op in the Edit column.
+
+**Python.** `photo.stack[i].mask.add("subject")`, `.add("brush").stroke(points)`,
+`masks.detect("the dog")`, `op.opacity = 60`. MCP tool `render_preview` accepts `mask=` to
+return the raster as an image block so an agent can check what it selected.
+
 ## 4. Stack
 
 **A C++ engine daemon owns everything that touches pixels, state, or the agent. Electron is a
@@ -338,6 +390,30 @@ single-photo export (JPEG, TIFF16, AVIF, PNG), embedded Python with `stack` + `d
 sugar, MCP server with `run_python` / `get_stack` / `render_preview` / `list_photos`.
 Mostly plumbing, and the hardest part to get right.
 
+**Phase 0.5 — feel.** The generated panels prove the plumbing; they are not a photo editor
+yet. Bar: Lightroom desktop (`reference/lightroom/lightroom-ui-*.png`, `lightroom-mobile.png`)
+and Luminar (`reference/lightroom/luminar-*.png`). Concretely:
+
+- Sliders: wide track with a large hit area, click-anywhere-on-track jumps, thumb drag, value
+  field scrubbable by drag and editable on click, arrow keys ±step and Shift ±10×step,
+  double-click on label or thumb resets to default, centre detent at 0 for bipolar ops, WB
+  Temp/Tint tracks tinted blue→yellow / green→magenta like Lightroom, `+`/`−` signed
+  readouts. Keep the one-in-flight coalescing.
+- Panels: collapsible sections with a chevron, Lightroom order (Profile → Light → Point Curve
+  → Color → Effects → Detail → Optics → Geometry), per-section eye to bypass, per-section
+  reset, sticky section headers, section-level "edited" dot. Histogram at the top of the right
+  column; clipping toggles.
+- Right rail: icon strip for Edit / Crop / Masks / Heal / Presets / History / Info, like
+  Lightroom's. Modes swap the right column; one column, no second window.
+- Viewer: before/after (`\`), 1:1 / fit / zoom (`Z`, scroll-wheel, drag-pan), compare pane,
+  loupe info overlay, `Tab` hides all panes, `F` fullscreen.
+- Filmstrip + Library: Lightroom density, hover reveals rating/flag controls, grid view
+  (`G`) with size slider, sort menu, quick filter bar, search box.
+- Design pass over every pane against `@neoworks-dev/ui` tokens: type scale, spacing, borders,
+  focus rings, disabled states, tooltips with shortcuts.
+
+Done when a Lightroom user sits down and does not ask where anything is.
+
 **Phase 1 — masking.** SAM 2 subject/sky/object detection, Florence-2 text → box for
 `masks.detect()`, brush, gradient, radial, mask math. This is where it passes digiKam and ART.
 
@@ -380,7 +456,7 @@ Code: `engine/probe/`. All five steps run; numbers are measured, not estimated.
 |---|---|
 | 1 wgpu-native | RTX 4080 SUPER via Vulkan (driver 615.71). `maxTextureDimension2D` 32768, `maxBufferSize` 1 TiB, `shader-f16` yes, float32-filterable yes. 2× 8256×5504 rgba16float allocated, sampled ping-pong pass **1.22 ms**, full-res readback 249 ms (363 MB — never do this for preview). Device ready in 145 ms. `wgpuInstanceWaitAny` panics "not implemented" in v29.0.1.1; use `AllowProcessEvents` + `wgpuInstanceProcessEvents`/`wgpuDevicePoll`. |
 | 2 LibRaw | Sony ILCE-6400 ARW 24.2 MP: open+unpack+AHD demosaic **1223 ms** single-threaded, RGB→RGBA pad 85 ms. vcpkg libraw 0.22.2. |
-| 3 Frame path | 2560×1440 rgba8 over loopback WebSocket into an Electron canvas, 100 slider ticks: **p50 17.1 ms, p95 22.9 ms, mean 20.8 ms** (max 347 = first frame). Engine side 1.6 ms render + 5.0 ms readback; the rest is transport + `putImageData`. Under the 30 ms kill line; daemon model stands. Optimisation later: WebGL texture upload instead of `putImageData`. |
+| 3 Frame path | 2560×1440 rgba8 over loopback WebSocket into an Electron canvas, 100 slider ticks: **p50 17.1 ms, p95 22.9 ms, mean 20.8 ms** (max 347 = first frame). Engine side 1.6 ms render + 5.0 ms readback; the rest is transport + `putImageData`. Under the 30 ms kill line; daemon model stands. Optimisation later: WebGL texture upload instead of `putImageData`. **Follow-up (same day, 811×1245 = 4 MB frames):** canvas was never the cost (`putImageData` 0.4 ms). Chromium's WebSocket receive is ~11 ms p50 for 4 MB, linear in bytes (0.5 MB → 2.6 ms), a Worker-owned socket is slower, `desynchronized` widens p95. After WebGL2 painter: request→pixels-on-GPU 11.0 / 16.2 ms p50/p95, +~8 ms vsync to presented. Remaining lever is bytes: half-res proxy while dragging, full on release. |
 | 4 Python + MCP | Bundled CPython 3.12.13 from vcpkg embedded via pybind11: interpreter up in **5.7 ms**. `PyConfig.home` must point at the vcpkg prefix and the executable needs `-rdynamic` (static libpython; extension modules resolve symbols against it). MCP Python SDK **2.2.0** (`MCPServer`, not `FastMCP`) served streamable HTTP from inside the daemon; `initialize` + `tools/call` round trip from curl returned a value computed in C++. |
 | 5 ORT CUDA | onnxruntime 1.30.0 cuda13 prebuilt links and loads the SAM 2 hiera-base-plus encoder (`~/.local/share/latent/models/`). Session init failed only because another process held 11.9 of 16 GB VRAM at the time (ComfyUI). Re-run `probe_onnx` with free VRAM before Phase 1. |
 

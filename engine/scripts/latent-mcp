@@ -1,0 +1,19 @@
+#!/bin/sh
+# `latent mcp` for clients that only speak stdio: proxies to the running daemon's
+# streamable-HTTP endpoint. Register it with Claude Code as
+#   claude mcp add latent -- /home/moritz/Documents/latent/engine/scripts/latent-mcp
+# LATENT_PYTHON overrides the interpreter, LATENT_MCP_URL the endpoint.
+set -eu
+
+here=$(dirname "$(readlink -f "$0")")
+engine=$(dirname "$here")
+python=${LATENT_PYTHON:-$engine/build/dev/vcpkg_installed/x64-linux/tools/python3/python3.12}
+
+if [ ! -x "$python" ]; then
+  echo "latent-mcp: no interpreter at $python (build the engine first)" >&2
+  exit 1
+fi
+
+PYTHONPATH="$engine/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec "$python" -m latent.stdio_shim "$@"

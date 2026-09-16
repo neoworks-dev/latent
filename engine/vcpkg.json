@@ -8,6 +8,8 @@
     "nlohmann-json",
     "uwebsockets",
     "libpng",
+    "libjpeg-turbo",
+    "sqlite3",
     "catch2",
     "pybind11"
   ]

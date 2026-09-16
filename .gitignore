@@ -10,3 +10,4 @@ engine/build/
 engine/third_party/
 engine/build-vcpkg.log
 engine/vcpkg_installed/
+.claude/scheduled_tasks.lock

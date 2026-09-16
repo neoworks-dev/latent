@@ -6,4 +6,5 @@ contextBridge.exposeInMainWorld("latentDesktop", {
   platform: process.platform,
   engineEndpoint: (): Promise<string | null> => ipcRenderer.invoke("engine:endpoint"),
   pickFiles: (): Promise<string[]> => ipcRenderer.invoke("dialog:pickFiles"),
+  pickDirectory: (): Promise<string | null> => ipcRenderer.invoke("dialog:pickDirectory"),
 });

@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@latent/contracts": "workspace:*",
+    "@latent/plugin-catalog": "workspace:*",
+    "@latent/plugin-console": "workspace:*",
     "@latent/plugin-panels": "workspace:*",
     "@latent/protocol": "workspace:*",
     "@neoworks-dev/ui": "link:@neoworks-dev/ui",
