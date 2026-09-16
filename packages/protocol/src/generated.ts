@@ -29,6 +29,9 @@ export type MethodName =
   | "catalog.thumbnails"
   | "catalog.remove"
   | "job.cancel"
+  | "mask.preview"
+  | "mask.detect"
+  | "mask.stroke"
   | "stack.changed"
   | "engine.log"
   | "catalog.changed"
@@ -51,6 +54,23 @@ export type NotificationName =
 export type PhotoId = number;
 export type ViewId = number;
 export type OpId = string;
+/**
+ * Mirrors Lightroom's Masking panel. AI kinds (subject, sky, background, objects, people, text) rasterise through mask.detect as a job; the rest rasterise inline from their params.
+ */
+export type MaskComponentKind =
+  | "subject"
+  | "sky"
+  | "background"
+  | "objects"
+  | "people"
+  | "text"
+  | "brush"
+  | "linear"
+  | "radial"
+  | "luminance"
+  | "color"
+  | "depth";
+export type JobId = number;
 export type Stack = Op[];
 export type PhotoFlag = "none" | "pick" | "reject";
 /**
@@ -71,7 +91,6 @@ export type StackChangedParams = StackGetResult & {
    */
   client?: string;
 };
-export type JobId = number;
 
 /**
  * JSON-RPC 2.0 methods between the Latent engine and its UI. Each method has <Method>Params and <Method>Result. Phase 0 surface only.
@@ -85,7 +104,15 @@ export interface LatentProtocol {
   ViewId?: ViewId;
   OpId?: OpId;
   Op?: Op;
-  MaskRef?: MaskRef;
+  Mask?: Mask;
+  MaskComponentKind?: MaskComponentKind;
+  MaskComponent?: MaskComponent;
+  MaskPreviewParams?: MaskPreviewParams;
+  MaskPreviewResult?: MaskPreviewResult;
+  MaskDetectParams?: MaskDetectParams;
+  MaskDetectResult?: MaskDetectResult;
+  MaskStrokeParams?: MaskStrokeParams;
+  MaskStrokeResult?: StackGetResult;
   Stack?: Stack;
   OpParamSpec?: OpParamSpec;
   OpParamDisplay?: OpParamDisplay;
@@ -184,14 +211,132 @@ export interface Op {
   params: {
     [k: string]: unknown | undefined;
   };
-  mask?: MaskRef;
+  mask?: Mask;
+  /**
+   * Layer opacity 0–100; absent means 100. The op's output is mixed into its input by opacity × mask.
+   */
+  opacity?: number;
   enabled: boolean;
 }
 /**
- * Phase 1. Reserved so Op's shape does not change when masks arrive.
+ * A per-op mask: components combined top-down with add / subtract / intersect (PROMPT.md §3.7). Rasters live in the engine; the UI only ever sees them as LMSK frames from mask.preview. An op with a mask renders as mix(in, op(in), mask × opacity).
  */
-export interface MaskRef {
-  kind: string;
+export interface Mask {
+  components: MaskComponent[];
+}
+/**
+ * The engine always emits `id` and `mode`. It tolerates a write without them (generates an id, defaults mode to `add`) as leniency for scripts, not as contract: a UI sends both.
+ */
+export interface MaskComponent {
+  id: OpId;
+  kind: MaskComponentKind;
+  mode: "add" | "subtract" | "intersect";
+  /**
+   * Absent = false.
+   */
+  invert?: boolean;
+  /**
+   * Edge softness 0–100; absent = 0 for AI/luminance/color, the tool's own default for brush/linear/radial.
+   */
+  feather?: number;
+  /**
+   * Component strength 0–100; absent = 100.
+   */
+  opacity?: number;
+  /**
+   * Kind-specific, all coordinates normalised 0..1 over the content rect — the image as the view shows it after crop/rotate/transform (Phase 2 moves this to image space so a mask survives a later crop). linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched.
+   */
+  params?: {
+    [k: string]: unknown | undefined;
+  };
+  /**
+   * Engine-owned. ready = raster cached for these params; pending = mask.detect job running; stale = params or source changed since the raster (not auto re-run); failed = last job failed.
+   */
+  state?: "ready" | "pending" | "stale" | "failed";
+  jobId?: JobId;
+}
+export interface MaskPreviewParams {
+  photoId: PhotoId;
+  opId: OpId;
+  /**
+   * One component's raster instead of the combined mask.
+   */
+  componentId?: string;
+  /**
+   * Size the raster like this view's proxy so the overlay maps 1:1 onto the frame. Absent = the photo's proxy size.
+   */
+  viewId?: number;
+}
+/**
+ * Sent after exactly one LMSK frame on the calling socket (protocol/frames.md). `width`/`height` are the view's full proxy size, letterbox included; `coverage` is measured over the image rect inside it. A component in `pending` or `failed` state contributes nothing to the combined raster; asking for its own raster is a -32602 error.
+ */
+export interface MaskPreviewResult {
+  width: number;
+  height: number;
+  /**
+   * Fraction 0..1 of pixels above 50 %, so a client can tell an empty mask from a failed one.
+   */
+  coverage?: number;
+}
+/**
+ * Starts (or re-runs) the AI rasterisation of one component. The component goes `pending` immediately (stack.changed), the job ticks job.progress with kind "mask", and on completion the component is `ready` or `failed` (stack.changed again). Non-AI kinds are a -32602 error.
+ */
+export interface MaskDetectParams {
+  photoId: PhotoId;
+  opId: OpId;
+  componentId: OpId;
+  /**
+   * Overrides the component's params for this run: {box}, {points}, {prompt}. Stored back into the component on success.
+   */
+  hint?: {
+    [k: string]: unknown | undefined;
+  };
+}
+export interface MaskDetectResult {
+  jobId: JobId;
+}
+/**
+ * Appends a stroke segment to a brush component. The engine owns the stroke list and its raster; the UI never uploads pixels. Only brush components accept strokes (-32602 otherwise).
+ */
+export interface MaskStrokeParams {
+  photoId: PhotoId;
+  opId: OpId;
+  componentId: OpId;
+  /**
+   * @minItems 1
+   */
+  points: [
+    [number, number] | [number, number, number],
+    ...([number, number] | [number, number, number])[]
+  ];
+  /**
+   * Absent = paint.
+   */
+  erase?: boolean;
+  /**
+   * Brush diameter as a fraction of the image's long edge; absent = the component's params.size.
+   */
+  size?: number;
+  flow?: number;
+  /**
+   * True for every segment of one pointer-down; the first non-transient call (pointer-up) snapshots, so a stroke undoes as one step.
+   */
+  transient?: boolean;
+}
+export interface StackGetResult {
+  stack: Stack;
+  revision: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  histogram?: Histogram;
+}
+export interface Histogram {
+  bins: number;
+  r: number[];
+  g: number[];
+  b: number[];
+  clippedShadowsPct: number;
+  clippedHighlightsPct: number;
 }
 /**
  * One slider/control of an op, in Lightroom terms.
@@ -231,17 +376,13 @@ export interface OpDefinition {
    * Position inside `section`, ascending, following Lightroom's slider order. Ops without one sort last, then by name.
    */
   order?: number;
+  /**
+   * The op accepts `mask` and `opacity` (every develop op). Geometry ops and generative ops that own their region are not maskable; absent = false.
+   */
+  maskable?: boolean;
   panel: "light" | "color" | "effects" | "detail" | "optics" | "geometry" | "generative";
   label: string;
   params: OpParamSpec[];
-}
-export interface Histogram {
-  bins: number;
-  r: number[];
-  g: number[];
-  b: number[];
-  clippedShadowsPct: number;
-  clippedHighlightsPct: number;
 }
 export interface EngineHelloParams {
   client?: string;
@@ -337,13 +478,6 @@ export interface PhotoCloseResult {}
 export interface StackGetParams {
   photoId: PhotoId;
 }
-export interface StackGetResult {
-  stack: Stack;
-  revision: number;
-  canUndo: boolean;
-  canRedo: boolean;
-  histogram?: Histogram;
-}
 export interface StackSetParams {
   photoId: PhotoId;
   stack: Stack;
@@ -365,6 +499,11 @@ export interface OpAddParams {
    * True when the add is the first tick of a slider drag: no history snapshot, no sidecar write, so the whole drag undoes as one step. The first non-transient update after it snapshots.
    */
   transient?: boolean;
+  mask?: Mask;
+  /**
+   * Layer opacity 0–100; absent means 100.
+   */
+  opacity?: number;
 }
 export interface OpUpdateParams {
   photoId: PhotoId;
@@ -380,6 +519,14 @@ export interface OpUpdateParams {
    * True while a slider is being dragged: no history snapshot, no sidecar write. The first non-transient update after a drag snapshots.
    */
   transient?: boolean;
+  /**
+   * Full replacement, never a merge: a mask is an ordered list and merging two by index is not something a caller can reason about. `null` clears it.
+   */
+  mask?: Mask | null;
+  /**
+   * Layer opacity 0–100; absent leaves it unchanged.
+   */
+  opacity?: number;
 }
 export interface OpRemoveParams {
   photoId: PhotoId;
@@ -650,7 +797,7 @@ export interface JobProgressParams {
    * The job that queued this one — set on the thumbnail job an import spawns, absent on a job nobody spawned. A progress UI nests the child under its parent instead of showing two unrelated bars.
    */
   parentJobId?: number;
-  kind: "import" | "thumbnails" | "export";
+  kind: "import" | "thumbnails" | "export" | "mask";
   done: number;
   total: number;
   finished: boolean;

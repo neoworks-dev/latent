@@ -6,8 +6,33 @@
   const { paneId: _paneId }: { paneId: string } = $props();
   const ctx = kernelContext();
   const viewer = ctx.viewer;
+  const overlay = viewer.overlay;
 
   let canvas = $state<HTMLCanvasElement | null>(null);
+  let overlayCanvas = $state<HTMLCanvasElement | null>(null);
+
+  // The overlay is a second canvas in the same box: 2D, transparent, never in the frame
+  // path. It hands itself to the viewer's overlay service, which owns what is drawn on it.
+  $effect(() => {
+    const element = overlayCanvas;
+    if (!element) return;
+    return overlay.attachCanvas(element);
+  });
+
+  function dispatch(kind: "down" | "move" | "up" | "cancel", event: PointerEvent): void {
+    const element = overlayCanvas;
+    if (!element) return;
+    if (kind === "down") element.setPointerCapture(event.pointerId);
+    if (kind === "up" || kind === "cancel") element.releasePointerCapture(event.pointerId);
+    if (overlay.dispatch(kind, event, element.getBoundingClientRect())) event.preventDefault();
+  }
+
+  function onWheel(event: WheelEvent): void {
+    const element = overlayCanvas;
+    if (!element) return;
+    // Only a tool that claims the wheel (brush size) stops the page from scrolling.
+    if (overlay.dispatch("wheel", event, element.getBoundingClientRect())) event.preventDefault();
+  }
 
   // The GL context lives as long as this canvas does, and the viewer draws through it
   // directly — no frame ever passes through reactive state.
@@ -47,6 +72,8 @@
         Math.round(rect.width * devicePixelRatio),
         Math.round(rect.height * devicePixelRatio),
       );
+      // The overlay works in CSS pixels; it scales itself by devicePixelRatio when it paints.
+      overlay.setBoxSize(rect.width, rect.height);
     });
     observer.observe(element);
     return () => observer.disconnect();
@@ -72,5 +99,23 @@
       {viewer.latencyMs.toFixed(1)} ms ({viewer.engineMs.toFixed(1)} engine)
     </span>
   </div>
-  <canvas bind:this={canvas} class="min-h-0 w-full min-w-0 flex-1 object-contain"></canvas>
+  <div class="relative min-h-0 w-full min-w-0 flex-1">
+    <canvas bind:this={canvas} class="absolute inset-0 size-full object-contain"></canvas>
+    <!-- Masks, crop and every other tool draw here. Transparent, 2D, and never part of the
+         frame path: the WebGL canvas below keeps its own context untouched. It is on the
+         page only while a tool is attached — an idle second canvas over the frame is a
+         compositing layer for nothing. -->
+    <canvas
+      bind:this={overlayCanvas}
+      class="absolute inset-0 size-full touch-none"
+      class:hidden={!overlay.active}
+      style:cursor={overlay.cursor}
+      data-overlay-canvas
+      onpointerdown={(event) => dispatch("down", event)}
+      onpointermove={(event) => dispatch("move", event)}
+      onpointerup={(event) => dispatch("up", event)}
+      onpointercancel={(event) => dispatch("cancel", event)}
+      onwheel={onWheel}
+    ></canvas>
+  </div>
 </div>

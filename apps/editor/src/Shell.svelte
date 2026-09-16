@@ -6,8 +6,10 @@
   import type { Context } from "@neoworks/extension-system";
   import { Button, SectionHeader, Tooltip } from "@neoworks-dev/ui";
   import InfoIcon from "phosphor-svelte/lib/InfoIcon";
+  import SelectionBackgroundIcon from "phosphor-svelte/lib/SelectionBackgroundIcon";
   import SlidersHorizontalIcon from "phosphor-svelte/lib/SlidersHorizontalIcon";
   import SquaresFourIcon from "phosphor-svelte/lib/SquaresFourIcon";
+  import StackSimpleIcon from "phosphor-svelte/lib/StackSimpleIcon";
   import { untrack } from "svelte";
   import { nextChrome, shellShortcut, showsRegion, type ShellChrome } from "./shell";
 
@@ -16,7 +18,9 @@
   provideKernelContext(untrack(() => kernel));
   const ctx = kernelContext();
 
-  let mode = $state("edit");
+  // The mode lives on the pane registry, not here: the Edit column's mask badge hands over
+  // to the Masks column, and a plugin cannot reach into a component's local state.
+  const mode = $derived(ctx.panes.mode);
   let chrome = $state<ShellChrome>("all");
 
   const left = $derived(ctx.panes.list("left"));
@@ -32,9 +36,16 @@
   ]);
   const railIcons: Record<string, typeof InfoIcon> = {
     edit: SlidersHorizontalIcon,
+    masks: SelectionBackgroundIcon,
+    layers: StackSimpleIcon,
     info: InfoIcon,
   };
-  const railLabels: Record<string, string> = { edit: "Edit", info: "Info" };
+  const railLabels: Record<string, string> = {
+    edit: "Edit",
+    masks: "Masks",
+    layers: "Layers",
+    info: "Info",
+  };
 
   const showsLeft = $derived(left.length > 0 && showsRegion(chrome, "left"));
   const showsRight = $derived(showsRegion(chrome, "right"));
@@ -123,7 +134,7 @@
               size="sm"
               variant={mode === entry ? "surface" : "ghost"}
               icon={Icon}
-              onclick={() => (mode = entry)}
+              onclick={() => ctx.panes.setMode(entry)}
             />
           </Tooltip>
         </span>

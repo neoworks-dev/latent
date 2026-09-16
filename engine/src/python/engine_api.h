@@ -61,6 +61,16 @@ class EngineApi {
                                                    std::optional<PreviewRegion> region) = 0;
   virtual nlohmann::json catalog_list(int limit) = 0;
 
+  // `photo.masks.detect(op_id, component_id)`: starts the AI rasterisation of one
+  // component and returns its jobId. The component is `pending` when this returns.
+  virtual int64_t detect_mask(int64_t photo_id, const std::string& op_id,
+                              const std::string& component_id) = 0;
+  // The op's combined mask as an 8-bit greyscale PNG, or one component's raster when
+  // `component_id` is not empty. What MCP's render_preview(mask=...) hands an agent.
+  virtual std::vector<uint8_t> render_mask_png(int64_t photo_id, const std::string& op_id,
+                                               const std::string& component_id,
+                                               uint32_t max_size) = 0;
+
   // Reaches the UI as engine.log, carrying photoId when the message is about one photo.
   virtual void warn(const std::string& message, int64_t photo_id) = 0;
 };

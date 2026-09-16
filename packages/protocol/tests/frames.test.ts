@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  FRAME_FORMAT_R8,
   FRAME_HEADER_BYTES,
+  FRAME_MAGIC_MASK,
   FRAME_MAGIC_THUMBNAIL,
   frameBody,
   parseFrameHeader,
@@ -34,6 +36,20 @@ describe("binary frames", () => {
   test("the body is the bytes after the header, not a copy of the frame", () => {
     const body = frameBody(frame("LTHM", [2, 1, 1, 7, 1], [0xff, 0xd8, 0x00]));
     expect([...body]).toEqual([0xff, 0xd8, 0x00]);
+  });
+
+  test("an LMSK header reads the viewId as the target and r8 as the format", () => {
+    const header = parseFrameHeader(frame("LMSK", [4, 2, 9, 3, FRAME_FORMAT_R8], [0, 255, 128]));
+    expect(header).toEqual({
+      magic: FRAME_MAGIC_MASK,
+      width: 4,
+      height: 2,
+      seq: 9,
+      target: 3,
+      format: FRAME_FORMAT_R8,
+    });
+    // One byte per pixel, not four: the body is w·h long.
+    expect(frameBody(frame("LMSK", [2, 2, 1, 0, FRAME_FORMAT_R8], [1, 2, 3, 4]))).toHaveLength(4);
   });
 
   test("a short buffer or an unknown magic is an error, never a half-read frame", () => {

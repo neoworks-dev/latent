@@ -4,7 +4,7 @@
 //
 //   node apps/desktop/scripts/screenshot.ts [--out /tmp/latent-ui.png] [--engine mock|real]
 //                                           [--photo /path/to/raw]
-//                                           [--flow slider|panels|catalog|latency]
+//                                           [--flow slider|panels|masks|catalog|library|latency]
 //                                           [--dir <import directory>]
 //
 // `--engine real` spawns engine/build/dev/latentd instead of the mock; pair it with a real
@@ -23,6 +23,11 @@
 // `--flow panels` exercises the rest of the panel column's gestures: a click on the track
 // that jumps, a scrub on the value readout, arrow keys on the focused slider, a
 // double-click that resets to the default, and folding a section away.
+//
+// `--flow masks` drives Masks and Layers: a radial dragged on the viewer's overlay, the
+// LMSK raster drawn back as a red tint, three brush strokes that each grow the coverage,
+// one undo that takes a whole stroke, layer opacity, and the Layers column's thumbnails,
+// drag-reorder and eye.
 //
 // Node, not bun: Playwright's `_electron.launch` never resolves under bun 1.3 (it hangs
 // after attaching to the inspector), while node runs it fine. Everything else is bun.
@@ -43,7 +48,11 @@ function argument(flag: string, fallback: string): string {
 }
 
 const flow = argument("--flow", "slider");
-const defaultOutput = flow === "catalog" ? "/tmp/latent-catalog.png" : "/tmp/latent-ui.png";
+const flowOutputs: Record<string, string> = {
+  catalog: "/tmp/latent-catalog.png",
+  masks: "/tmp/latent-masks.png",
+};
+const defaultOutput = flowOutputs[flow] ?? "/tmp/latent-ui.png";
 const outputPath = argument("--out", defaultOutput);
 const externalPath = outputPath.replace(/\.png$/, "-external.png");
 const engineKind = argument("--engine", "mock");
@@ -273,6 +282,25 @@ const app = await electron.launch({
 const window = await app.firstWindow();
 window.on("console", (message) => console.log(`[renderer] ${message.text()}`));
 window.on("pageerror", (error) => console.log(`[renderer] ${error.message}`));
+
+/**
+ * `page.screenshot` captures the window's surface and waits for the compositor to hand it
+ * a frame. With other GPU clients on the machine that wait sometimes never ends, and the
+ * viewer's canvas is not repainting on its own to wake it. The fallback asks the renderer's
+ * own compositor for the same pixels (`fromSurface: false`). Driver-side only.
+ */
+async function capture(path: string): Promise<void> {
+  const captured = await window
+    .screenshot({ path, timeout: 8000 })
+    .then(() => true)
+    .catch(() => false);
+  if (captured) return;
+  const session = await window.context().newCDPSession(window);
+  const shot = await session.send("Page.captureScreenshot", { format: "png", fromSurface: false });
+  await session.detach();
+  writeFileSync(path, Buffer.from(shot.data, "base64"));
+  console.log(`[shot] surface capture stalled; ${path} came from the renderer instead`);
+}
 if (flow === "catalog") {
   // The import job walks the directories and ticks job.progress; the filmstrip fills in
   // as catalog.changed lands and every thumbnail arrives as its own LTHM frame.
@@ -398,7 +426,7 @@ if (flow === "catalog") {
     : "import finished before cancel";
   console.log(`[shot] ${outcome}: ${jobLine.replace(/\s+/g, " ").trim()}`);
 
-  await window.screenshot({ path: outputPath });
+  await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
 } else if (flow === "latency") {
   await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
@@ -429,8 +457,259 @@ if (flow === "catalog") {
   }
   await window.mouse.up();
   await window.waitForTimeout(500);
-  await window.screenshot({ path: outputPath });
+  await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
+} else if (flow === "masks") {
+  // Every wait in this flow polls on a timer, never on an animation frame: a rAF-polled
+  // `waitForFunction` over a canvas that is being drawn into leaves Chromium's screenshot
+  // capture waiting for a frame that never comes quiet.
+  const poll = { timeout: 15_000, polling: 200 };
+  await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
+  await window.waitForFunction(
+    () => {
+      const canvas = document.querySelector("canvas");
+      return canvas instanceof HTMLCanvasElement && canvas.width > 300;
+    },
+    null,
+    { timeout: 30_000, polling: 200 },
+  );
+
+  /** The fraction of the frame the last mask.preview covered, as the pane reports it. */
+  async function maskCoverage(): Promise<number> {
+    const value = await window.locator('[data-pane="masks"]').getAttribute("data-mask-coverage");
+    return Number(value ?? 0);
+  }
+
+  /** Waits until the coverage has moved past `floor`, then answers with it. */
+  async function coverageAbove(floor: number): Promise<number> {
+    await window.waitForFunction(
+      (limit: number) => {
+        const pane = document.querySelector('[data-pane="masks"]');
+        return Number(pane?.getAttribute("data-mask-coverage") ?? 0) > limit;
+      },
+      floor,
+      poll,
+    );
+    return maskCoverage();
+  }
+
+  /**
+   * The same, but only once the number stops moving: a stroke's transient segments each
+   * bring a preview of their own, and reading the first one that is bigger would record a
+   * coverage from the middle of the stroke rather than from the end of it.
+   */
+  async function settledCoverage(floor: number): Promise<number> {
+    let previous = await coverageAbove(floor);
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await window.waitForTimeout(150);
+      const current = await maskCoverage();
+      if (current === previous) return current;
+      previous = current;
+    }
+    return previous;
+  }
+
+  // Two ops to layer: a click at 60 % of the exposure track, and one on contrast.
+  for (const [op, at, text] of [
+    ["exposure", 0.6, "+1.00 EV"],
+    ["contrast", 0.75, "+50"],
+  ] as const) {
+    const track = window.locator(`[data-op="${op}"] [role="slider"]`);
+    const box = await track.boundingBox();
+    if (!box) throw new Error(`${op} slider has no box`);
+    await window.mouse.click(box.x + box.width * at, box.y + box.height / 2);
+    await window.waitForFunction(readoutIs, { op, text }, poll);
+  }
+  console.log("[shot] two ops in the stack: exposure +1.00 EV, contrast +50");
+
+  // The rail swaps the column. Nothing is masked yet, so the Masks column asks which
+  // adjustment to mask.
+  await window.locator('[data-rail-mode="masks"] button').click();
+  await window.waitForSelector('[data-pane="masks"]', { timeout: 10_000 });
+  await window.locator('[data-select-op="exposure"]').click();
+  await window.waitForSelector("[data-create-mask]", { timeout: 10_000 });
+
+  // Create a radial, then drag one on the overlay: press at the centre, release at a
+  // corner of the ellipse. The component exists after the first call; the drag resizes it.
+  await window.locator('[data-create-mask] [aria-haspopup="listbox"]').click();
+  await window.getByRole("option", { name: "Radial gradient" }).click();
+  await window.waitForSelector('[data-mask-component="radial1"]', { timeout: 10_000 });
+  const created = await coverageAbove(0);
+  console.log(`[shot] radial created, mask.preview covers ${(created * 100).toFixed(1)}%`);
+
+  const overlay = window.locator("[data-overlay-canvas]");
+  const frame = await overlay.boundingBox();
+  if (!frame) throw new Error("the viewer overlay has no box");
+  const centre = { x: frame.x + frame.width / 2, y: frame.y + frame.height / 2 };
+  await window.mouse.move(centre.x, centre.y);
+  await window.mouse.down();
+  for (let step = 1; step <= 8; step++) {
+    await window.mouse.move(
+      centre.x + frame.width * 0.045 * step,
+      centre.y + frame.height * 0.045 * step,
+    );
+    await window.waitForTimeout(16);
+  }
+  await window.mouse.up();
+  const dragged = await settledCoverage(created);
+  console.log(
+    `[shot] drag on the overlay resized the radial: coverage ${(created * 100).toFixed(1)}%` +
+      ` → ${(dragged * 100).toFixed(1)}%`,
+  );
+
+  await capture(outputPath);
+  console.log(`[shot] wrote ${outputPath}`);
+
+  // O takes the tint off, Shift+O walks the overlay styles.
+  await window.keyboard.press("o");
+  await window.waitForSelector('[data-pane="masks"][data-mask-overlay="false"]', {
+    timeout: 5_000,
+  });
+  await window.keyboard.press("o");
+  await window.waitForSelector('[data-pane="masks"][data-mask-overlay="true"]', { timeout: 5_000 });
+  await window.keyboard.press("Shift+O");
+  await window.waitForSelector('[data-pane="masks"][data-mask-tint="green"]', { timeout: 5_000 });
+  await window.keyboard.press("Shift+O");
+  await window.keyboard.press("Shift+O");
+  await window.keyboard.press("Shift+O");
+  await window.waitForSelector('[data-pane="masks"][data-mask-tint="red"]', { timeout: 5_000 });
+  console.log("[shot] O toggled the overlay, Shift+O cycled the four tints back to red");
+
+  // A brush component, then three strokes. Every stroke is transient segments plus one
+  // committed call, so each one grows the mask and each one is a single undo step.
+  await window.locator('[data-create-mask] [aria-haspopup="listbox"]').click();
+  await window.getByRole("option", { name: "Tools · Brush" }).click();
+  await window.waitForSelector('[data-mask-component="brush1"]', { timeout: 10_000 });
+  // Selecting a component previews that component's own raster, so the empty brush reads
+  // as 0 % while the combined mask stays on the op. Every stroke below grows this number.
+  await window.waitForFunction(
+    () => document.querySelector('[data-pane="masks"][data-mask-coverage="0.0000"]') !== null,
+    null,
+    poll,
+  );
+
+  const strokes: number[] = [];
+  let before = 0;
+  for (const [index, y] of [0.12, 0.22, 0.86].entries()) {
+    const top = frame.y + frame.height * y;
+    await window.mouse.move(frame.x + frame.width * 0.12, top);
+    await window.mouse.down();
+    for (let step = 1; step <= 10; step++) {
+      await window.mouse.move(frame.x + frame.width * (0.12 + 0.07 * step), top);
+      await window.waitForTimeout(16);
+    }
+    await window.mouse.up();
+    before = await settledCoverage(before);
+    strokes.push(before);
+    console.log(`[shot] brush stroke ${index + 1}: coverage ${(before * 100).toFixed(1)}%`);
+  }
+
+  // One Ctrl+Z takes the whole third stroke, not one of its segments: the coverage lands
+  // back on what it was after the second stroke, not somewhere inside the third.
+  const afterTwo = strokes[1] ?? 0;
+  const afterThree = strokes[2] ?? 0;
+  await window.keyboard.press("Control+z");
+  await window.waitForFunction(
+    (target: number) => {
+      const pane = document.querySelector('[data-pane="masks"]');
+      return Number(pane?.getAttribute("data-mask-coverage") ?? 0) < target - 0.0005;
+    },
+    afterThree,
+    poll,
+  );
+  const undone = await maskCoverage();
+  if (Math.abs(undone - afterTwo) > 0.002) {
+    throw new Error(
+      `undo landed on ${undone.toFixed(4)}, not on the two-stroke ${afterTwo.toFixed(4)}`,
+    );
+  }
+  console.log(
+    `[shot] undo removed the whole third stroke: ${(afterThree * 100).toFixed(1)}%` +
+      ` → ${(undone * 100).toFixed(1)}% (two strokes)`,
+  );
+  await window.keyboard.press("Control+Shift+z");
+  await coverageAbove(afterTwo);
+
+  // Layer opacity: the readout opens on a click and takes a typed value.
+  await window.locator('[data-pane="masks"] [aria-label="Layer opacity"]').click();
+  await window.locator('[data-pane="masks"] input[aria-label="Layer opacity"]').fill("50");
+  await window.keyboard.press("Enter");
+  await window.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-pane="masks"] [data-readout="opacity"]')
+        ?.textContent?.trim() === "50 %",
+    null,
+    poll,
+  );
+  console.log("[shot] layer opacity set to 50 %");
+
+  // Back in the Edit column the op now wears a mask badge with that opacity on it, and
+  // clicking the badge is the way back here.
+  await window.locator('[data-rail-mode="edit"] button').click();
+  await window.waitForSelector('[data-mask-badge="exposure"]', { timeout: 10_000 });
+  const badge = await window.locator('[data-mask-badge="exposure"]').innerText();
+  console.log(`[shot] the Edit column marks exposure as a layer: "${badge.replace(/\s+/g, " ")}"`);
+  await window.locator('[data-mask-badge="exposure"]').click();
+  await window.waitForSelector('[data-pane="masks"]', { timeout: 10_000 });
+
+  // The Layers column: the stack top-down, one row per op, each with its mask thumbnail.
+  await window.locator('[data-rail-mode="layers"] button').click();
+  await window.waitForSelector('[data-pane="layers"]', { timeout: 10_000 });
+  await window.waitForSelector("[data-mask-thumb-image]", { timeout: 15_000 });
+  const rowOrder = async (): Promise<string[]> =>
+    window
+      .locator("[data-layer-row]")
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-op") ?? ""));
+  const beforeOrder = await rowOrder();
+  const thumbnails = await window.locator("[data-mask-thumb-image]").count();
+  const exposureOpacity = await window
+    .locator('[data-layer-row][data-op="exposure"]')
+    .getAttribute("data-opacity");
+  console.log(
+    `[shot] layers top-down ${beforeOrder.join(" → ")}, ${thumbnails} mask thumbnail(s),` +
+      ` exposure at ${exposureOpacity}% opacity`,
+  );
+
+  // Drag the top row past the middle of the bottom row: that is a stack.set, and the
+  // engine's answer is what re-orders the list.
+  const handle = window.locator("[data-layer-handle]").first();
+  const handleBox = await handle.boundingBox();
+  const lastRow = await window.locator("[data-layer-row]").last().boundingBox();
+  if (!handleBox || !lastRow) throw new Error("a layer row has no box");
+  await window.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
+  await window.mouse.down();
+  await window.mouse.move(handleBox.x + handleBox.width / 2, lastRow.y + lastRow.height * 0.8, {
+    steps: 8,
+  });
+  await window.mouse.up();
+  await window.waitForFunction(
+    (was: string[]) => {
+      const rows = [...document.querySelectorAll("[data-layer-row]")];
+      const order = rows.map((row) => row.getAttribute("data-op") ?? "");
+      return order.join(",") !== was.join(",");
+    },
+    beforeOrder,
+    poll,
+  );
+  const afterOrder = await rowOrder();
+  console.log(
+    `[shot] drag reordered the stack: ${beforeOrder.join(" → ")} becomes ${afterOrder.join(" → ")}`,
+  );
+
+  // The eye is an op.update, so the row only dims once the engine agrees.
+  const topOp = afterOrder[0] ?? "exposure";
+  await window.locator(`[data-layer-row][data-op="${topOp}"] [data-layer-eye] button`).click();
+  await window.waitForSelector(`[data-layer-row][data-op="${topOp}"][data-enabled="false"]`, {
+    timeout: 10_000,
+  });
+  console.log(`[shot] the eye disabled the ${topOp} layer`);
+
+  // Off the row, or the tooltip the click left open covers the shot.
+  await window.mouse.move(frame.x + frame.width / 2, frame.y + frame.height / 2);
+  const layersPath = outputPath.replace(/\.png$/, "-layers.png");
+  await capture(layersPath);
+  console.log(`[shot] wrote ${layersPath}`);
 } else if (flow === "panels") {
   await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
   await window.waitForFunction(
@@ -490,7 +769,7 @@ if (flow === "catalog") {
   );
   console.log("[shot] scrubbing the readout 20 px moved exposure to +2.31 EV");
 
-  await window.screenshot({ path: outputPath });
+  await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
 
   // Double-click resets to the described default. Off-centre on purpose: the two clicks
@@ -509,7 +788,7 @@ if (flow === "catalog") {
   console.log(`[shot] Color section folded: ${visibleRows} rows left in it`);
 
   const foldedPath = outputPath.replace(/\.png$/, "-folded.png");
-  await window.screenshot({ path: foldedPath });
+  await capture(foldedPath);
   console.log(`[shot] wrote ${foldedPath}`);
 } else if (flow === "library") {
   // The library at Lightroom density: a cell's own hover controls, the grid and its size
@@ -552,7 +831,7 @@ if (flow === "catalog") {
   // Hover one cell so the shot shows the controls the cursor reveals.
   await window.locator('[data-pane="grid"] [data-photo-id]').first().hover();
   const gridPath = outputPath.replace(/\.png$/, "-grid.png");
-  await window.screenshot({ path: gridPath });
+  await capture(gridPath);
   console.log(`[shot] wrote ${gridPath}`);
 
   // Click a cell, Enter opens it: the grid closes and the viewer has the centre back.
@@ -592,7 +871,7 @@ if (flow === "catalog") {
   const camera = await window.locator('[data-pane="info"] dd').first().innerText();
   console.log(`[shot] Info rail shows camera ${camera.trim()}`);
   const infoPath = outputPath.replace(/\.png$/, "-info.png");
-  await window.screenshot({ path: infoPath });
+  await capture(infoPath);
   console.log(`[shot] wrote ${infoPath}`);
 
   // Tab takes the side panes off, the way Lightroom's does, and puts them back.
@@ -601,7 +880,7 @@ if (flow === "catalog") {
   const hidden = await window.locator('[data-pane="filmstrip"]').count();
   console.log(`[shot] Tab hid the side panes: ${hidden} filmstrip panes left on screen`);
   const hiddenPath = outputPath.replace(/\.png$/, "-tab.png");
-  await window.screenshot({ path: hiddenPath });
+  await capture(hiddenPath);
   await window.keyboard.press("Tab");
   await window.waitForSelector('[data-chrome="all"]', { timeout: 5_000 });
 
@@ -659,7 +938,7 @@ if (flow === "catalog") {
   console.log(`[shot] wheel over the strip scrolled it ${scrolled}px sideways`);
   await window.waitForSelector('[data-jobs-running="0"]', { timeout: 120_000 });
 
-  await window.screenshot({ path: outputPath });
+  await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
 } else {
   await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
@@ -686,7 +965,7 @@ if (flow === "catalog") {
   await window.mouse.up();
   await window.waitForTimeout(500);
 
-  await window.screenshot({ path: outputPath });
+  await capture(outputPath);
   const readout = await window.locator('[data-op="exposure"] [data-readout]').innerText();
   const revision = await window.locator("[data-revision]").innerText();
   console.log(`[shot] exposure reads ${readout}, ${revision}`);
@@ -720,7 +999,7 @@ if (flow === "catalog") {
   );
   await window.waitForFunction(readoutIs, { op: "contrast", text: "+60" }, { timeout: 10_000 });
   await window.waitForTimeout(500);
-  await window.screenshot({ path: externalPath });
+  await capture(externalPath);
   console.log(`[shot] external writer moved contrast to 60, wrote ${externalPath}`);
 }
 

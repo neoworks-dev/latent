@@ -29,7 +29,7 @@ struct OpParams {
   origin: vec2f,
   size: vec2f,
   kind: u32,
-  pad0: u32,
+  opacity: f32,
   pad1: u32,
   pad2: u32,
   v: array<vec4f, 7>,
@@ -38,6 +38,16 @@ struct OpParams {
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var mid: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> op: OpParams;
+// The op's combined mask, r8; a 1x1 white texture when the op has none. A neighbourhood
+// op blends here, in its combine pass, not in the blur that feeds it: the filter still
+// reads unmasked pixels, so an edge of the mask does not become an edge in the filter.
+@group(0) @binding(3) var mask: texture_2d<f32>;
+
+fn mask_at(position: vec2f) -> f32 {
+  let dims = vec2i(textureDimensions(mask));
+  let at = clamp(vec2i(position), vec2i(0, 0), dims - vec2i(1, 1));
+  return textureLoad(mask, at, 0).r * op.opacity;
+}
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
@@ -234,5 +244,5 @@ fn desaturate(rgb: vec3f, amount: f32) -> vec3f {
     }
     default: {}
   }
-  return vec4f(rgb, 1.0);
+  return vec4f(mix(source, rgb, mask_at(in.pos.xy)), 1.0);
 }

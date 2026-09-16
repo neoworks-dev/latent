@@ -4,10 +4,12 @@ import type {
   EngineClient,
   EngineConnectionState,
   FrameListener,
+  MaskListener,
   ThumbnailListener,
 } from "@latent/contracts";
 import {
   FRAME_HEADER_BYTES,
+  FRAME_MAGIC_MASK,
   FRAME_MAGIC_THUMBNAIL,
   frameBody,
   type MethodMap,
@@ -37,6 +39,7 @@ export class WebSocketEngineClient implements EngineClient {
   private readonly notificationListeners = new Map<string, Set<(params: unknown) => void>>();
   private readonly frameListeners = new Map<number, Set<FrameListener>>();
   private readonly thumbnailListeners = new Map<number, Set<ThumbnailListener>>();
+  private readonly maskListeners = new Set<MaskListener>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
   private readonly openWaiters = new Set<() => void>();
@@ -98,6 +101,13 @@ export class WebSocketEngineClient implements EngineClient {
     };
   }
 
+  onMask(listener: MaskListener): () => void {
+    this.maskListeners.add(listener);
+    return () => {
+      this.maskListeners.delete(listener);
+    };
+  }
+
   private connect(): void {
     const socket = new WebSocket(this.url);
     socket.binaryType = "arraybuffer";
@@ -151,6 +161,12 @@ export class WebSocketEngineClient implements EngineClient {
       // The payload stays binary all the way to the <img>: a Blob, never a data URL.
       const jpeg = new Blob([frameBody(buffer)], { type: "image/jpeg" });
       for (const listener of listeners) listener(header, jpeg);
+      return;
+    }
+    if (header.magic === FRAME_MAGIC_MASK) {
+      // r8: one coverage byte per pixel, a view into the socket's buffer like LFRM's.
+      const coverage = new Uint8Array(buffer, FRAME_HEADER_BYTES, header.width * header.height);
+      for (const listener of this.maskListeners) listener(header, coverage);
       return;
     }
     const listeners = this.frameListeners.get(header.target);

@@ -364,6 +364,7 @@ nlohmann::json describe_ops() {
     nlohmann::json described = {{"name", definition.name},
                                 {"panel", definition.panel},
                                 {"label", definition.label},
+                                {"maskable", definition.maskable()},
                                 {"params", params}};
     if (!definition.section.empty()) described["section"] = definition.section;
     if (definition.order > 0) described["order"] = definition.order;

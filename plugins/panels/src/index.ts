@@ -13,6 +13,14 @@ declare module "@neoworks/extension-system" {
   }
 }
 
+// The controls the hand-built columns reuse: the Masks pane draws the selected layer's own
+// sliders with GeneratedPanel, and its component rows use the same slider and readout as
+// the Edit column rather than a second pair that drifts from it.
+export { default as GeneratedPanel } from "./GeneratedPanel.svelte";
+export { default as Slider } from "./Slider.svelte";
+export { default as ValueField } from "./ValueField.svelte";
+export { sliderRange, type SliderRange } from "./panels";
+
 export const panelsPlugin: Plugin.Object<void> = {
   name: "panels",
   inject: ["engine", "panes", "viewer"],

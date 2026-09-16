@@ -14,14 +14,18 @@ import type {
   CatalogPhoto,
   JobCancelResult,
   JobProgressParams,
+  MaskComponent,
+  MaskDetectResult,
+  MaskPreviewResult,
+  Op,
   PhotoOpenResult,
   PythonFinishedParams,
   PythonRunResult,
   ViewOpenResult,
   ViewRenderResult,
 } from "@latent/protocol";
-import { FRAME_HEADER_BYTES } from "@latent/protocol";
-import { PhotoState, renderFrame, startMockEngine } from "../mock-engine";
+import { FRAME_HEADER_BYTES, parseFrameHeader } from "@latent/protocol";
+import { opDefinitions, PhotoState, renderFrame, startMockEngine } from "../mock-engine";
 
 function exposureOf(photo: PhotoState): number {
   const entry = photo.stack.find((candidate) => candidate.op === "exposure");
@@ -633,3 +637,399 @@ describe("catalog over the socket", () => {
     }
   });
 });
+
+/** The error message a call came back with; fails loudly when the call succeeded. */
+async function failureOf(call: Promise<unknown>): Promise<string> {
+  return call.then(
+    () => "the call succeeded",
+    (error: Error) => error.message,
+  );
+}
+
+/** An op with one mask component, the shape the UI writes through `stack.set`. */
+function maskedStack(component: MaskComponent, opacity?: number): Op[] {
+  const op: Op = {
+    id: "op1",
+    op: "exposure",
+    params: { value: 1 },
+    enabled: true,
+    mask: { components: [component] },
+  };
+  if (opacity !== undefined) op.opacity = opacity;
+  return [op];
+}
+
+const radial: MaskComponent = {
+  id: "m1",
+  kind: "radial",
+  mode: "add",
+  feather: 20,
+  params: { center: [0.5, 0.5], radius: [0.3, 0.3], angle: 0 },
+};
+
+async function openMasked(
+  client: TestClient,
+  component: MaskComponent = radial,
+  opacity?: number,
+): Promise<{ photoId: number; viewId: number }> {
+  const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/mask.arw" });
+  const view = await client.call<ViewOpenResult>("view.open", {
+    photoId: opened.photoId,
+    width: 600,
+    height: 400,
+  });
+  await client.call<StackGetResult>("stack.set", {
+    photoId: opened.photoId,
+    stack: maskedStack(component, opacity),
+  });
+  return { photoId: opened.photoId, viewId: view.viewId };
+}
+
+describe("masks over the socket", () => {
+  test("a stack write carries mask and opacity through the stack, history and JSON", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const { photoId } = await openMasked(client, radial, 60);
+      const stored = await client.call<StackGetResult>("stack.get", { photoId });
+      expect(stored.stack[0]?.opacity).toBe(60);
+      expect(stored.stack[0]?.mask?.components[0]).toMatchObject({ id: "m1", kind: "radial" });
+
+      // The sidecar is JSON of exactly this: a round trip must not lose the mask.
+      expect(JSON.parse(JSON.stringify(stored.stack))).toEqual(stored.stack);
+
+      // op.update keeps them: only `params` and `enabled` are its business.
+      const updated = await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId: "op1",
+        params: { value: 2 },
+        enabled: false,
+      });
+      expect(updated.stack[0]).toMatchObject({ opacity: 60, enabled: false });
+      expect(updated.stack[0]?.mask?.components).toHaveLength(1);
+
+      const undone = await client.call<StackGetResult>("history.undo", { photoId });
+      expect(undone.stack[0]?.params.value).toBe(1);
+      expect(undone.stack[0]?.mask?.components).toHaveLength(1);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("op.update writes the mask whole, clears it with null and sets the opacity", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/m.arw" });
+      const photoId = opened.photoId;
+      const added = await client.call<StackGetResult>("op.add", {
+        photoId,
+        op: "exposure",
+        params: { value: 1 },
+        mask: { components: [radial] },
+        opacity: 80,
+      });
+      const opId = added.stack[0]?.id ?? "";
+      expect(added.stack[0]).toMatchObject({ opacity: 80 });
+      expect(added.stack[0]?.mask?.components[0]?.state).toBe("ready");
+
+      // A second component replaces the list: never a merge by index.
+      const brush: MaskComponent = { id: "b1", kind: "brush", mode: "subtract" };
+      const replaced = await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId,
+        params: {},
+        mask: { components: [radial, brush] },
+        opacity: 55,
+      });
+      expect(replaced.stack[0]?.mask?.components.map((entry) => entry.id)).toEqual(["m1", "b1"]);
+      expect(replaced.stack[0]?.opacity).toBe(55);
+
+      // A transient tick leaves no snapshot: one undo goes back past the whole drag.
+      await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId,
+        params: {},
+        opacity: 40,
+        transient: true,
+      });
+      const committed = await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId,
+        params: {},
+        opacity: 30,
+      });
+      expect(committed.stack[0]?.opacity).toBe(30);
+      const undone = await client.call<StackGetResult>("history.undo", { photoId });
+      expect(undone.stack[0]?.opacity).toBe(55);
+
+      const cleared = await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId,
+        params: {},
+        mask: null,
+      });
+      expect(cleared.stack[0]?.mask).toBeUndefined();
+      expect(cleared.stack[0]?.opacity).toBe(55);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("mask.preview sends one LMSK frame before its result", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const { photoId, viewId } = await openMasked(client);
+      const preview = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(client.frames).toHaveLength(1);
+      const frame = client.frames[0] ?? new ArrayBuffer(0);
+      const header = parseFrameHeader(frame);
+      expect(header).toMatchObject({ magic: "LMSK", target: viewId, format: 2 });
+      // r8: one byte per pixel, and the result's size is the frame's.
+      expect(frame.byteLength - FRAME_HEADER_BYTES).toBe(header.width * header.height);
+      expect(preview.width).toBe(header.width);
+      // π·0.3² of the frame, softened by the feather.
+      expect(preview.coverage).toBeGreaterThan(0.2);
+      expect(preview.coverage).toBeLessThan(0.32);
+
+      // One component's own raster instead of the combined mask.
+      const single = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        componentId: "m1",
+        viewId,
+      });
+      expect(single.coverage).toBeCloseTo(preview.coverage ?? 0, 3);
+      expect(client.frames).toHaveLength(2);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("mask.stroke appends to a brush, and one pointer-down undoes as one step", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const brush: MaskComponent = {
+        id: "b1",
+        kind: "brush",
+        mode: "add",
+        feather: 30,
+        params: { size: 0.2, flow: 100 },
+      };
+      const { photoId, viewId } = await openMasked(client, brush);
+      const empty = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(empty.coverage).toBe(0);
+
+      // A drag: transient segments, then the committed one that closes the stroke.
+      for (const x of [0.3, 0.4, 0.5]) {
+        await client.call<StackGetResult>("mask.stroke", {
+          photoId,
+          opId: "op1",
+          componentId: "b1",
+          points: [[x, 0.5]],
+          transient: true,
+        });
+      }
+      const committed = await client.call<StackGetResult>("mask.stroke", {
+        photoId,
+        opId: "op1",
+        componentId: "b1",
+        points: [[0.6, 0.5]],
+      });
+      const painted = committed.stack[0]?.mask?.components[0];
+      expect(painted?.params?.strokeData).toHaveLength(4);
+      // The stroke reference the contract describes is there; the points are the engine's.
+      expect(painted?.params?.strokes).toBe("brush/b1.bin");
+
+      const drawn = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(drawn.coverage).toBeGreaterThan(0.02);
+
+      const undone = await client.call<StackGetResult>("history.undo", { photoId });
+      expect(undone.stack[0]?.mask?.components[0]?.params?.strokeData ?? []).toHaveLength(0);
+      const cleared = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(cleared.coverage).toBe(0);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("a stroke aimed at a component that is not a brush is refused", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const { photoId } = await openMasked(client);
+      const refused = await failureOf(
+        client.call("mask.stroke", {
+          photoId,
+          opId: "op1",
+          componentId: "m1",
+          points: [[0.5, 0.5]],
+        }),
+      );
+      expect(refused).toContain("not a brush");
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("mask.detect runs as a job: pending, progress, then a raster to preview", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const subject: MaskComponent = { id: "s1", kind: "subject", mode: "add" };
+      const { photoId, viewId } = await openMasked(client, subject);
+      const started = await client.call<MaskDetectResult>("mask.detect", {
+        photoId,
+        opId: "op1",
+        componentId: "s1",
+      });
+      expect(started.jobId).toBeGreaterThan(0);
+
+      // The component was already `pending` the moment it existed; the job puts its id on it.
+      const pending = await client.waitFor<StackChangedParams>(
+        "stack.changed",
+        (params) => componentState(params) === "pending" && componentJob(params) !== undefined,
+      );
+      expect(pending.stack[0]?.mask?.components[0]?.jobId).toBe(started.jobId);
+      // While it pends the component contributes nothing, and has no raster of its own.
+      const blank = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(blank.coverage).toBe(0);
+      const refused = await failureOf(
+        client.call("mask.preview", { photoId, opId: "op1", componentId: "s1", viewId }),
+      );
+      expect(refused).toContain("pending");
+
+      const done = await client.waitFor<JobProgressParams>(
+        "job.progress",
+        (params) => params.jobId === started.jobId && params.finished === true,
+      );
+      expect(done.kind).toBe("mask");
+      await client.waitFor("stack.changed", (params) => componentState(params) === "ready");
+
+      const detected = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(detected.coverage).toBeGreaterThan(0.1);
+      const ready = await client.call<StackGetResult>("stack.get", { photoId });
+      expect(ready.stack[0]?.mask?.components[0]?.params?.model).toBe("sam2-mock");
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("a text component without a prompt fails, and the job says why", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const text: MaskComponent = { id: "t1", kind: "text", mode: "add", params: { prompt: "" } };
+      const { photoId } = await openMasked(client, text);
+      const started = await client.call<MaskDetectResult>("mask.detect", {
+        photoId,
+        opId: "op1",
+        componentId: "t1",
+      });
+      const failed = await client.waitFor<JobProgressParams>(
+        "job.progress",
+        (params) => params.jobId === started.jobId && params.finished === true,
+      );
+      expect(failed.state).toBe("error");
+      expect(failed.error).toContain("no prompt");
+      await client.waitFor("stack.changed", (params) => componentState(params) === "failed");
+
+      // A component the mask does not have is not something to detect.
+      const missing = await failureOf(
+        client.call("mask.detect", { photoId, opId: "op1", componentId: "nope" }),
+      );
+      expect(missing).toContain("unknown mask component");
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("a whole-stack write from the UI keeps the strokes the engine owns", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const brush: MaskComponent = { id: "b1", kind: "brush", mode: "add", params: { size: 0.3 } };
+      const { photoId, viewId } = await openMasked(client, brush);
+      await client.call<StackGetResult>("mask.stroke", {
+        photoId,
+        opId: "op1",
+        componentId: "b1",
+        points: [[0.5, 0.5]],
+      });
+      const painted = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(painted.coverage).toBeGreaterThan(0);
+
+      // The UI writes the mask it was shown — a copy with no strokes in it — to change the
+      // feather. The engine's stroke list survives that.
+      await client.call<StackGetResult>("stack.set", {
+        photoId,
+        stack: maskedStack({ ...brush, feather: 10 }),
+      });
+      const after = await client.call<MaskPreviewResult>("mask.preview", {
+        photoId,
+        opId: "op1",
+        viewId,
+      });
+      expect(after.coverage).toBeGreaterThan(0);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("ops.describe marks the develop ops maskable and the geometry ops not", () => {
+    const byName = new Map(opDefinitions.map((op) => [op.name, op]));
+    expect(byName.get("exposure")?.maskable).toBe(true);
+    expect(byName.get("clarity")?.maskable).toBe(true);
+    expect(byName.get("crop")?.maskable).toBe(false);
+    expect(byName.get("transform")?.maskable).toBe(false);
+  });
+});
+
+/** The state of the first mask component in a `stack.changed`, for `waitFor`. */
+function componentState(params: Record<string, unknown>): string | undefined {
+  const stack = params.stack as Op[] | undefined;
+  return stack?.[0]?.mask?.components[0]?.state;
+}
+
+function componentJob(params: Record<string, unknown>): number | undefined {
+  const stack = params.stack as Op[] | undefined;
+  return stack?.[0]?.mask?.components[0]?.jobId;
+}

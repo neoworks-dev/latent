@@ -58,7 +58,10 @@ int main(int argc, char** argv) {
     std::vector<Ort::Value> inputs;
     for (size_t i = 0; i < session.GetInputCount(); ++i) {
       input_names.push_back(session.GetInputNameAllocated(i, allocator).get());
-      auto info = session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+      // GetTensorTypeAndShapeInfo() is a non-owning view into the TypeInfo; the TypeInfo
+      // must outlive it or the element type reads as garbage.
+      const Ort::TypeInfo type_info = session.GetInputTypeInfo(i);
+      auto info = type_info.GetTensorTypeAndShapeInfo();
       if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
         std::fprintf(stderr, "input %s is not float32; probe only handles float models\n",
                      input_names.back().c_str());

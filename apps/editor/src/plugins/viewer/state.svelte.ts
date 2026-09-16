@@ -1,6 +1,7 @@
 import type { EngineClient, EngineFrame, FrameSink, ViewerService } from "@latent/contracts";
-import type { Op, StackGetResult } from "@latent/protocol";
+import type { Mask, Op, OpUpdateParams, StackGetResult } from "@latent/protocol";
 import { FrameTimingLog } from "../../lib/engine/frame-timing";
+import { ViewerOverlayState } from "./overlay.svelte";
 
 interface QueuedUpdate {
   opId: string;
@@ -29,6 +30,9 @@ export class ViewerState implements ViewerService {
   status = $state("no photo");
   latencyMs = $state(0);
   engineMs = $state(0);
+  /** Which op the Masks and Layers columns are pointed at. View state, not edit state. */
+  selectedOpId = $state<string | null>(null);
+  readonly overlay = new ViewerOverlayState();
 
   private renderWidth = 1;
   private renderHeight = 1;
@@ -44,6 +48,8 @@ export class ViewerState implements ViewerService {
   private readonly addsInFlight: PendingAdd[] = [];
   private unsubscribeFrame: (() => void) | null = null;
   private readonly unsubscribeStack: () => void;
+  private stackWrites: Promise<void> = Promise.resolve();
+  private stackWriteBusy = false;
 
   /**
    * `traceEvery > 0` prints a p50/p95 stage breakdown every that many frames. Off by
@@ -86,6 +92,8 @@ export class ViewerState implements ViewerService {
    */
   private paint(frame: EngineFrame): void {
     const marks = this.frameSink?.(frame);
+    // The overlay letterboxes to the frame's aspect, so it follows the frame, not the box.
+    this.overlay.setImageSize(frame.header.width, frame.header.height);
     const sent = this.renderSentAt;
     if (!marks || sent === 0) return;
     if (this.presentHandle !== null) cancelAnimationFrame(this.presentHandle);
@@ -187,6 +195,41 @@ export class ViewerState implements ViewerService {
     return this.addOp(op, params, transient);
   }
 
+  setOpParams(opId: string, params: Record<string, unknown>, transient: boolean): Promise<void> {
+    return this.updateOp(opId, params, transient);
+  }
+
+  selectOp(opId: string | null): void {
+    this.selectedOpId = opId;
+  }
+
+  /**
+   * Layer opacity, 0–100. `transient` is a readout still being dragged: no snapshot, and
+   * the tick is dropped while another write is in flight so a drag cannot queue up.
+   */
+  setOpacity(opId: string, value: number, transient: boolean): Promise<void> {
+    if (transient && this.stackWriteBusy) return Promise.resolve();
+    return this.writeOp({ opId, params: {}, opacity: value, transient });
+  }
+
+  /**
+   * Replaces one op's mask, or clears it with `null`. Never a merge: a mask is an ordered
+   * list and merging two of them by index is not something a caller can reason about.
+   */
+  setMask(opId: string, mask: Mask | undefined, transient = false): Promise<void> {
+    if (transient && this.stackWriteBusy) return Promise.resolve();
+    return this.writeOp({ opId, params: {}, mask: mask ?? null, transient });
+  }
+
+  setEnabled(opId: string, enabled: boolean): Promise<void> {
+    return this.writeOp({ opId, params: {}, enabled, transient: false });
+  }
+
+  /** Reorder, duplicate, delete: the whole stack in the order it should end up in. */
+  setStack(stack: Op[]): Promise<void> {
+    return this.writeStack(() => stack);
+  }
+
   async undo(): Promise<void> {
     if (this.photoId === null || !this.canUndo) return;
     this.applyStack(await this.engine.call("history.undo", { photoId: this.photoId }));
@@ -255,10 +298,62 @@ export class ViewerState implements ViewerService {
     }
   }
 
+  /**
+   * The layer half of `op.update` — mask, opacity, enabled — on the same one-at-a-time
+   * chain as the whole-stack writes, so a reorder and a mask edit cannot cross.
+   */
+  private writeOp(update: Omit<OpUpdateParams, "photoId">): Promise<void> {
+    this.stackWriteBusy = true;
+    const run = this.stackWrites
+      .then(async () => {
+        const photoId = this.photoId;
+        if (photoId === null) return;
+        this.applyStack(await this.engine.call("op.update", { ...update, photoId }));
+        this.requestRender();
+      })
+      .catch((error: Error) => {
+        this.status = error.message;
+      })
+      .finally(() => {
+        if (this.stackWrites === run) this.stackWriteBusy = false;
+      });
+    this.stackWrites = run;
+    return run;
+  }
+
+  /**
+   * One whole-stack write at a time, each built from the mirror as it is when the call goes
+   * out — two reorders in a row must not both start from the stack before the first one.
+   */
+  private writeStack(transform: (stack: Op[]) => Op[]): Promise<void> {
+    this.stackWriteBusy = true;
+    const run = this.stackWrites
+      .then(async () => {
+        const photoId = this.photoId;
+        if (photoId === null) return;
+        const stack = transform(this.stack);
+        this.applyStack(await this.engine.call("stack.set", { photoId, stack }));
+        this.requestRender();
+      })
+      .catch((error: Error) => {
+        this.status = error.message;
+      })
+      .finally(() => {
+        if (this.stackWrites === run) this.stackWriteBusy = false;
+      });
+    this.stackWrites = run;
+    return run;
+  }
+
   private applyStack(state: StackGetResult): void {
     this.stack = state.stack;
     this.revision = state.revision;
     this.canUndo = state.canUndo;
     this.canRedo = state.canRedo;
+    // An op that undo or a script took out of the stack cannot stay selected.
+    const selected = this.selectedOpId;
+    if (selected !== null && !state.stack.some((op) => op.id === selected)) {
+      this.selectedOpId = null;
+    }
   }
 }

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "gpu/gpu.h"
+#include "image/gray.h"
 #include "ops/op.h"
 #include "raw/raw_decode.h"
 
@@ -12,8 +13,11 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace latent {
 
@@ -56,6 +60,15 @@ struct RenderTiming {
   double readback_ms = 0;
 };
 
+// What mask.preview answers with, next to the LMSK frame it precedes.
+struct MaskReadout {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // Share of the content rect above 50 %, so a client can tell an empty mask from a
+  // failed one (protocol MaskPreviewResult).
+  double coverage = 0;
+};
+
 struct ViewGeometry {
   uint32_t width = 0;
   uint32_t height = 0;
@@ -93,6 +106,20 @@ class Renderer {
   RenderTiming render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
                       size_t offset);
 
+  // An AI component's raster: mask.detect's output, or the PNG cache reloaded when the
+  // photo was opened. Held per photo and resampled into whatever size a view needs, so it
+  // survives a resize and every view shares one copy.
+  void put_mask_raster(int64_t photo_id, std::string_view component_id, std::string_view hash,
+                       GrayImage raster);
+  bool has_mask_raster(int64_t photo_id, std::string_view component_id,
+                       std::string_view hash) const;
+
+  // Renders the stack into the view — which builds any mask it needs — then reads one r8
+  // mask back into `out`: `op_id`'s combined mask, or one component's raster when
+  // `component_id` is not empty. Throws if either is unknown.
+  MaskReadout read_mask(uint32_t view_id, const Stack& stack, std::string_view op_id,
+                        std::string_view component_id, std::vector<uint8_t>& out, size_t offset);
+
  private:
   struct Photo;
   struct View;
@@ -100,6 +127,14 @@ class Renderer {
 
   View& view_for(uint32_t view_id);
   void build_base(View& view);
+  // Runs the op chain into the view's ping-pong textures and returns the texture the last
+  // pass wrote (the base when the stack had nothing to do).
+  WGPUTextureView run_passes(View& view, const Stack& stack);
+  // Rasterises and folds one op's mask into a cached r8 texture. Called between passes,
+  // because a luminance or colour component reads the op's input, which only exists once
+  // everything below it has been submitted.
+  void build_mask(View& view, const Op& op, const nlohmann::json& canonical,
+                  const std::string& hash, WGPUTextureView input);
 
   Gpu gpu_;
   RenderPipelineHandle linearize_pipeline_;
@@ -108,6 +143,18 @@ class Renderer {
   RenderPipelineHandle blur_pipeline_;
   RenderPipelineHandle neighborhood_pipeline_;
   RenderPipelineHandle display_pipeline_;
+  RenderPipelineHandle mask_pipeline_;
+  RenderPipelineHandle mask_combine_pipeline_;
+  // 1x1 r8: white is "the op applies everywhere" for an unmasked op, black is the empty
+  // accumulator every mask folds into.
+  TextureHandle white_mask_;
+  TextureViewHandle white_mask_view_;
+  TextureHandle empty_mask_;
+  TextureViewHandle empty_mask_view_;
+  BufferHandle mask_uniforms_;
+  uint32_t mask_uniform_capacity_ = 0;
+  // One slot per combine mode, written once: the fold never needs a per-frame upload.
+  BufferHandle combine_uniforms_;
   std::unordered_map<int64_t, std::unique_ptr<Photo>> photos_;
   std::unordered_map<uint32_t, std::unique_ptr<View>> views_;
 };

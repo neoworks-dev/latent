@@ -29,6 +29,10 @@ export interface MethodMap {
   "catalog.collections": { params: G.CatalogCollectionsParams; result: G.CatalogCollectionsResult };
   "catalog.collectionSet": { params: G.CatalogCollectionSetParams; result: G.CatalogCollectionsResult };
   "catalog.thumbnail": { params: G.CatalogThumbnailParams; result: G.CatalogThumbnailResult };
+  "mask.preview": { params: G.MaskPreviewParams; result: G.MaskPreviewResult };
+  "mask.detect": { params: G.MaskDetectParams; result: G.MaskDetectResult };
+  // MaskStrokeResult is a `$ref` alias of StackGetResult; the generator dedupes it.
+  "mask.stroke": { params: G.MaskStrokeParams; result: G.StackGetResult };
   "catalog.thumbnails": { params: G.CatalogThumbnailsParams; result: G.CatalogThumbnailsResult };
   "catalog.remove": { params: G.CatalogRemoveParams; result: G.CatalogRemoveResult };
   "job.cancel": { params: G.JobCancelParams; result: G.JobCancelResult };
@@ -75,6 +79,9 @@ export const methods: readonly MethodName[] = [
   "catalog.thumbnails",
   "catalog.remove",
   "job.cancel",
+  "mask.preview",
+  "mask.detect",
+  "mask.stroke",
 ];
 
 export const notifications: readonly NotificationName[] = [

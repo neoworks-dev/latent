@@ -22,7 +22,7 @@ struct OpParams {
   origin: vec2f,
   size: vec2f,
   kind: u32,
-  pad0: u32,
+  opacity: f32,  // unused here: the blend happens in neighborhood.wgsl's combine pass
   pad1: u32,
   pad2: u32,
   v: array<vec4f, 7>,

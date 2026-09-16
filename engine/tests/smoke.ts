@@ -108,6 +108,9 @@ assert(described.ops.find((op: any) => op.name === "color_mixer").params.every((
 
 const sidecarPath = `${samplePath}.latent`;
 if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
+// Its sibling directory holds brush strokes and mask rasters; a stale one would make the
+// mask assertions below pass for the wrong reason.
+rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 
 const photo = await timed("photo.open", () => ui.call("photo.open", { path: samplePath }));
 console.log(`  photo ${photo.photoId}: ${photo.camera} ${photo.width}x${photo.height} hash ${photo.hash.slice(0, 12)}…`);
@@ -278,6 +281,289 @@ for (let i = 0; i < 20; i++) {
 const full = await ui.call("view.render", { viewId });
 console.log(`  all ${everything.length} ops at 1280x720: render ${full.renderMs.toFixed(2)} ms, readback ${full.readbackMs.toFixed(2)} ms (worst render ${worst.renderMs.toFixed(2)} ms)`);
 assert(full.renderMs + full.readbackMs < 16, `the whole op set must stay inside the 16 ms frame budget, took ${(full.renderMs + full.readbackMs).toFixed(2)} ms`);
+
+// ---- masks and layer opacity ------------------------------------------------------------
+// A mask is per op, and a layer is one op of the stack with a mask and an opacity
+// (PROMPT.md 3.7). The overlay the UI draws is the same raster the op samples, so these
+// assertions compare the frame against the raster mask.preview sent, not against a guess
+// about where the ellipse landed.
+const definitionOf = (name: string) => described.ops.find((op: any) => op.name === name);
+for (const develop of ["exposure", "dehaze", "sharpening", "color_mixer", "lens_correction"]) {
+  assert(definitionOf(develop).maskable === true, `${develop} must be maskable`);
+}
+for (const geometry of ["crop", "rotate", "flip", "transform"]) {
+  assert(definitionOf(geometry).maskable === false, `${geometry} must not be maskable`);
+}
+
+/** sRGB 8-bit back to the linear light the mask blend happens in. */
+function toLinear(level: number): number {
+  const value = level / 255;
+  return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+}
+
+/** Mean rgb level of the frame's pixels where the mask raster satisfies `where`. */
+function meanWhere(pixels: Uint8Array, mask: Uint8Array, where: (level: number) => boolean) {
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < mask.length; i++) {
+    if (!where(mask[i]!)) continue;
+    sum += (pixels[i * 4]! + pixels[i * 4 + 1]! + pixels[i * 4 + 2]!) / 3;
+    count++;
+  }
+  return count === 0 ? 0 : sum / count;
+}
+
+const radialComponent = {
+  id: "radial01",
+  kind: "radial",
+  mode: "add",
+  feather: 0,
+  params: { center: [0.5, 0.5], radius: [0.25, 0.25] },
+};
+const maskedExposure = {
+  id: "mask0001",
+  op: "exposure",
+  params: { value: 2 },
+  enabled: true,
+  mask: { components: [radialComponent] },
+};
+
+await ui.call("stack.set", { photoId, stack: [] });
+await ui.call("view.render", { viewId });
+const unmaskedFrame = new Uint8Array(ui.frame!.pixels);
+await timed("stack.set (masked +2 EV)", () => ui.call("stack.set", { photoId, stack: [maskedExposure] }));
+const maskRender = await timed("view.render (masked)", () => ui.call("view.render", { viewId }));
+const maskedFrame = new Uint8Array(ui.frame!.pixels);
+
+const masksBefore = ui.masks.length;
+const radialPreview = await timed("mask.preview", () =>
+  ui.call("mask.preview", { photoId, opId: "mask0001", viewId }),
+);
+assert(ui.masks.length === masksBefore + 1, "mask.preview must send exactly one LMSK frame");
+const raster = ui.masks.at(-1)!;
+console.log(
+  `  mask ${radialPreview.width}x${radialPreview.height}, coverage ${(radialPreview.coverage * 100).toFixed(1)}% of the image rect`,
+);
+assert(raster.width === 1280 && raster.height === 720, "the raster must be the view's proxy size");
+assert(raster.target === viewId, "the LMSK frame must name the view it was sized for");
+assert(radialPreview.width === raster.width && radialPreview.height === raster.height, "result and frame disagree");
+// A hard-edged ellipse of radius 0.25 x 0.25 covers pi/16 of the image rect.
+assert(
+  Math.abs(radialPreview.coverage - Math.PI * 0.25 * 0.25) < 0.01,
+  `a 0.25 radial should cover ~19.6% of the image rect, got ${(radialPreview.coverage * 100).toFixed(1)}%`,
+);
+
+const insideBefore = meanWhere(unmaskedFrame, raster.pixels, (m) => m > 200);
+const insideAfter = meanWhere(maskedFrame, raster.pixels, (m) => m > 200);
+const outsideBefore = meanWhere(unmaskedFrame, raster.pixels, (m) => m === 0);
+const outsideAfter = meanWhere(maskedFrame, raster.pixels, (m) => m === 0);
+console.log(
+  `  inside the mask ${insideBefore.toFixed(1)} -> ${insideAfter.toFixed(1)}, outside ${outsideBefore.toFixed(1)} -> ${outsideAfter.toFixed(1)}`,
+);
+assert(insideAfter > insideBefore + 20, "+2 EV inside the mask did not brighten those pixels");
+assert(Math.abs(outsideAfter - outsideBefore) < 0.01, "a masked op must not touch a pixel outside its mask");
+assert(maskRender.renderMs < 16, `a masked render must stay in budget, took ${maskRender.renderMs}`);
+
+// opacity is the same mix over the whole mask: half the strength is halfway in linear light.
+await timed("op.update (opacity 50)", () =>
+  ui.call("op.update", { photoId, opId: "mask0001", params: {}, opacity: 50 }),
+);
+const withOpacity = await ui.call("stack.get", { photoId });
+assert(withOpacity.stack[0].opacity === 50, "op.update must store opacity");
+await ui.call("view.render", { viewId });
+const halfFrame = new Uint8Array(ui.frame!.pixels);
+const insideHalf = meanWhere(halfFrame, raster.pixels, (m) => m > 200);
+const halfway = (toLinear(insideBefore) + toLinear(insideAfter)) / 2;
+console.log(`  opacity 50 lands at ${insideHalf.toFixed(1)} between ${insideBefore.toFixed(1)} and ${insideAfter.toFixed(1)}`);
+assert(insideHalf > insideBefore + 5 && insideHalf < insideAfter - 5, "opacity 50 did not halve the effect");
+assert(
+  Math.abs(toLinear(insideHalf) - halfway) / halfway < 0.03,
+  "opacity 50 must be the midpoint in linear light",
+);
+assert(
+  Math.abs(meanWhere(halfFrame, raster.pixels, (m) => m === 0) - outsideBefore) < 0.01,
+  "opacity must not reach outside the mask",
+);
+await ui.call("op.update", { photoId, opId: "mask0001", params: {}, opacity: 100 });
+
+// Brush strokes: the engine owns the list, the UI only ever appends points to it.
+const brushed = {
+  ...maskedExposure,
+  mask: {
+    components: [
+      radialComponent,
+      { id: "brush01", kind: "brush", mode: "add", feather: 40, params: { size: 0.12, flow: 100 } },
+    ],
+  },
+};
+await ui.call("stack.set", { photoId, stack: [brushed] });
+const emptyBrush = await ui.call("mask.preview", { photoId, opId: "mask0001", viewId });
+assert(
+  Math.abs(emptyBrush.coverage - radialPreview.coverage) < 0.005,
+  "a brush with no strokes must add nothing to the mask",
+);
+// One pointer-down: transient segments, then the committed one that snapshots.
+const strokeSegments = [
+  [[0.2, 0.15], [0.2, 0.35]],
+  [[0.2, 0.35], [0.2, 0.55]],
+  [[0.2, 0.55], [0.2, 0.85]],
+];
+for (const [index, points] of strokeSegments.entries()) {
+  await ui.call("mask.stroke", {
+    photoId,
+    opId: "mask0001",
+    componentId: "brush01",
+    points,
+    transient: index < strokeSegments.length - 1,
+  });
+}
+const painted = await timed("mask.preview (brushed)", () =>
+  ui.call("mask.preview", { photoId, opId: "mask0001", viewId }),
+);
+console.log(`  brush raised coverage ${(emptyBrush.coverage * 100).toFixed(1)}% -> ${(painted.coverage * 100).toFixed(1)}%`);
+assert(painted.coverage > emptyBrush.coverage + 0.01, "brush strokes must raise the mask's coverage");
+
+const strokeState = await ui.call("stack.get", { photoId });
+const brushParams = strokeState.stack[0].mask.components[1].params;
+assert(brushParams.strokeData.length === strokeSegments.length, "every segment must be stored");
+assert(brushParams.strokes === "masks/brush01.strokes.json", "the engine names the stroke file");
+const strokeFile = `${samplePath}.latent.d/masks/brush01.strokes.json`;
+assert(existsSync(strokeFile), `the engine must mirror the strokes to ${strokeFile}`);
+assert(
+  JSON.parse(await Bun.file(strokeFile).text()).length === strokeSegments.length,
+  "the mirrored stroke file disagrees with the stack",
+);
+
+// One pointer-down is one undo step, however many segments it took.
+const afterUndo = await timed("history.undo (stroke)", () => ui.call("history.undo", { photoId }));
+assert(
+  (afterUndo.stack[0].mask.components[1].params.strokeData ?? []).length === 0,
+  "undo must drop the whole stroke, not its last segment",
+);
+const afterRedo = await ui.call("history.redo", { photoId });
+assert(
+  afterRedo.stack[0].mask.components[1].params.strokeData.length === strokeSegments.length,
+  "redo must bring the stroke back whole",
+);
+
+// AI kinds are jobs. Without a model the component fails; it never guesses.
+const aiMask = {
+  id: "mask0002",
+  op: "clarity",
+  params: { value: 60 },
+  enabled: true,
+  mask: { components: [{ id: "ai01", kind: "subject", mode: "add" }] },
+};
+await ui.call("stack.set", { photoId, stack: [brushed, aiMask] });
+const fresh = await ui.call("stack.get", { photoId });
+assert(fresh.stack[1].mask.components[0].state === "pending", "an unrun AI component starts pending");
+const detect = await timed("mask.detect (no model)", () =>
+  ui.call("mask.detect", { photoId, opId: "mask0002", componentId: "ai01" }),
+);
+assert(detect.jobId >= 1, "mask.detect must return a jobId");
+await waitFor("the mask job to finish", () =>
+  ui.notifications.some((n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished),
+);
+const maskJob = ui.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished,
+)!;
+console.log(`  mask job ${detect.jobId}: ${maskJob.params.state} — ${maskJob.params.error}`);
+assert(maskJob.params.kind === "mask", "a mask job reports kind mask");
+assert(maskJob.params.state === "error", "a detect with no model must end in error");
+assert(maskJob.params.error === "model not installed", `wrong failure: ${maskJob.params.error}`);
+const failed = await ui.call("stack.get", { photoId });
+assert(failed.stack[1].mask.components[0].state === "failed", "the component must be failed");
+assert(failed.stack[1].mask.components[0].params.error === "model not installed", "the reason belongs on the component");
+// A pending or failed component contributes nothing, so its op does nothing at all.
+const pendingPreview = await ui.call("mask.preview", { photoId, opId: "mask0002", viewId });
+assert(pendingPreview.coverage === 0, "a failed component must contribute nothing");
+const refusedComponent = await ui.fail("mask.preview", { photoId, opId: "mask0002", componentId: "ai01", viewId });
+assert(refusedComponent.startsWith("-32602"), `a failed component has no raster: ${refusedComponent}`);
+
+// ---- mask errors ------------------------------------------------------------------------
+assert(
+  (await ui.fail("mask.preview", { photoId, opId: "nosuchop" })).startsWith("-32602"),
+  "mask.preview on an unknown op must be -32602",
+);
+assert(
+  (await ui.fail("mask.stroke", { photoId, opId: "mask0001", componentId: "radial01", points: [[0.1, 0.1]] })).startsWith("-32602"),
+  "only a brush component takes strokes",
+);
+assert(
+  (await ui.fail("mask.detect", { photoId, opId: "mask0001", componentId: "radial01" })).startsWith("-32602"),
+  "a radial rasterises inline, not through mask.detect",
+);
+const badMask = await ui.fail("stack.set", {
+  photoId,
+  stack: [{ op: "exposure", params: { value: 1 }, enabled: true, mask: { components: [{ id: "a", kind: "sorcery", mode: "add" }] } }],
+});
+assert(badMask.startsWith("-32602"), `an unknown component kind must be -32602, got ${badMask}`);
+const duplicateIds = await ui.fail("stack.set", {
+  photoId,
+  stack: [{ op: "exposure", params: { value: 1 }, enabled: true, mask: { components: [{ id: "a", kind: "radial", mode: "add" }, { id: "a", kind: "brush", mode: "add" }] } }],
+});
+assert(duplicateIds.startsWith("-32602"), `duplicate component ids must be -32602, got ${duplicateIds}`);
+const pixelCoords = await ui.fail("stack.set", {
+  photoId,
+  stack: [{ op: "exposure", params: { value: 1 }, enabled: true, mask: { components: [{ id: "a", kind: "radial", mode: "add", params: { center: [640, 360] } }] } }],
+});
+assert(pixelCoords.startsWith("-32602"), `mask coordinates are normalised: ${pixelCoords}`);
+
+// A mask on a geometry op is dropped with a warning, not honoured and not an error.
+const logsBefore = ui.notifications.filter((n) => n.method === "engine.log").length;
+const geometryMasked = await ui.call("stack.set", {
+  photoId,
+  stack: [{ op: "crop", params: { left: 0.1 }, enabled: true, mask: { components: [radialComponent] } }],
+});
+assert(geometryMasked.stack[0].mask === undefined, "a geometry op must not keep a mask");
+assert(
+  ui.notifications.filter((n) => n.method === "engine.log").length > logsBefore,
+  "dropping a mask must be announced on engine.log",
+);
+
+// op.add takes a mask and an opacity too, so a layer can be created in one call.
+const addedLayer = await timed("op.add (masked layer)", () =>
+  ui.call("op.add", {
+    photoId,
+    op: "vibrance",
+    params: { value: 40 },
+    opacity: 75,
+    mask: { components: [radialComponent] },
+  }),
+);
+const layer = addedLayer.stack.at(-1);
+assert(layer.opacity === 75, "op.add must store opacity");
+assert(layer.mask.components[0].id === "radial01", "op.add must store the mask");
+assert(layer.mask.components[0].state === "ready", "an inline kind is ready as soon as it exists");
+
+// The stack the Python and MCP sections below expect.
+await ui.call("stack.set", { photoId, stack: [] });
+
+// ---- the mask API from Python -----------------------------------------------------------
+const scriptedMask = await ui.call("python.run", {
+  code: [
+    "import json",
+    "p = latent.photo",
+    "op = p.stack.add('exposure', value=1.5)",
+    "component = op.mask.add('radial', center=[0.5, 0.5], radius=[0.2, 0.2], feather=0)",
+    "op.opacity = 40",
+    "print(json.dumps([len(op.mask), op.mask[0]['kind'], op.opacity, component == op.mask[0]['id'],",
+    "                  len(p.masks.preview(op.id))]))",
+  ].join("\n"),
+  photoId,
+});
+assert(scriptedMask.ok === true, `the mask script failed: ${scriptedMask.stderr}`);
+const maskValues = JSON.parse(scriptedMask.stdout);
+console.log(`  python mask API -> ${scriptedMask.stdout.trim()}`);
+assert(maskValues[0] === 1 && maskValues[1] === "radial", "op.mask.add did not add a component");
+assert(maskValues[2] === 40, "op.opacity did not stick");
+assert(maskValues[3] === true, "mask.add must return the component id it generated");
+assert(maskValues[4] > 100, "photo.masks.preview should return a PNG");
+const removed = await ui.call("python.run", {
+  code: "op = latent.photo.stack[0]\nop.mask.remove(op.mask[0]['id'])\nprint(len(latent.photo.stack[0].mask))",
+});
+assert(removed.stdout.trim() === "0", `op.mask.remove did not remove the component: ${removed.stdout}`);
+await ui.call("stack.set", { photoId, stack: [] });
 
 // A drag that starts by creating the op: op.add is transient too, so the add and every
 // tick of the drag collapse into the one snapshot the committed update takes.
@@ -535,6 +821,35 @@ const jpeg = Uint8Array.from(atob(image.data), (character) => character.charCode
 assert(jpeg[0] === 0xff && jpeg[1] === 0xd8 && jpeg[2] === 0xff, "render_preview did not return JPEG bytes");
 console.log(`  preview ${jpeg.length} bytes of JPEG`);
 
+// render_preview(mask=…) hands back the raster instead of the picture, so an agent can
+// check what it selected rather than describe it (PROMPT.md 3.7).
+const agentMask = await ui.call("python.run", {
+  code: [
+    "p = latent.photo",
+    "op = p.stack[0] if len(p.stack) else p.stack.add('exposure', value=1)",
+    "print(op.id, op.mask.add('radial', center=[0.5, 0.5], radius=[0.3, 0.3]))",
+  ].join("\n"),
+  photoId,
+});
+assert(agentMask.ok === true, `the agent mask script failed: ${agentMask.stderr}`);
+const [agentOpId, agentComponentId] = agentMask.stdout.trim().split(" ");
+for (const target of [[agentOpId], [agentOpId, agentComponentId]]) {
+  const rendered = await timed("mcp render_preview (mask)", () =>
+    mcp({
+      jsonrpc: "2.0",
+      id: 50 + target.length,
+      method: "tools/call",
+      params: { name: "render_preview", arguments: { photo_id: photoId, max_size: 512, mask: target } },
+    }),
+  );
+  const block = rendered.result.content[0];
+  assert(block.type === "image" && block.mimeType === "image/png", `render_preview(mask) must return a PNG: ${JSON.stringify(block).slice(0, 200)}`);
+  const raster = Uint8Array.from(atob(block.data), (character) => character.charCodeAt(0));
+  assert(raster[0] === 0x89 && raster[1] === 0x50 && raster[2] === 0x4e, "the mask block is not PNG bytes");
+  console.log(`  render_preview(mask=${JSON.stringify(target)}) -> ${raster.length} PNG bytes`);
+}
+await ui.call("python.run", { code: `latent.photo.stack[0].mask.clear()` });
+
 const listed = await timed("mcp list_photos", () =>
   mcp({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "list_photos", arguments: {} } }),
 );
@@ -708,5 +1023,87 @@ const exitCode = await engine.process.exited;
 console.log(`latentd exited with ${exitCode} after SIGTERM`);
 assert(exitCode === 0, `latentd should exit 0, got ${exitCode}`);
 assert(!existsSync(portFile), "the daemon must remove its mcp.port file on the way out");
+
+// ---- mask.detect with the stub detector -------------------------------------------------
+// LATENT_MASK_STUB=1 swaps a shape generator in for SAM 2 (engine/src/ai/mask_detect.h), so
+// the whole job path — pending, job.progress, ready, the PNG cache beside the sidecar, the
+// overlay — runs end to end on a machine with no checkpoint on disk. Its own daemon,
+// because the detector is chosen once at startup.
+const stubScratch = `${scratch}-stub`;
+const stubEngine = startEngine(stubScratch, ["--no-mcp"], { LATENT_MASK_STUB: "1" });
+const stub = await connect(await stubEngine.endpoint);
+const stubPhoto = await timed("photo.open (stub)", () => stub.call("photo.open", { path: samplePath }));
+let stubId: number = stubPhoto.photoId;
+const stubView = await stub.call("view.open", { photoId: stubId, width: 640, height: 480 });
+await stub.call("stack.set", {
+  photoId: stubId,
+  stack: [
+    {
+      id: "stub0001",
+      op: "exposure",
+      params: { value: 1.5 },
+      enabled: true,
+      mask: { components: [{ id: "subject1", kind: "subject", mode: "add" }] },
+    },
+  ],
+});
+const beforeDetect = await stub.call("stack.get", { photoId: stubId });
+assert(beforeDetect.stack[0].mask.components[0].state === "pending", "an unrun AI component is pending");
+
+const stubJob = await timed("mask.detect (stub)", () =>
+  stub.call("mask.detect", { photoId: stubId, opId: "stub0001", componentId: "subject1" }),
+);
+const running = await stub.call("stack.get", { photoId: stubId });
+assert(running.stack[0].mask.components[0].state === "pending", "detect must mark the component pending");
+assert(running.stack[0].mask.components[0].jobId === stubJob.jobId, "the component must carry its jobId");
+await waitFor("the stub detect to finish", () =>
+  stub.notifications.some((n) => n.method === "job.progress" && n.params.jobId === stubJob.jobId && n.params.finished),
+);
+const stubProgress = stub.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === stubJob.jobId && n.params.finished,
+)!;
+assert(stubProgress.params.kind === "mask" && stubProgress.params.state === "done", `stub detect failed: ${JSON.stringify(stubProgress.params)}`);
+
+const stubReady = await stub.call("stack.get", { photoId: stubId });
+const detected = stubReady.stack[0].mask.components[0];
+console.log(`  stub subject -> ${detected.state}, model ${detected.params.model}, raster ${detected.params.raster}`);
+assert(detected.state === "ready", "a finished detect must leave the component ready");
+assert(detected.params.model === "stub-shapes", "the component must name the model that produced it");
+assert(detected.params.sourceHash === stubPhoto.hash, "the raster must be tied to the source image");
+assert(existsSync(`${samplePath}.latent.d/${detected.params.raster}`), "the raster must be cached beside the sidecar");
+
+const stubPreview = await stub.call("mask.preview", {
+  photoId: stubId,
+  opId: "stub0001",
+  componentId: "subject1",
+  viewId: stubView.viewId,
+});
+console.log(`  stub subject coverage ${(stubPreview.coverage * 100).toFixed(1)}%`);
+assert(stubPreview.coverage > 0.05, `a detected subject must cover something, got ${stubPreview.coverage}`);
+assert(stub.masks.at(-1)!.width === 640, "the raster follows the view it was sized for");
+
+// The raster outlives the process: reopening reads the PNG back rather than re-detecting.
+await stub.call("view.close", { viewId: stubView.viewId });
+await stub.call("photo.close", { photoId: stubId });
+const reopenedStub = await stub.call("photo.open", { path: samplePath });
+stubId = reopenedStub.photoId;
+const restoredView = await stub.call("view.open", { photoId: stubId, width: 640, height: 480 });
+const restoredPreview = await stub.call("mask.preview", {
+  photoId: stubId,
+  opId: "stub0001",
+  componentId: "subject1",
+  viewId: restoredView.viewId,
+});
+assert(
+  Math.abs(restoredPreview.coverage - stubPreview.coverage) < 0.001,
+  "the cached raster must come back from disk unchanged",
+);
+stub.close();
+stubEngine.process.kill("SIGTERM");
+await stubEngine.process.exited;
+rmSync(stubScratch, { recursive: true, force: true });
+
+if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
+rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 rmSync(scratch, { recursive: true, force: true });
 console.log(`smoke: ok in ${(performance.now() - started).toFixed(0)} ms`);

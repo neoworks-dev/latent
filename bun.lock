@@ -39,6 +39,8 @@
         "@latent/contracts": "workspace:*",
         "@latent/plugin-catalog": "workspace:*",
         "@latent/plugin-console": "workspace:*",
+        "@latent/plugin-layers": "workspace:*",
+        "@latent/plugin-masks": "workspace:*",
         "@latent/plugin-panels": "workspace:*",
         "@latent/protocol": "workspace:*",
         "@neoworks-dev/ui": "link:@neoworks-dev/ui",
@@ -103,6 +105,47 @@
       "version": "0.0.0",
       "dependencies": {
         "@latent/contracts": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
+    "plugins/layers": {
+      "name": "@latent/plugin-layers",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/plugin-masks": "workspace:*",
+        "@latent/plugin-panels": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
+    "plugins/masks": {
+      "name": "@latent/plugin-masks",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/plugin-panels": "workspace:*",
         "@latent/protocol": "workspace:*",
         "@neoworks-dev/ui": "link:@neoworks-dev/ui",
         "@neoworks/extension-system": "link:@neoworks/extension-system",
@@ -298,6 +341,10 @@
     "@latent/plugin-catalog": ["@latent/plugin-catalog@workspace:plugins/catalog"],
 
     "@latent/plugin-console": ["@latent/plugin-console@workspace:plugins/console"],
+
+    "@latent/plugin-layers": ["@latent/plugin-layers@workspace:plugins/layers"],
+
+    "@latent/plugin-masks": ["@latent/plugin-masks@workspace:plugins/masks"],
 
     "@latent/plugin-panels": ["@latent/plugin-panels@workspace:plugins/panels"],
 

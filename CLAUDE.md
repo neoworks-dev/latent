@@ -55,6 +55,11 @@ mirror Lightroom 1:1.
   `~/.claude/skills/comfy`). Graphs in `engine/workflows/`: fragments + blueprint, `comfy
   workflow compose`; compiled JSON is a template, substitute by node id at runtime.
 - SAM 2 has no text input. Text select = Florence-2 box → SAM 2. ORT with CUDA EP.
+  Florence-2 never abstains → only the `text` kind uses it; `subject`/`background` =
+  BiRefNet-lite, `sky`/`people` = SegFormer-B2 ADE20K (classes 2/12). Models prepared by
+  `scripts/models/fetch.py` into `~/.local/share/latent/models/<model>/` with
+  `config.json` + top-level `manifest.json` (sha256). I/O tables, preprocessing, timings
+  and C++ port notes: `scripts/models/README.md`. SAM 2 decoder `num_labels` must be 1.
 - Frame budget: < 16 ms slider tick end-to-end. Measured 2026-09-16: request→GPU 11.0 ms
   p50 at 811×1245 after WebGL2 painter; ~11 ms of it is Chromium's WebSocket receive of a
   4 MB frame, linear in bytes. Canvas draw is 0.0 ms. Numbers in `PROMPT.md` §8.1. Lever

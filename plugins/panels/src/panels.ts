@@ -283,9 +283,19 @@ export function trackTint(spec: OpParamSpec): string | null {
   return tintGradients[tint];
 }
 
-/** The value the control shows: the engine's stack when the op is in it, else the default. */
-export function paramValue(stack: Op[], op: OpDefinition, spec: OpParamSpec): unknown {
-  const entry = stack.find((candidate) => candidate.op === op.name);
+/**
+ * The value the control shows: the engine's stack when the op is in it, else the default.
+ * `opId` picks one entry by id — the same op can be in the stack twice, once masked.
+ */
+export function paramValue(
+  stack: Op[],
+  op: OpDefinition,
+  spec: OpParamSpec,
+  opId?: string | null,
+): unknown {
+  const entry = opId
+    ? stack.find((candidate) => candidate.id === opId)
+    : stack.find((candidate) => candidate.op === op.name);
   if (!entry) return spec.default;
   const value = entry.params[spec.name];
   if (value === undefined) return spec.default;
@@ -312,6 +322,27 @@ export function groupEdited(stack: Op[], group: PanelGroup): boolean {
 /** Every parameter of an op back at its described default — one write per op for a reset. */
 export function defaultParams(op: OpDefinition): Record<string, unknown> {
   return Object.fromEntries(op.params.map((spec) => [spec.name, spec.default]));
+}
+
+/** What the Edit column says about an op that is also a layer: a mask, an opacity, or both. */
+export interface LayerBadge {
+  opId: string;
+  components: number;
+  opacity: number;
+}
+
+/**
+ * The badge for one op of the generated column, or null when the op is an ordinary global
+ * adjustment. Opacity only shows when it is below 100, the way Lightroom only shows an
+ * amount that is not full.
+ */
+export function layerBadge(stack: Op[], op: OpDefinition): LayerBadge | null {
+  const entry = stack.find((candidate) => candidate.op === op.name);
+  if (!entry) return null;
+  const components = entry.mask?.components.length ?? 0;
+  const opacity = entry.opacity ?? 100;
+  if (components === 0 && opacity >= 100) return null;
+  return { opId: entry.id, components, opacity };
 }
 
 export interface HistoryKeyEvent {
