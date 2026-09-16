@@ -3,17 +3,22 @@ import type { Op, OpDefinition, OpParamSpec } from "@latent/protocol";
 import {
   compareOrder,
   controlKind,
+  curveParams,
+  curveStroke,
   decimalsFor,
   defaultParams,
   detented,
   editableText,
   fillBounds,
   formatValue,
+  generatedParams,
   groupBySection,
   groupEdited,
   historyShortcut,
   isBipolar,
   keyboardDelta,
+  mixerChannels,
+  mixerParams,
   opEdited,
   paramValue,
   parseValue,
@@ -172,18 +177,15 @@ describe("param to control mapping", () => {
     ).toBe("checkbox");
   });
 
-  test("curve and HSL params get a placeholder, never a slider over values a slider cannot hold", () => {
+  test("a curve gets a placeholder, never a slider over values a slider cannot hold", () => {
     const curve: OpParamSpec = {
       name: "a",
       type: "curve",
       default: null,
       display: { kind: "curve" },
     };
-    const hsl: OpParamSpec = { name: "a", type: "curve", default: null, display: { kind: "hsl" } };
     expect(controlKind(curve)).toBe("pending");
-    expect(controlKind(hsl)).toBe("pending");
-    expect(pendingNote(curve)).toBe("Curve editor — coming");
-    expect(pendingNote(hsl)).toBe("Color mixer — coming");
+    expect(pendingNote).toBe("Drawn by the curve editor");
   });
 
   test("without `display` the param's type still picks a control", () => {
@@ -369,6 +371,136 @@ describe("edited detection", () => {
   test("a section reset writes every parameter of an op in one call", () => {
     expect(defaultParams(whiteBalance)).toEqual({ temperature: 0, tint: 0 });
     expect(defaultParams(sharpening)).toEqual({ amount: 40 });
+  });
+});
+
+describe("curve params", () => {
+  const rgb: OpParamSpec = { name: "rgb", type: "curve", default: [], display: { kind: "curve" } };
+  const red: OpParamSpec = { name: "red", type: "curve", default: [], display: { kind: "curve" } };
+  const amount = (name: string, value = 0): OpParamSpec => ({
+    name,
+    label: name,
+    type: "number",
+    min: name.endsWith("Split") ? 0 : -100,
+    max: 100,
+    step: 1,
+    default: value,
+    display: { kind: "slider" },
+  });
+  const toneCurve = op("tone_curve", "Light", 7, [
+    amount("highlights"),
+    amount("shadows"),
+    amount("shadowSplit", 25),
+    amount("midtoneSplit", 50),
+    amount("highlightSplit", 75),
+    rgb,
+    red,
+  ]);
+
+  test("an op with point curves hands every parameter to the editor", () => {
+    const curve = curveParams(toneCurve);
+    expect(curve?.points.map((spec) => spec.name)).toEqual(["rgb", "red"]);
+    expect(curve?.regions.map((spec) => spec.name)).toEqual(["highlights", "shadows"]);
+    expect(curve?.splits.map((split) => split.name)).toEqual([
+      "shadowSplit",
+      "midtoneSplit",
+      "highlightSplit",
+    ]);
+    expect(generatedParams(toneCurve)).toEqual([]);
+  });
+
+  test("an op without one is generated the way it always was", () => {
+    expect(curveParams(exposure)).toBeNull();
+    expect(generatedParams(exposure)).toEqual(exposure.params);
+  });
+
+  test("the splits come back in Lightroom's order however the engine listed them", () => {
+    const shuffled = op("tone_curve", "Light", 7, [
+      amount("highlightSplit", 75),
+      amount("shadowSplit", 25),
+      amount("midtoneSplit", 50),
+      rgb,
+    ]);
+    expect(curveParams(shuffled)?.splits.map((split) => split.name)).toEqual([
+      "shadowSplit",
+      "midtoneSplit",
+      "highlightSplit",
+    ]);
+  });
+
+  test("a curve at its identity is not an edit, even though it is a fresh array", () => {
+    expect(opEdited([stackEntry("tone_curve", { rgb: [] })], toneCurve)).toBe(false);
+    const anchors = [
+      { x: 0, y: 0 },
+      { x: 1, y: 1 },
+    ];
+    expect(opEdited([stackEntry("tone_curve", { rgb: anchors })], toneCurve)).toBe(false);
+    const lifted = [
+      { x: 0, y: 0 },
+      { x: 0.5, y: 0.7 },
+      { x: 1, y: 1 },
+    ];
+    expect(opEdited([stackEntry("tone_curve", { rgb: lifted })], toneCurve)).toBe(true);
+  });
+
+  test("every tab is stroked in a context token, never a hex", () => {
+    for (const tab of ["parametric", "rgb", "red", "green", "blue", "luma"]) {
+      expect(curveStroke(tab)).toMatch(/^var\(--/);
+    }
+  });
+});
+
+describe("colour mixer params", () => {
+  const band = (name: string, channel: string, tint?: OpParamSpec["display"]): OpParamSpec => ({
+    name: `${name}${channel}`,
+    label: `${name} ${channel.toLowerCase()}`,
+    type: "number",
+    min: -100,
+    max: 100,
+    step: 1,
+    default: 0,
+    display: tint ?? { kind: "hsl" },
+  });
+  const mixer = op("color_mixer", "Color", 4, [
+    band("red", "Hue", { kind: "hsl", tint: "hue" }),
+    band("red", "Saturation", { kind: "hsl", tint: "saturation" }),
+    band("red", "Luminance"),
+    band("orange", "Hue", { kind: "hsl", tint: "hue" }),
+    band("orange", "Saturation", { kind: "hsl", tint: "saturation" }),
+    band("orange", "Luminance"),
+  ]);
+
+  test("the flat parameters group into bands, in the engine's order", () => {
+    const params = mixerParams(mixer);
+    expect(params?.bands.map((entry) => entry.name)).toEqual(["red", "orange"]);
+    expect(params?.bands[0]?.label).toBe("Red");
+    expect(params?.bands[0]?.sliders.map((slider) => slider.channel)).toEqual(
+      mixerChannels.slice(),
+    );
+    expect(generatedParams(mixer)).toEqual([]);
+  });
+
+  test("a mixer slider is an ordinary slider, never a placeholder", () => {
+    expect(controlKind(mixer.params[0])).toBe("slider");
+    expect(controlKind(mixer.params[2])).toBe("slider");
+  });
+
+  test("the hue and saturation tracks keep the tint the engine asked for", () => {
+    expect(trackTint(mixer.params[0])).toContain("--ctx-red");
+    expect(trackTint(mixer.params[1])).toContain("--color-line-strong");
+    expect(trackTint(mixer.params[2])).toBeNull();
+  });
+
+  test("an op with no mixer band is generated the way it always was", () => {
+    expect(mixerParams(exposure)).toBeNull();
+    expect(generatedParams(exposure)).toEqual(exposure.params);
+  });
+
+  test("an `hsl` parameter whose name carries no channel is not the mixer's", () => {
+    const odd = op("color_mixer", "Color", 4, [
+      { name: "Hue", type: "number", default: 0, display: { kind: "hsl" } },
+    ]);
+    expect(mixerParams(odd)).toBeNull();
   });
 });
 

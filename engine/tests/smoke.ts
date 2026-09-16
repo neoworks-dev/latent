@@ -20,6 +20,7 @@ import {
 } from "./harness";
 
 const outputPath = process.env.LATENT_SMOKE_PNG ?? "/tmp/latent-smoke.png";
+const aiOutputPath = process.env.LATENT_AI_MASK_PNG ?? "/tmp/latent-ai-masks.png";
 // Never the real catalog, config or thumbnail cache: this test owns throwaway copies.
 const scratch = `/tmp/latent-smoke-${process.pid}`;
 const catalogPath = `${scratch}/catalog.db`;
@@ -156,6 +157,29 @@ assert(ui.frame.target === viewId, "frame viewId does not match");
 assert(ui.frame.width === 1280 && ui.frame.height === 720, "frame is the wrong size");
 assert(render.width === 1280 && render.height === 720, "view.render must report the frame size");
 assert(render.revision === added.revision, `view.render must report the revision it rendered: ${render.revision} vs ${added.revision}`);
+
+// The sample is portrait and the view is 16:9, so the frame is mostly letterbox. Nothing in
+// the frame says where the photo is inside it — contentRect does, and mask coordinates are
+// normalised over it (protocol/README.md, view.render).
+function letterboxRect(imageWidth: number, imageHeight: number, viewWidth: number, viewHeight: number) {
+  const aspect = imageWidth / imageHeight;
+  let width = viewWidth;
+  let height = Math.max(1, Math.round(viewWidth / aspect));
+  if (height > viewHeight) {
+    height = viewHeight;
+    width = Math.max(1, Math.round(viewHeight * aspect));
+  }
+  width = Math.min(width, viewWidth);
+  return [Math.floor((viewWidth - width) / 2), Math.floor((viewHeight - height) / 2), width, height];
+}
+
+const expectedRect = letterboxRect(photo.width, photo.height, 1280, 720);
+console.log(`  contentRect ${JSON.stringify(render.contentRect)} inside ${render.width}x${render.height}`);
+assert(
+  JSON.stringify(render.contentRect) === JSON.stringify(expectedRect),
+  `view.render must report the letterboxed image rect: ${JSON.stringify(render.contentRect)} vs ${JSON.stringify(expectedRect)}`,
+);
+assert(expectedRect[2]! < 1280, "the sample is portrait: its content rect cannot fill a 16:9 view");
 
 // +1 EV must be visibly brighter than the neutral render of the same pixels.
 const brightNeutral = mean(neutral.pixels);
@@ -347,6 +371,12 @@ console.log(
 assert(raster.width === 1280 && raster.height === 720, "the raster must be the view's proxy size");
 assert(raster.target === viewId, "the LMSK frame must name the view it was sized for");
 assert(radialPreview.width === raster.width && radialPreview.height === raster.height, "result and frame disagree");
+// The raster is letterboxed exactly like the frame it lies over, so both calls must name
+// the same rect — an overlay blits that sub-rectangle and nothing outside it.
+assert(
+  JSON.stringify(radialPreview.contentRect) === JSON.stringify(maskRender.contentRect),
+  `mask.preview's contentRect must match the view's: ${JSON.stringify(radialPreview.contentRect)} vs ${JSON.stringify(maskRender.contentRect)}`,
+);
 // A hard-edged ellipse of radius 0.25 x 0.25 covers pi/16 of the image rect.
 assert(
   Math.abs(radialPreview.coverage - Math.PI * 0.25 * 0.25) < 0.01,
@@ -446,18 +476,20 @@ assert(
   "redo must bring the stroke back whole",
 );
 
-// AI kinds are jobs. Without a model the component fails; it never guesses.
+// AI kinds are jobs, and a failed one is a message, not a guess. `depth` is the kind that
+// fails the same way on every machine — Phase 2 owns it — so this covers the whole error
+// path whether or not the model store is on disk.
 const aiMask = {
   id: "mask0002",
   op: "clarity",
   params: { value: 60 },
   enabled: true,
-  mask: { components: [{ id: "ai01", kind: "subject", mode: "add" }] },
+  mask: { components: [{ id: "ai01", kind: "depth", mode: "add" }] },
 };
 await ui.call("stack.set", { photoId, stack: [brushed, aiMask] });
 const fresh = await ui.call("stack.get", { photoId });
 assert(fresh.stack[1].mask.components[0].state === "pending", "an unrun AI component starts pending");
-const detect = await timed("mask.detect (no model)", () =>
+const detect = await timed("mask.detect (depth)", () =>
   ui.call("mask.detect", { photoId, opId: "mask0002", componentId: "ai01" }),
 );
 assert(detect.jobId >= 1, "mask.detect must return a jobId");
@@ -468,12 +500,13 @@ const maskJob = ui.notifications.find(
   (n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished,
 )!;
 console.log(`  mask job ${detect.jobId}: ${maskJob.params.state} — ${maskJob.params.error}`);
+const notImplemented = "depth masks are not implemented yet";
 assert(maskJob.params.kind === "mask", "a mask job reports kind mask");
 assert(maskJob.params.state === "error", "a detect with no model must end in error");
-assert(maskJob.params.error === "model not installed", `wrong failure: ${maskJob.params.error}`);
+assert(maskJob.params.error === notImplemented, `wrong failure: ${maskJob.params.error}`);
 const failed = await ui.call("stack.get", { photoId });
 assert(failed.stack[1].mask.components[0].state === "failed", "the component must be failed");
-assert(failed.stack[1].mask.components[0].params.error === "model not installed", "the reason belongs on the component");
+assert(failed.stack[1].mask.components[0].params.error === notImplemented, "the reason belongs on the component");
 // A pending or failed component contributes nothing, so its op does nothing at all.
 const pendingPreview = await ui.call("mask.preview", { photoId, opId: "mask0002", viewId });
 assert(pendingPreview.coverage === 0, "a failed component must contribute nothing");
@@ -1102,6 +1135,115 @@ stub.close();
 stubEngine.process.kill("SIGTERM");
 await stubEngine.process.exited;
 rmSync(stubScratch, { recursive: true, force: true });
+
+// ---- mask.detect with the real models ---------------------------------------------------
+// onnxruntime on the CUDA EP, one session per job (engine/src/ai/). ~1.8 GB of ONNX graphs
+// that `scripts/models/fetch.py` installs; without them this section does not run, so a
+// fresh clone still gets a green ctest. Coverage is the share of the image rect above 0.5,
+// and every bound below was measured on this raw — a studio portrait, hence no sky.
+const modelStore =
+  process.env.LATENT_MODEL_STORE ??
+  `${process.env.XDG_DATA_HOME ?? `${process.env.HOME}/.local/share`}/latent/models`;
+if (!existsSync(`${modelStore}/birefnet-lite`)) {
+  console.log(`smoke: no model store at ${modelStore}; skipping the AI mask section`);
+} else {
+  if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
+  rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
+
+  const aiScratch = `${scratch}-ai`;
+  const aiEngine = startEngine(aiScratch, ["--no-mcp"]);
+  const ai = await connect(await aiEngine.endpoint);
+  const aiPhoto = await ai.call("photo.open", { path: samplePath });
+  const aiId: number = aiPhoto.photoId;
+  const aiView = await ai.call("view.open", { photoId: aiId, width: 720, height: 960 });
+
+  // One op, one component, replaced per kind: the detector sees the photo either way,
+  // because a pending component contributes nothing and its op does nothing.
+  async function detectMask(kind: string, params: Record<string, unknown> = {}, invert = false) {
+    await ai.call("stack.set", {
+      photoId: aiId,
+      stack: [
+        {
+          id: "ai000001",
+          op: "saturation",
+          params: { value: -100 },
+          enabled: true,
+          mask: { components: [{ id: "detected", kind, mode: "add", invert, params }] },
+        },
+      ],
+    });
+    const begin = performance.now();
+    const job = await ai.call("mask.detect", { photoId: aiId, opId: "ai000001", componentId: "detected" });
+    await waitFor(`the ${kind} detect to finish`, () =>
+      ai.notifications.some((n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished),
+    );
+    const elapsed = performance.now() - begin;
+    const progress = ai.notifications.find(
+      (n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished,
+    )!;
+    assert(progress.params.state === "done", `${kind} detect failed: ${progress.params.error}`);
+
+    const preview = await ai.call("mask.preview", {
+      photoId: aiId,
+      opId: "ai000001",
+      componentId: "detected",
+      viewId: aiView.viewId,
+    });
+    const component = (await ai.call("stack.get", { photoId: aiId })).stack[0].mask.components[0];
+    console.log(
+      `  ${kind.padEnd(8)} ${(preview.coverage * 100).toFixed(2).padStart(6)}% ` +
+        `via ${component.params.model} in ${elapsed.toFixed(0)} ms`,
+    );
+    assert(component.state === "ready", `a finished detect leaves the component ready, not ${component.state}`);
+    assert(component.params.sourceHash === aiPhoto.hash, "the raster must be tied to the source image");
+    assert(existsSync(`${samplePath}.latent.d/${component.params.raster}`), "the raster is cached beside the sidecar");
+    return { coverage: preview.coverage, model: component.params.model as string };
+  }
+
+  // A box around the woman, normalised over the content rect -> SAM 2.
+  const objects = await detectMask("objects", { box: [0.3, 0.2, 0.7, 0.9] });
+  assert(objects.model === "sam2-hiera-base-plus", `objects must run SAM 2, not ${objects.model}`);
+  assert(objects.coverage > 0.08 && objects.coverage < 0.16, `objects coverage ${objects.coverage}`);
+
+  // Florence-2 finds the box, SAM 2 turns it into a mask. The hat is small.
+  const text = await detectMask("text", { prompt: "the hat" });
+  assert(text.model === "florence-2-base+sam2-hiera-base-plus", `text must chain both models, not ${text.model}`);
+  assert(text.coverage > 0.005 && text.coverage < 0.05, `"the hat" coverage ${text.coverage}`);
+
+  const subject = await detectMask("subject");
+  assert(subject.model === "birefnet-lite", `subject must run BiRefNet, not ${subject.model}`);
+  assert(subject.coverage > 0.08 && subject.coverage < 0.16, `subject coverage ${subject.coverage}`);
+
+  // A seamless paper backdrop is not a sky, and the empty answer is the feature.
+  const sky = await detectMask("sky");
+  assert(sky.model === "segformer-b2-ade20k", `sky must run SegFormer, not ${sky.model}`);
+  assert(sky.coverage < 0.01, `a studio backdrop is not sky, got ${sky.coverage}`);
+
+  const people = await detectMask("people");
+  assert(people.model === "segformer-b2-ade20k", `people must run SegFormer, not ${people.model}`);
+  assert(people.coverage > 0.08 && people.coverage < 0.16, `people coverage ${people.coverage}`);
+
+  // A second prompt on the same photo reuses the cached SAM 2 embedding, so it skips the
+  // ~100 ms encode. Timings are printed above; this only asserts the answer is the same.
+  const again = await detectMask("objects", { box: [0.3, 0.2, 0.7, 0.9] });
+  assert(Math.abs(again.coverage - objects.coverage) < 1e-9, "the cached embedding must give the same mask");
+
+  // The picture: -100 saturation everywhere the subject is *not*, so she keeps her colour
+  // and the backdrop goes grey. Same mask, inverted — which is also why the preview above
+  // was measured without the invert.
+  await detectMask("subject", {}, true);
+  ai.frame = null;
+  await ai.call("view.render", { viewId: aiView.viewId });
+  await waitFor("the masked frame", () => ai.frame !== null);
+  await Bun.write(aiOutputPath, encodePng(ai.frame!.pixels, ai.frame!.width, ai.frame!.height));
+  console.log(`  wrote ${aiOutputPath}`);
+
+  ai.close();
+  aiEngine.process.kill("SIGTERM");
+  const aiExit = await aiEngine.process.exited;
+  assert(aiExit === 0, `latentd should exit 0 after the model sessions, got ${aiExit}`);
+  rmSync(aiScratch, { recursive: true, force: true });
+}
 
 if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
 rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });

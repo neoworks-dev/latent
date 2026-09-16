@@ -124,6 +124,55 @@ describe("frames", () => {
     const bright = new Uint8Array(renderFrame(8, 4, 2, 1, photo.stack), FRAME_HEADER_BYTES);
     expect(bright[0]).toBeGreaterThan(Number(dark[0]));
   });
+
+  test("a point curve changes the pixels, a curve at its default does not", () => {
+    const photo = new PhotoState();
+    const flat = new Uint8Array(renderFrame(8, 4, 1, 1, photo.stack), FRAME_HEADER_BYTES);
+    const op = photo.addOp("tone_curve", { rgb: [], red: [], green: [], blue: [] });
+    const neutral = new Uint8Array(renderFrame(8, 4, 2, 1, photo.stack), FRAME_HEADER_BYTES);
+    expect([...neutral]).toEqual([...flat]);
+
+    // A quarter-tone lifted to 0.4 raises everything below the next control point.
+    photo.updateOp(
+      op.id,
+      {
+        rgb: [
+          { x: 0, y: 0 },
+          { x: 0.25, y: 0.4 },
+          { x: 1, y: 1 },
+        ],
+      },
+      undefined,
+      false,
+    );
+    const lifted = new Uint8Array(renderFrame(8, 4, 3, 1, photo.stack), FRAME_HEADER_BYTES);
+    expect(lifted[0]).toBeGreaterThan(Number(flat[0]));
+    expect(lifted[1]).toBeGreaterThan(Number(flat[1]));
+    expect(lifted[2]).toBeGreaterThan(Number(flat[2]));
+  });
+
+  test("a red curve moves only the red channel", () => {
+    const photo = new PhotoState();
+    const before = new Uint8Array(renderFrame(8, 4, 1, 1, photo.stack), FRAME_HEADER_BYTES);
+    photo.addOp("tone_curve", {
+      red: [
+        { x: 0, y: 0.3 },
+        { x: 1, y: 1 },
+      ],
+    });
+    const after = new Uint8Array(renderFrame(8, 4, 2, 1, photo.stack), FRAME_HEADER_BYTES);
+    expect(after[0]).toBeGreaterThan(Number(before[0]));
+    expect(after[1]).toBe(Number(before[1]));
+    expect(after[2]).toBe(Number(before[2]));
+  });
+
+  test("the parametric regions reach the pixels too", () => {
+    const photo = new PhotoState();
+    const before = new Uint8Array(renderFrame(8, 4, 1, 1, photo.stack), FRAME_HEADER_BYTES);
+    photo.addOp("tone_curve", { shadows: 100, shadowSplit: 25, midtoneSplit: 50 });
+    const after = new Uint8Array(renderFrame(8, 4, 2, 1, photo.stack), FRAME_HEADER_BYTES);
+    expect(after[0]).toBeGreaterThan(Number(before[0]));
+  });
 });
 
 /** Minimal JSON-RPC client over the mock's socket, for the end-to-end catalog tests. */

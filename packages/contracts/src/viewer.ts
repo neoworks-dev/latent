@@ -27,6 +27,15 @@ export interface OverlayRect {
 }
 
 /**
+ * `[x, y, width, height]` of the photo inside a proxy frame, in that frame's own pixels —
+ * `view.render` and `mask.preview` both answer with one. The frame is letterboxed and crop,
+ * rotate and the Transform sliders change the photo's aspect inside it, so this is the only
+ * thing that says where the photo actually is; mask component coordinates are normalised
+ * over it. Absent from an engine older than the field, which is what `containRect` is for.
+ */
+export type ContentRect = [number, number, number, number];
+
+/**
  * Where an image of `imageWidth`×`imageHeight` lands inside a `boxWidth`×`boxHeight` box
  * under `object-fit: contain` — the canvas' own letterbox rule, so the overlay sits on the
  * photo and not on the bars beside it. A box or an image with no area yields an empty rect

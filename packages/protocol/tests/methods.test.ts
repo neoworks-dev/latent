@@ -162,10 +162,14 @@ describe("v4 additions", () => {
       seq: 7,
       width: 1280,
       height: 720,
+      // A portrait photo in a 16:9 view: the frame is mostly letterbox, and only this says
+      // where the photo is inside it.
+      contentRect: [399, 0, 481, 720],
       renderMs: 1.4,
       readbackMs: 4.8,
       revision: 12,
     };
+    expect(rendered.contentRect?.[2]).toBeLessThan(rendered.width);
     const changed: StackChangedParams = {
       stack: [],
       revision: 12,

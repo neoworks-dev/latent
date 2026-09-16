@@ -51,7 +51,7 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `history.undo` / `history.redo` | `photoId` | as `stack.get` | Cursor over snapshots, never a pop |
 | `view.open` | `photoId`, `width`, `height` | `viewId` | One canvas, one proxy size |
 | `view.close` | `viewId` | — | |
-| `view.render` | `viewId`, `width?`, `height?` | `seq`, size, `renderMs`, `readbackMs`, `revision` | Sends one `LFRM` frame first |
+| `view.render` | `viewId`, `width?`, `height?` | `seq`, size, `contentRect?`, `renderMs`, `readbackMs`, `revision` | Sends one `LFRM` frame first |
 | `python.run` | `code`, `photoId?`, `timeoutMs?` | `ok`, `stdout`, `stderr`, `durationMs`, `value?`, `runId?` | `timeoutMs` default 30000 |
 | `catalog.import` | `paths`, `recursive?` | `jobId`, `thumbnailJobId?` | `recursive` default **true**; progress via `job.progress` |
 | `catalog.list` | filters below | `photos`, `total` | |
@@ -65,7 +65,7 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `catalog.thumbnails` | `photoIds`, `size?` | `requested`, `sent`, `missing[]` | One `LTHM` frame per photo, then the result |
 | `catalog.remove` | `photoIds` | `removed` | Rows only — never the files |
 | `job.cancel` | `jobId` | `cancelled` | Stops a running job at its next safe point |
-| `mask.preview` | `photoId`, `opId`, `componentId?`, `viewId?` | `width`, `height`, `coverage` | One `LMSK` frame (r8) first, then the result. Combined mask, or one component's raster |
+| `mask.preview` | `photoId`, `opId`, `componentId?`, `viewId?` | `width`, `height`, `contentRect?`, `coverage` | One `LMSK` frame (r8) first, then the result. Combined mask, or one component's raster |
 | `mask.detect` | `photoId`, `opId`, `componentId`, `hint?` | `jobId` | Starts the AI rasterisation of an AI-kind component; component goes `pending` → `ready`/`failed` via `stack.changed`, job ticks `job.progress` kind `mask` |
 | `mask.stroke` | `photoId`, `opId`, `componentId`, `points`, `erase?`, `size?`, `flow?`, `transient?` | as `stack.get` | Appends a brush segment; the engine owns strokes and rasters. One pointer-down = transient segments + one committed call = one undo step |
 
@@ -84,6 +84,14 @@ still builds a correct control out of `type`, `min`, `max` and `step` — and a 
 no gradient simply omits `tint`.
 
 ### `view.render`
+
+`contentRect` is `[x, y, width, height]` of the image inside the frame, in proxy pixels.
+The frame is the view's full size and the image is letterboxed inside it, so the two only
+agree when the aspects do; crop, rotate and the Transform sliders change the content rect
+without changing the frame. Mask component coordinates are normalised over this rect, and
+so is `mask.preview`'s raster — an overlay draws into it and nowhere else. It is optional
+and additive: a client talking to an engine that does not send it falls back to fitting the
+frame's own aspect into its canvas, which is what the rect says whenever nothing is cropped.
 
 The result's `revision` is the stack revision the frame was rendered from, the same counter
 `stack.get` and `stack.changed` report. A client that coalesces slider drags compares it

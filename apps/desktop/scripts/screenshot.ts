@@ -4,7 +4,7 @@
 //
 //   node apps/desktop/scripts/screenshot.ts [--out /tmp/latent-ui.png] [--engine mock|real]
 //                                           [--photo /path/to/raw]
-//                                           [--flow slider|panels|masks|catalog|library|latency]
+//                                     [--flow slider|panels|curve|mixer|masks|catalog|library|latency]
 //                                           [--dir <import directory>]
 //
 // `--engine real` spawns engine/build/dev/latentd instead of the mock; pair it with a real
@@ -23,6 +23,15 @@
 // `--flow panels` exercises the rest of the panel column's gestures: a click on the track
 // that jumps, a scrub on the value readout, arrow keys on the focused slider, a
 // double-click that resets to the default, and folding a section away.
+//
+// `--flow curve` drives the hand-built tone curve: the Point/RGB tab, a click that adds a
+// control point, a drag that moves it, one undo that takes the whole drag, a second point
+// on the Red channel, then the Parametric tab's region slider and split handles. The
+// engine's own render is digested before and after, so "the curve reached the pixels" is
+// asserted on the frame the engine produced rather than on the canvas.
+//
+// `--flow mixer` drives the hand-built colour mixer: the Hue tab's eight band rows, a drag
+// on one of them, the Luminance tab, and the All grid with every band's three sliders.
 //
 // `--flow masks` drives Masks and Layers: a radial dragged on the viewer's overlay, the
 // LMSK raster drawn back as a red tint, three brush strokes that each grow the coverage,
@@ -51,6 +60,8 @@ const flow = argument("--flow", "slider");
 const flowOutputs: Record<string, string> = {
   catalog: "/tmp/latent-catalog.png",
   masks: "/tmp/latent-masks.png",
+  curve: "/tmp/latent-curve.png",
+  mixer: "/tmp/latent-mixer.png",
 };
 const defaultOutput = flowOutputs[flow] ?? "/tmp/latent-ui.png";
 const outputPath = argument("--out", defaultOutput);
@@ -128,8 +139,8 @@ function photoCountIs(expected: number): boolean {
 
 interface RpcAnswer<T> {
   result: T;
-  /** Binary frames that arrived before the result — LTHM thumbnails, for the batch call. */
-  frames: number;
+  /** Binary frames that arrived before the result — LTHM thumbnails, LFRM renders. */
+  frames: ArrayBuffer[];
 }
 
 /**
@@ -144,11 +155,11 @@ async function engineCall<T>(
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
   await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
-  let frames = 0;
+  const frames: ArrayBuffer[] = [];
   const answered = new Promise<RpcAnswer<T>>((resolve) => {
     socket.addEventListener("message", (event) => {
       if (event.data instanceof ArrayBuffer) {
-        frames += 1;
+        frames.push(event.data);
         return;
       }
       const message: { id?: number; result?: unknown } = JSON.parse(String(event.data));
@@ -160,6 +171,55 @@ async function engineCall<T>(
   const answer = await answered;
   socket.close();
   return answer;
+}
+
+/** The LFRM/LTHM header, ahead of the pixels (protocol/frames.md). */
+const FRAME_HEADER_BYTES = 32;
+
+/**
+ * A cheap digest of one frame's pixels. The viewer's canvas is WebGL with no preserved
+ * drawing buffer, so "did the render change?" is asked of the engine rather than read back
+ * off the canvas: two renders of the same stack digest the same, two of different stacks
+ * do not.
+ */
+function frameDigest(frame: ArrayBuffer | undefined): string {
+  if (!frame) return "";
+  const pixels = new Uint8Array(frame, FRAME_HEADER_BYTES);
+  let hash = 2166136261;
+  for (const byte of pixels) {
+    hash = Math.imul(hash ^ byte, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/** Renders one small proxy of the photo as it stands and digests it. */
+async function renderDigest(url: string, photoId: number): Promise<string> {
+  const view = await engineCall<{ viewId: number }>(url, "view.open", {
+    photoId,
+    width: 240,
+    height: 160,
+  });
+  const viewId = view.result.viewId;
+  const rendered = await engineCall<{ seq: number }>(url, "view.render", { viewId });
+  await engineCall(url, "view.close", { viewId });
+  return frameDigest(rendered.frames[0]);
+}
+
+/** The control points one channel of the open photo's `tone_curve` op carries. */
+async function curvePointsOf(
+  url: string,
+  photoId: number,
+  channel: string,
+): Promise<{ x: number; y: number }[]> {
+  const state = await engineCall<{ stack: { op: string; params: Record<string, unknown> }[] }>(
+    url,
+    "stack.get",
+    { photoId },
+  );
+  const entry = state.result.stack.find((op) => op.op === "tone_curve");
+  const points = entry?.params[channel];
+  if (!Array.isArray(points)) return [];
+  return points as { x: number; y: number }[];
 }
 
 const children: ChildProcess[] = [];
@@ -340,7 +400,7 @@ if (flow === "catalog") {
   );
   console.log(
     `[shot] catalog.thumbnails requested ${batch.result.requested}, sent ${batch.result.sent}` +
-      ` in ${batch.frames} LTHM frames, missing [${batch.result.missing.join(",")}]`,
+      ` in ${batch.frames.length} LTHM frames, missing [${batch.result.missing.join(",")}]`,
   );
 
   // Click the first cell: that opens the photo in the viewer, at the canvas' own size.
@@ -457,6 +517,309 @@ if (flow === "catalog") {
   }
   await window.mouse.up();
   await window.waitForTimeout(500);
+  await capture(outputPath);
+  console.log(`[shot] wrote ${outputPath}`);
+} else if (flow === "curve") {
+  const poll = { timeout: 15_000, polling: 200 };
+  await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
+  await window.waitForFunction(
+    () => {
+      const canvas = document.querySelector("canvas");
+      return canvas instanceof HTMLCanvasElement && canvas.width > 300;
+    },
+    null,
+    { timeout: 30_000, polling: 200 },
+  );
+  await window.waitForSelector('[data-curve-editor="tone_curve"]', { timeout: 15_000 });
+
+  // The photo id the UI is on, resolved the way any client would: the same path opens the
+  // same catalog row.
+  const opened = await engineCall<{ photoId: number }>(engineUrl, "photo.open", {
+    path: photoPath,
+  });
+  const photoId = opened.result.photoId;
+  const neutralDigest = await renderDigest(engineUrl, photoId);
+
+  const graph = window.locator('[data-curve-editor="tone_curve"] [role="application"]');
+
+  /** The graph's box, with the column scrolled so the whole of it is on screen first. */
+  async function graphBox(): Promise<{ x: number; y: number; width: number; height: number }> {
+    await graph.scrollIntoViewIfNeeded();
+    const box = await graph.boundingBox();
+    if (!box) throw new Error("the curve graph has no box");
+    return box;
+  }
+
+  /** Where a curve coordinate lands on screen: x to the right, y up, as the editor draws. */
+  async function graphPoint(x: number, y: number): Promise<{ x: number; y: number }> {
+    const box = await graphBox();
+    return { x: box.x + box.width * x, y: box.y + box.height * (1 - y) };
+  }
+
+  /** A click at a curve coordinate, aimed at the element rather than at the screen. */
+  async function graphClick(x: number, y: number): Promise<void> {
+    const box = await graphBox();
+    await graph.click({ position: { x: box.width * x, y: box.height * (1 - y) } });
+  }
+
+  /** The `in → out` levels the editor prints for the selected point. */
+  async function readoutLevels(): Promise<[number, number]> {
+    const text = await window.locator("[data-curve-readout]").innerText();
+    const parts = text.split("→").map((part) => Number(part.trim()));
+    return [parts[0] ?? -1, parts[1] ?? -1];
+  }
+
+  // The tab strip: Parametric is what opens, Point/RGB is one click away.
+  await window.locator('[data-curve-tab="rgb"]').click();
+  await window.waitForSelector('[data-curve-tab="rgb"][aria-selected="true"]', { timeout: 5_000 });
+
+  // A click on the curve adds a control point. The graph is ~230 px wide, so a click lands
+  // within a level or two of the coordinate asked for: 0.25 → 64, 0.40 → 102 of 255.
+  await graphClick(0.25, 0.4);
+  await window.waitForSelector("[data-curve-readout]", { timeout: 10_000 });
+  const addedLevels = await readoutLevels();
+  if (Math.abs(addedLevels[0] - 64) > 3 || Math.abs(addedLevels[1] - 102) > 3) {
+    throw new Error(`the readout says ${addedLevels.join(" → ")}, not 64 → 102`);
+  }
+  const added = await curvePointsOf(engineUrl, photoId, "rgb");
+  if (added.length !== 3) {
+    throw new Error(`stack.get has ${added.length} rgb points, expected two endpoints and one`);
+  }
+  console.log(
+    `[shot] a click added a point: readout "${addedLevels.join(" → ")}", stack.get has` +
+      ` ${added.length} rgb points, the middle one at` +
+      ` (${added[1]?.x.toFixed(3)}, ${added[1]?.y.toFixed(3)})`,
+  );
+
+  // Drag that point up and to the right. Every move is a transient op.update; the release
+  // is the one commit, so the whole drag is one history step.
+  const from = await graphPoint(added[1]?.x ?? 0.25, added[1]?.y ?? 0.4);
+  const to = await graphPoint(0.45, 0.68);
+  await window.mouse.move(from.x, from.y);
+  await window.mouse.down();
+  for (let step = 1; step <= 8; step++) {
+    const fraction = step / 8;
+    await window.mouse.move(
+      from.x + (to.x - from.x) * fraction,
+      from.y + (to.y - from.y) * fraction,
+    );
+    await window.waitForTimeout(16);
+  }
+  await window.mouse.up();
+  await window.waitForFunction(
+    (was: number) => {
+      const text = document.querySelector("[data-curve-readout]")?.textContent ?? "";
+      return Number(text.split("→")[0]?.trim()) > was + 10;
+    },
+    addedLevels[0],
+    poll,
+  );
+  const dragged = await curvePointsOf(engineUrl, photoId, "rgb");
+  const draggedLevels = await readoutLevels();
+  console.log(
+    `[shot] the drag moved it to (${dragged[1]?.x.toFixed(3)}, ${dragged[1]?.y.toFixed(3)}),` +
+      ` readout "${draggedLevels.join(" → ")}"`,
+  );
+
+  const curvedDigest = await renderDigest(engineUrl, photoId);
+  if (curvedDigest === neutralDigest) {
+    throw new Error(`the engine rendered the same frame with and without the curve`);
+  }
+  console.log(`[shot] the engine's frame changed: ${neutralDigest} → ${curvedDigest}`);
+
+  // One Ctrl+Z takes the whole drag, landing on the point as the click left it rather than
+  // somewhere in the middle of the drag.
+  await window.keyboard.press("Control+z");
+  await window.waitForFunction(
+    (was: number) => {
+      const text = document.querySelector("[data-curve-readout]")?.textContent ?? "";
+      return Number(text.split("→")[0]?.trim()) < was - 10;
+    },
+    draggedLevels[0],
+    poll,
+  );
+  const undone = await curvePointsOf(engineUrl, photoId, "rgb");
+  const drift = Math.abs((undone[1]?.x ?? 0) - (added[1]?.x ?? 0));
+  if (drift > 0.002) {
+    throw new Error(
+      `undo landed on x=${undone[1]?.x?.toFixed(4)}, not on the added ${added[1]?.x?.toFixed(4)}`,
+    );
+  }
+  console.log(
+    `[shot] one undo removed the whole drag: x ${dragged[1]?.x.toFixed(3)} →` +
+      ` ${undone[1]?.x.toFixed(3)}, which is where the click put it`,
+  );
+  // Redo puts the drag back, so the shot below is of the curve that was dragged.
+  await window.keyboard.press("Control+Shift+z");
+  await window.waitForFunction(
+    (was: number) => {
+      const text = document.querySelector("[data-curve-readout]")?.textContent ?? "";
+      return Number(text.split("→")[0]?.trim()) > was + 10;
+    },
+    addedLevels[0],
+    poll,
+  );
+
+  // The Red channel is its own curve on the same graph, stroked in the red token.
+  await window.locator('[data-curve-tab="red"]').click();
+  await window.waitForSelector('[data-curve-tab="red"][aria-selected="true"]', { timeout: 5_000 });
+  // The Red curve is empty, so the graph draws no points until the click lands: waiting
+  // for that is what says the tab actually swapped before the click goes out.
+  await window.waitForFunction(
+    () => document.querySelectorAll("[data-curve-point]").length === 0,
+    null,
+    poll,
+  );
+  await graphClick(0.62, 0.42);
+  await window.waitForFunction(
+    () => document.querySelectorAll("[data-curve-point]").length >= 3,
+    null,
+    poll,
+  );
+  const red = await curvePointsOf(engineUrl, photoId, "red");
+  const rgbStill = await curvePointsOf(engineUrl, photoId, "rgb");
+  console.log(
+    `[shot] the Red tab has its own curve: ${red.length} red points,` +
+      ` ${rgbStill.length} rgb points still there`,
+  );
+
+  await capture(outputPath);
+  console.log(`[shot] wrote ${outputPath}`);
+
+  // Back to Parametric: the four region sliders and the three split handles live there.
+  await window.locator('[data-curve-tab="parametric"]').click();
+  await window.waitForSelector('[data-curve-tab="parametric"][aria-selected="true"]', {
+    timeout: 5_000,
+  });
+  const shadows = window.locator('[data-op="tone_curve"][data-param="shadows"] [role="slider"]');
+  const shadowsBox = await shadows.boundingBox();
+  if (!shadowsBox) throw new Error("the shadows slider has no box");
+  await window.mouse.move(
+    shadowsBox.x + shadowsBox.width / 2,
+    shadowsBox.y + shadowsBox.height / 2,
+  );
+  await window.mouse.down();
+  for (let step = 1; step <= 6; step++) {
+    await window.mouse.move(
+      shadowsBox.x + shadowsBox.width * (0.5 + 0.0333 * step),
+      shadowsBox.y + shadowsBox.height / 2,
+    );
+    await window.waitForTimeout(16);
+  }
+  await window.mouse.up();
+  await window.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-op="tone_curve"][data-param="shadows"] [data-readout]')
+        ?.textContent?.startsWith("+") === true,
+    null,
+    poll,
+  );
+  const shadowsReadout = await window
+    .locator('[data-op="tone_curve"][data-param="shadows"] [data-readout]')
+    .innerText();
+  console.log(`[shot] the parametric Shadows slider reads ${shadowsReadout}`);
+
+  // A split handle rides the graph's own x axis: drag the midtone one to 65 %.
+  const handle = window.locator('[data-curve-split="midtoneSplit"]');
+  const axis = await graphBox();
+  const handleBox = await handle.boundingBox();
+  if (!handleBox) throw new Error("the midtone split handle has no box");
+  await window.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
+  await window.mouse.down();
+  await window.mouse.move(axis.x + axis.width * 0.65, handleBox.y + handleBox.height / 2, {
+    steps: 6,
+  });
+  await window.mouse.up();
+  await window.waitForFunction(
+    () => {
+      const split = document.querySelector('[data-curve-split="midtoneSplit"]');
+      return Number(split?.getAttribute("aria-valuenow") ?? 50) > 60;
+    },
+    null,
+    poll,
+  );
+  const splitValue = await handle.getAttribute("aria-valuenow");
+  console.log(`[shot] the midtone split handle dragged to ${splitValue}%`);
+
+  const parametricDigest = await renderDigest(engineUrl, photoId);
+  if (parametricDigest === curvedDigest) {
+    throw new Error("the parametric half of the curve did not reach the engine's frame");
+  }
+  console.log(`[shot] the parametric edit changed the frame again: → ${parametricDigest}`);
+
+  const parametricPath = outputPath.replace(/\.png$/, "-parametric.png");
+  await capture(parametricPath);
+  console.log(`[shot] wrote ${parametricPath}`);
+} else if (flow === "mixer") {
+  const poll = { timeout: 15_000, polling: 200 };
+  await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
+  await window.waitForFunction(
+    () => {
+      const canvas = document.querySelector("canvas");
+      return canvas instanceof HTMLCanvasElement && canvas.width > 300;
+    },
+    null,
+    { timeout: 30_000, polling: 200 },
+  );
+  const mixer = window.locator('[data-mixer-editor="color_mixer"]');
+  await mixer.waitFor({ timeout: 15_000 });
+
+  /** How many slider rows the mixer is showing right now. */
+  const rowCount = async (): Promise<number> => mixer.locator("[data-param]").count();
+
+  // Hue is the tab that opens: eight rows, one per Lightroom colour band.
+  await window.waitForSelector('[data-mixer-tab="Hue"][aria-selected="true"]', { timeout: 5_000 });
+  const hueRows = await rowCount();
+  const bandLabels = await mixer
+    .locator("[data-param] [data-label]")
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() ?? ""));
+  console.log(`[shot] the Hue tab shows ${hueRows} bands: ${bandLabels.join(", ")}`);
+
+  // Drag the Orange band's hue: the row is the column's own slider, so this is the same
+  // transient-then-commit path every other slider takes.
+  const track = mixer.locator('[data-param="orangeHue"] [role="slider"]');
+  await track.scrollIntoViewIfNeeded();
+  const box = await track.boundingBox();
+  if (!box) throw new Error("the orange hue slider has no box");
+  await window.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await window.mouse.down();
+  for (let step = 1; step <= 6; step++) {
+    await window.mouse.move(box.x + box.width * (0.5 + 0.025 * step), box.y + box.height / 2);
+    await window.waitForTimeout(16);
+  }
+  await window.mouse.up();
+  await window.waitForFunction(
+    () =>
+      document
+        .querySelector('[data-param="orangeHue"] [data-readout]')
+        ?.textContent?.startsWith("+") === true,
+    null,
+    poll,
+  );
+  const orange = await window.locator('[data-param="orangeHue"] [data-readout]').innerText();
+  console.log(`[shot] dragging the Orange row moved orangeHue to ${orange}`);
+
+  // Luminance is the same eight bands, the other parameter.
+  await window.locator('[data-mixer-tab="Luminance"]').click();
+  await window.waitForSelector('[data-param="orangeLuminance"]', { timeout: 5_000 });
+  const stillHidden = await mixer.locator('[data-param="orangeHue"]').count();
+  console.log(
+    `[shot] the Luminance tab swapped the rows: ${await rowCount()} rows,` +
+      ` ${stillHidden} hue rows left on screen`,
+  );
+
+  // All is Lightroom's grid: every band, every channel, under a heading each.
+  await window.locator('[data-mixer-tab="All"]').click();
+  await window.waitForFunction(
+    () => document.querySelectorAll("[data-mixer-editor] [data-param]").length >= 24,
+    null,
+    poll,
+  );
+  const headings = await mixer.locator("[data-mixer-band]").count();
+  console.log(`[shot] the All grid shows ${await rowCount()} rows under ${headings} band headings`);
+
+  await mixer.scrollIntoViewIfNeeded();
   await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
 } else if (flow === "masks") {

@@ -21,6 +21,10 @@ completed render; the UI keeps at most one `view.render` request in flight per v
 The 8 `reserved` bytes stay zero and stay reserved: the layout is fixed, and anything new
 a frame has to say goes in the JSON result of the call that produced it, not here.
 
+`width`/`height` are the whole view, letterbox included. The image sits inside it at
+`ViewRenderResult.contentRect` — the frame's pixels outside that rect are background, not
+photo. The rect is in the JSON result and not in the header for exactly the reason above.
+
 ## `LMSK` — mask raster (engine → UI)
 
 Same header as `LFRM`; `viewId` holds the `viewId` the preview was sized for (0 when
@@ -28,6 +32,11 @@ Same header as `LFRM`; `viewId` holds the `viewId` the preview was sized for (0 
 255 = fully inside); `seq` increments per `mask.preview` call on that socket. The body is
 `w·h` bytes, tightly packed. Sent by `mask.preview`, exactly one frame **before** its RPC
 result. The UI tints it over the view frame; it never uploads a mask back.
+
+It is letterboxed the same way `LFRM` is, and `MaskPreviewResult.contentRect` says where
+the image sits inside it. A UI that draws the whole raster into the drawn image's box
+instead of that sub-rectangle stretches the mask off the photo as soon as a crop changes
+the aspect.
 
 ## `LTHM` — thumbnail (engine → UI)
 

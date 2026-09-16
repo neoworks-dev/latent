@@ -12,17 +12,32 @@ add_library(latent_ops STATIC
 target_include_directories(latent_ops PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(latent_ops PUBLIC nlohmann_json::nlohmann_json)
 
+# latent_ai is the onnxruntime half: the mask models and the pixel/token arithmetic they
+# need. No GPU (wgpu) involvement — the sessions run on the same worker thread the request
+# already sits on. Anything that links it needs ORT_LIB_DIR on its RPATH, because the CUDA
+# provider .so is dlopen'd next to libonnxruntime.so at session creation.
+add_library(latent_ai STATIC
+  ai/bpe_tokenizer.cpp
+  ai/dedicated.cpp
+  ai/florence2.cpp
+  ai/mask_detect.cpp
+  ai/model_store.cpp
+  ai/ort_session.cpp
+  ai/preprocess.cpp
+  ai/sam2.cpp)
+target_include_directories(latent_ai PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(latent_ai PUBLIC latent_ops onnxruntime)
+
 # latent_catalog is the other headless half: SQLite, LibRaw metadata, JPEG. The catalog
 # tests link it without pulling in a GPU device.
 add_library(latent_catalog STATIC
-  ai/mask_detect.cpp
   catalog/catalog.cpp
   catalog/thumbnail.cpp
   image/jpeg.cpp
   image/png.cpp
   jobs/worker.cpp
   raw/raw_metadata.cpp)
-target_link_libraries(latent_catalog PUBLIC latent_ops unofficial::sqlite3::sqlite3
+target_link_libraries(latent_catalog PUBLIC latent_ops latent_ai unofficial::sqlite3::sqlite3
   PkgConfig::LIBRAW PNG::PNG
   $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>)
 
@@ -72,4 +87,5 @@ add_dependencies(latentd latent_python_deps)
 # interpreter resolve CPython symbols against the executable, so they must be exported.
 target_link_options(latentd PRIVATE -rdynamic)
 # apps/desktop looks for engine/build/dev/latentd, so the binary sits in the build root.
-set_target_properties(latentd PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set_target_properties(latentd PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  BUILD_RPATH "${ORT_LIB_DIR}" INSTALL_RPATH "${ORT_LIB_DIR}")

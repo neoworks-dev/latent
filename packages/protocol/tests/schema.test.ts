@@ -149,6 +149,15 @@ describe("additive guarantees", () => {
     expect(definition("ViewRenderResult").required).toContain("revision");
   });
 
+  test("the letterboxed image rect is optional on both calls that send a frame", () => {
+    // Additive, so an engine built before the field still satisfies the schema and a UI
+    // falls back to fitting the frame's own aspect.
+    for (const name of ["ViewRenderResult", "MaskPreviewResult"]) {
+      expect(definition(name).required).not.toContain("contentRect");
+      expect(definition(name).properties).toHaveProperty("contentRect");
+    }
+  });
+
   test("the batch thumbnail result reports what it could not send", () => {
     expect(definition("CatalogThumbnailsResult").required).toEqual([
       "requested",

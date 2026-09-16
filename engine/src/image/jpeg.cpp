@@ -111,6 +111,38 @@ Rgb8Image box_resize_to_fit(const Rgb8Image& image, uint32_t max_edge) {
   return out;
 }
 
+Rgb8Image rotate_for_flip(const Rgb8Image& image, int flip) {
+  if (flip <= 0 || flip > 7) return image;
+  const size_t expected = static_cast<size_t>(image.width) * image.height * 3;
+  if (image.width == 0 || image.height == 0 || image.pixels.size() < expected) return image;
+
+  const bool transpose = (flip & 4) != 0;
+  const bool mirror_rows = (flip & 2) != 0;
+  const bool mirror_columns = (flip & 1) != 0;
+
+  Rgb8Image out;
+  out.width = transpose ? image.height : image.width;
+  out.height = transpose ? image.width : image.height;
+  out.pixels.resize(expected);
+
+  for (uint32_t y = 0; y < out.height; ++y) {
+    for (uint32_t x = 0; x < out.width; ++x) {
+      // Transposing first, then mirroring in the source's own axes, is dcraw's order —
+      // reversing it turns 90 CW into 90 CCW.
+      uint32_t source_x = transpose ? y : x;
+      uint32_t source_y = transpose ? x : y;
+      if (mirror_columns) source_x = image.width - 1 - source_x;
+      if (mirror_rows) source_y = image.height - 1 - source_y;
+      const size_t from = (static_cast<size_t>(source_y) * image.width + source_x) * 3;
+      const size_t to = (static_cast<size_t>(y) * out.width + x) * 3;
+      out.pixels[to] = image.pixels[from];
+      out.pixels[to + 1] = image.pixels[from + 1];
+      out.pixels[to + 2] = image.pixels[from + 2];
+    }
+  }
+  return out;
+}
+
 Rgb8Image rgba_to_rgb(std::span<const uint8_t> rgba, uint32_t row_pixels, uint32_t x, uint32_t y,
                       uint32_t width, uint32_t height) {
   const size_t needed = (static_cast<size_t>(y + height - 1) * row_pixels + x + width) * 4;

@@ -24,6 +24,7 @@ import type {
 import { FRAME_HEADER_BYTES } from "@latent/protocol";
 import type { ServerWebSocket } from "bun";
 import { MockCatalog, scanRawFiles } from "./mock-catalog";
+import { applyLut, curveTable } from "./mock-curve";
 import {
   combineMask,
   coverageOf,
@@ -430,6 +431,13 @@ function paramOf(stack: Op[], op: string, name: string, fallback: number): numbe
   return value;
 }
 
+/** Every parameter of one enabled op — what the curve needs, which is not one number. */
+function paramsOf(stack: Op[], op: string): Record<string, unknown> {
+  const entry = stack.find((candidate) => candidate.op === op && candidate.enabled);
+  if (!entry) return {};
+  return entry.params;
+}
+
 /**
  * The synthetic photo before any op: a smooth colour gradient with a grid. The frame
  * renderer and the luminance/colour mask kinds read the same function, so a mask built on
@@ -469,6 +477,9 @@ export function renderFrame(
   const warm = 1 + temperature / 300;
   const cool = 1 - temperature / 300;
   const vivid = 1 + saturation / 100;
+  // The curve is the last of the tone stage, after the light sliders, as in the engine's
+  // pipeline. Its tables are built once per frame, not once per pixel.
+  const curve = curveTable(paramsOf(stack, "tone_curve"));
 
   const buffer = new ArrayBuffer(FRAME_HEADER_BYTES + width * height * 4);
   const header = new DataView(buffer);
@@ -495,10 +506,18 @@ export function renderFrame(
       r = luma + (r - luma) * vivid;
       g = luma + (g - luma) * vivid;
       b = luma + (b - luma) * vivid;
+      let toneR = 0.5 + (r * gain - 0.5) * slope;
+      let toneG = 0.5 + (g * gain - 0.5) * slope;
+      let toneB = 0.5 + (b * gain - 0.5) * slope;
+      if (curve.active) {
+        toneR = applyLut(curve.red, toneR);
+        toneG = applyLut(curve.green, toneG);
+        toneB = applyLut(curve.blue, toneB);
+      }
       const offset = (y * width + x) * 4;
-      pixels[offset] = 255 * (0.5 + (r * gain - 0.5) * slope);
-      pixels[offset + 1] = 255 * (0.5 + (g * gain - 0.5) * slope);
-      pixels[offset + 2] = 255 * (0.5 + (b * gain - 0.5) * slope);
+      pixels[offset] = 255 * toneR;
+      pixels[offset + 1] = 255 * toneG;
+      pixels[offset + 2] = 255 * toneB;
       pixels[offset + 3] = 255;
     }
   }
@@ -874,7 +893,14 @@ export class MockEngine {
       );
       this.maskSeq += 1;
       return {
-        result: { width: size.width, height: size.height, coverage: coverageOf(bytes) },
+        result: {
+          width: size.width,
+          height: size.height,
+          // `combineMask` rasterises over the whole raster, so as with LFRM the mock has
+          // no letterbox and the content rect is the frame.
+          contentRect: [0, 0, size.width, size.height],
+          coverage: coverageOf(bytes),
+        },
         frames: [maskFrame(size.width, size.height, this.maskSeq, viewId, bytes)],
       };
     }
@@ -1248,6 +1274,10 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
               seq: rendered.seq,
               width: rendered.width,
               height: rendered.height,
+              // `renderFrame` paints the whole buffer, so the mock never letterboxes: the
+              // content rect is the frame. The field is still sent, so the UI exercises
+              // the engine's path and not only its fallback.
+              contentRect: [0, 0, rendered.width, rendered.height],
               renderMs: rendered.renderMs,
               readbackMs: 0,
               revision: rendered.revision,

@@ -137,12 +137,17 @@ RawMetadata read_raw_metadata(const std::string& path) {
 Rgb8Image load_raw_preview(const std::string& path, uint32_t max_edge) {
   LibRaw raw;
   open_or_throw(raw, path);
+  // The embedded preview is stored in sensor orientation; only dcraw_process applies the
+  // camera flip, and the thumbnail path never runs it. Rotate after the box filter — it
+  // fits the long edge either way and the smaller buffer is the cheaper one to permute.
+  const int flip = raw.imgdata.sizes.flip;
   int status = raw.unpack_thumb();
   if (status == LIBRAW_SUCCESS) {
     const ProcessedImage thumb(raw.dcraw_make_mem_thumb(&status));
     // A thumbnail smaller than what was asked for is still better than a full decode.
-    if (thumb) return box_resize_to_fit(thumb_to_rgb(*thumb), max_edge);
+    if (thumb) return rotate_for_flip(box_resize_to_fit(thumb_to_rgb(*thumb), max_edge), flip);
   }
+  // half_size_preview goes through dcraw_process, which already flipped it.
   return box_resize_to_fit(half_size_preview(path), max_edge);
 }
 

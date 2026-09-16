@@ -10,6 +10,7 @@
     op,
     spec,
     opId = null,
+    rowName = null,
   }: {
     op: OpDefinition;
     spec: OpParamSpec;
@@ -18,12 +19,17 @@
      * column passes it so a local adjustment edits its own masked op, not the base one.
      */
     opId?: string | null;
+    /**
+     * The row's label, when the caller groups the parameters itself. The colour mixer's
+     * Hue tab labels its rows "Red", not "Red hue" — the tab already said which channel.
+     */
+    rowName?: string | null;
   } = $props();
   const viewer = kernelContext().viewer;
 
   const kind = $derived(controlKind(spec));
   const range = $derived(sliderRange(spec));
-  const label = $derived(rowLabel(op, spec));
+  const label = $derived(rowName ?? rowLabel(op, spec));
   const options = $derived((spec.values ?? []).map((value) => ({ value, label: value })));
 
   // The stack is the truth: the control shows whatever the engine last reported, and
@@ -97,7 +103,7 @@
           <Select value={String(current)} {options} {disabled} onChange={chooseOption} />
         </div>
       {:else if kind === "pending"}
-        <span class="text-xs text-faint" data-pending={spec.name}>{pendingNote(spec)}</span>
+        <span class="text-xs text-faint" data-pending={spec.name}>{pendingNote}</span>
       {:else}
         <span class="text-xs text-faint">{spec.type} — hand-built panel</span>
       {/if}

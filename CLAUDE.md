@@ -60,13 +60,20 @@ mirror Lightroom 1:1.
   `scripts/models/fetch.py` into `~/.local/share/latent/models/<model>/` with
   `config.json` + top-level `manifest.json` (sha256). I/O tables, preprocessing, timings
   and C++ port notes: `scripts/models/README.md`. SAM 2 decoder `num_labels` must be 1.
+  Engine side: `engine/src/ai/` (`latent_ai` lib), one ORT session per job, dropped after;
+  only the SAM 2 embedding is cached (most recent photo). `LATENT_MODEL_STORE` overrides
+  the store path (tests use it); `LATENT_MASK_STUB=1` swaps in shape stubs. The process
+  `Ort::Env` is leaked on purpose: destroying it after a CUDA session corrupted the heap
+  at exit one run in three.
 - Frame budget: < 16 ms slider tick end-to-end. Measured 2026-09-16: request→GPU 11.0 ms
   p50 at 811×1245 after WebGL2 painter; ~11 ms of it is Chromium's WebSocket receive of a
   4 MB frame, linear in bytes. Canvas draw is 0.0 ms. Numbers in `PROMPT.md` §8.1. Lever
   left: fewer bytes (half-res proxy while dragging). Re-measure after any frame-path change
   (`node apps/desktop/scripts/screenshot.ts --engine real --flow latency`); never read back
   full-res for preview (249 ms).
-- Sample raw for tests: `~/Downloads/DSC00120.ARW` (Sony A6400, 24 MP). Models:
+- Sample raw for tests: `~/Downloads/DSC00120.ARW` (Sony A6400, 24 MP). Bulk set for
+  catalog flows: `~/Pictures/Photos/` (280 Panasonic RW2), e.g.
+  `--engine real --flow catalog --photo ~/Downloads/DSC00120.ARW --dir ~/Pictures/Photos`. Models:
   `~/.local/share/latent/models/`. ORT CUDA needs free VRAM; ComfyUI can hold 12 GB.
 
 ## UI (TS)

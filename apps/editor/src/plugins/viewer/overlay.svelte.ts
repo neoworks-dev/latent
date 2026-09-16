@@ -5,6 +5,7 @@
 // the overlay canvas' own CSS-pixel space. Nothing outside this file converts between them.
 import {
   containRect,
+  type ContentRect,
   imagePoint,
   type OverlayDraw,
   type OverlayPointer,
@@ -43,6 +44,7 @@ export class ViewerOverlayState implements ViewerOverlay {
   private imageHeight = 0;
   private boxWidth = 0;
   private boxHeight = 0;
+  private contentRect: ContentRect | null = null;
 
   /** The canvas hands itself over on mount and takes itself back on unmount. */
   attachCanvas(canvas: HTMLCanvasElement): () => void {
@@ -63,6 +65,21 @@ export class ViewerOverlayState implements ViewerOverlay {
     if (width === this.imageWidth && height === this.imageHeight) return;
     this.imageWidth = width;
     this.imageHeight = height;
+    this.measure();
+  }
+
+  /**
+   * Where the engine put the photo inside the frame, in frame pixels (`view.render`'s
+   * `contentRect`). Crop and rotate move it, and no client can derive it, so without it
+   * the overlay can only assume the frame is all photo. `null` when the engine did not
+   * send one.
+   */
+  setContentRect(rect: ContentRect | null): void {
+    // A render result lands per frame, so an unchanged rect must not cost a repaint.
+    const current = this.contentRect;
+    if (rect === null && current === null) return;
+    if (rect && current && rect.every((value, index) => value === current[index])) return;
+    this.contentRect = rect;
     this.measure();
   }
 
@@ -149,7 +166,22 @@ export class ViewerOverlayState implements ViewerOverlay {
   }
 
   private measure(): void {
-    this.rect = containRect(this.imageWidth, this.imageHeight, this.boxWidth, this.boxHeight);
+    // The canvas letterboxes the whole frame into the box; the photo then sits inside that
+    // at the engine's content rect, scaled by the same factor.
+    const frame = containRect(this.imageWidth, this.imageHeight, this.boxWidth, this.boxHeight);
+    const content = this.contentRect;
+    if (!content || this.imageWidth <= 0 || frame.width <= 0) {
+      this.rect = frame;
+      this.redraw();
+      return;
+    }
+    const scale = frame.width / this.imageWidth;
+    this.rect = {
+      x: frame.x + content[0] * scale,
+      y: frame.y + content[1] * scale,
+      width: content[2] * scale,
+      height: content[3] * scale,
+    };
     this.redraw();
   }
 

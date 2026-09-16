@@ -2,13 +2,13 @@
 // stack below the op, hands it here on the worker thread, and the result lands back as a
 // cached raster the component points at — never inline in a slider tick.
 //
-// Phase 1 ships two implementations. `LATENT_MASK_STUB=1` selects a shape generator, so
-// the whole path — job, progress, pending -> ready, sidecar, overlay — can be exercised
-// end to end without a 400 MB checkpoint. Without it, detection fails with "model not
-// installed": stale is never auto-run and neither is missing.
-//
-// Next task: SAM 2 through onnxruntime with the CUDA EP, with Florence-2 in front for the
-// `text` kind (SAM 2 has no text input). Nothing outside this header changes when it lands.
+// Two implementations. `LATENT_MASK_STUB=1` selects a shape generator, so the whole path —
+// job, progress, pending -> ready, sidecar, overlay — can be exercised end to end without a
+// 400 MB checkpoint. Without it, onnxruntime on the CUDA EP (ai/ort_session.h), routed by
+// kind: `objects` and `text` to SAM 2 (with Florence-2 in front of `text`, because SAM 2
+// has no text input), `subject`/`background` to BiRefNet-lite, `sky`/`people` to
+// SegFormer-B2 ADE20K. A model that is not in the store fails with a message naming it;
+// stale is never auto-run and neither is missing.
 #pragma once
 
 #include "image/gray.h"

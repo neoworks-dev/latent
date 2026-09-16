@@ -381,16 +381,17 @@ duplicated`** comes from SAM 2's decoder. Also harmless — the indices are the 
 
 ## Files
 
-| File                  | What                                                               |
-| --------------------- | ------------------------------------------------------------------ |
-| `fetch.py`            | idempotent install of all four models, `manifest.json`, `--verify` |
-| `segment.py`          | reference pipeline: `--prompt` / `--box` / `--points` / `--kind`   |
-| `evaluate.py`         | contact sheets for the quality assessment                          |
-| `sam2.py`             | SAM 2 preprocessing, prompts, decode, upsample                     |
-| `florence2.py`        | task tokens, prompt build, greedy decode, box parsing              |
-| `dedicated.py`        | BiRefNet-lite and SegFormer-ADE20K runtimes                        |
-| `export_florence2.py` | torch -> ONNX for Florence-2                                       |
-| `export_dedicated.py` | torch -> ONNX for SegFormer, fetch for BiRefNet                    |
-| `common.py`           | store paths, sha256, raw decode, resize convention, timers         |
-| `testdata.py`         | the three CC0 evaluation photos                                    |
-| `inspect_onnx.py`     | print a graph's inputs and outputs                                 |
+| File                   | What                                                                                                                         |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `fetch.py`             | idempotent install of all four models, `manifest.json`, `--verify`                                                           |
+| `segment.py`           | reference pipeline: `--prompt` / `--box` / `--points` / `--kind`                                                             |
+| `evaluate.py`          | contact sheets for the quality assessment                                                                                    |
+| `sam2.py`              | SAM 2 preprocessing, prompts, decode, upsample                                                                               |
+| `florence2.py`         | task tokens, prompt build, greedy decode, box parsing                                                                        |
+| `dedicated.py`         | BiRefNet-lite and SegFormer-ADE20K runtimes                                                                                  |
+| `export_florence2.py`  | torch -> ONNX for Florence-2                                                                                                 |
+| `export_dedicated.py`  | torch -> ONNX for SegFormer, fetch for BiRefNet                                                                              |
+| `common.py`            | store paths, sha256, raw decode, resize convention, timers                                                                   |
+| `testdata.py`          | the three CC0 evaluation photos                                                                                              |
+| `inspect_onnx.py`      | print a graph's inputs and outputs                                                                                           |
+| `tokenizer_fixture.py` | token ids for ~10 prompts -> `engine/tests/fixtures/florence-tokenizer.json`, which the C++ byte-level BPE is diffed against |

@@ -171,6 +171,9 @@ export class ViewerState implements ViewerService {
       })
       .then((result) => {
         this.engineMs = result.renderMs + result.readbackMs;
+        // Where the photo sits inside the frame the engine just sent. An engine that does
+        // not answer with one leaves the overlay on its own letterbox of the frame.
+        this.overlay.setContentRect(result.contentRect ?? null);
       })
       .catch((error: Error) => {
         this.status = error.message;
