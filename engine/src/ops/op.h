@@ -19,13 +19,18 @@ class OpError : public std::runtime_error {
 };
 
 // One entry of the stack, matching protocol/messages.schema.json#/definitions/Op.
+// `mask` is the canonical MaskComponent list (ops/mask.h); `opacity` is the layer opacity
+// 0..100, and 100 is absent on the wire and in the sidecar.
 struct Op {
   std::string id;
   std::string name;
   nlohmann::json params = nlohmann::json::object();
   std::optional<nlohmann::json> mask;
+  double opacity = 100;
   bool enabled = true;
 };
+
+inline constexpr double kFullOpacity = 100.0;
 
 using Stack = std::vector<Op>;
 

@@ -2,6 +2,8 @@
 
 #include "catalog/thumbnail.h"
 #include "image/jpeg.h"
+#include "image/png.h"
+#include "ops/mask.h"
 #include "ops/registry.h"
 #include "ops/sha256.h"
 #include "ops/sidecar.h"
@@ -17,6 +19,7 @@
 #include <array>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -36,6 +39,10 @@ constexpr uint32_t kDefaultThumbnailSize = 256;
 constexpr int kPreviewQuality = 88;
 constexpr size_t kImportProgressEvery = 8;
 constexpr int kDefaultScriptTimeoutMs = 30000;
+// mask.preview without a viewId, and the input a detector is handed: both proxy sizes,
+// both long-edge, both small enough that a detect never stalls the loop for long.
+constexpr uint32_t kMaskPreviewSize = 1024;
+constexpr uint32_t kMaskDetectInputSize = 1024;
 // LTHM carries the photo id in a u32 (protocol/frames.md); a larger rowid cannot be
 // tagged, so the request is refused instead of answered with a truncated frame.
 constexpr int64_t kMaxThumbnailPhotoId = 0xFFFFFFFF;
@@ -88,6 +95,20 @@ int optional_int(const nlohmann::json& params, const char* key, int fallback) {
   return params[key].get<int>();
 }
 
+double optional_opacity(const nlohmann::json& params, double fallback) {
+  if (!params.is_object() || !params.contains("opacity") || params["opacity"].is_null()) {
+    return fallback;
+  }
+  if (!params["opacity"].is_number()) {
+    throw RpcError(kInvalidParams, "params.opacity must be a number");
+  }
+  const double opacity = params["opacity"].get<double>();
+  if (opacity < 0 || opacity > kFullOpacity) {
+    throw RpcError(kInvalidParams, "params.opacity must be between 0 and 100");
+  }
+  return opacity;
+}
+
 nlohmann::json object_param(const nlohmann::json& params, const char* key) {
   if (!params.is_object() || !params.contains(key) || params[key].is_null()) {
     return nlohmann::json::object();
@@ -130,21 +151,46 @@ std::string require_flag(const nlohmann::json& params, const char* key) {
 }
 
 // Drops ops this engine does not know and normalises the rest, so a hand-edited sidecar
-// or a script's stack.set can never put an unrenderable op in the truth.
+// or a script's stack.set can never put an unrenderable op in the truth. The same pass
+// canonicalises masks: every component validated, defaults filled in, engine-owned fields
+// (the stroke list, an AI raster's path) carried through untouched.
 Stack sanitize_stack(const Stack& input, std::vector<std::string>& warnings) {
   Stack out;
   out.reserve(input.size());
   for (const Op& op : input) {
-    if (find_op_definition(op.name) == nullptr) {
+    const OpDefinition* definition = find_op_definition(op.name);
+    if (definition == nullptr) {
       warnings.push_back("dropping unknown op '" + op.name + "'");
       continue;
     }
     Op copy = op;
     if (copy.id.empty()) copy.id = make_op_id();
     copy.params = normalize_params_for(copy.name, op.params, warnings);
+    copy.opacity = std::clamp(copy.opacity, 0.0, kFullOpacity);
+    if (copy.mask.has_value()) {
+      if (!definition->maskable()) {
+        // A geometry op moves pixels instead of changing them, so there is nothing for a
+        // mask to blend into (PROMPT.md 3.7, ops.describe `maskable`).
+        warnings.push_back("op '" + copy.name + "' is not maskable: its mask is ignored");
+        copy.mask.reset();
+      } else {
+        copy.mask = normalize_mask(*copy.mask);
+      }
+    }
     out.push_back(std::move(copy));
   }
   return out;
+}
+
+// A component's raster cache key: its params, the model that produced it and the source
+// image. A model change or a re-edited photo reads as a different raster, which is what
+// makes `stale` mean something (PROMPT.md 3.7).
+std::string detect_raster_hash(const MaskComponent& component, const std::string& model,
+                               const std::string& source_hash) {
+  const std::string text = component.params.dump() + "|" +
+                           std::string(mask_kind_name(component.kind)) + "|" + model + "|" +
+                           source_hash;
+  return sha256_hex({reinterpret_cast<const uint8_t*>(text.data()), text.size()});
 }
 
 void write_frame_header(std::vector<uint8_t>& frame, const char* magic, uint32_t width,
@@ -205,7 +251,8 @@ std::vector<std::string> collect_raw_files(const std::vector<std::string>& paths
 Server::Server(Renderer& renderer, ServerOptions options)
     : renderer_(renderer),
       options_(std::move(options)),
-      catalog_(options_.catalog_path.empty() ? Catalog::default_path() : options_.catalog_path) {}
+      catalog_(options_.catalog_path.empty() ? Catalog::default_path() : options_.catalog_path),
+      mask_detector_(make_mask_detector()) {}
 
 Server::~Server() {
   // The worker and the interpreter must stop reaching into the engine before it dies.
@@ -388,6 +435,9 @@ std::optional<nlohmann::json> Server::dispatch(std::string_view method,
   if (method == "catalog.thumbnails") return handle_catalog_thumbnails(params, peer, responder);
   if (method == "catalog.remove") return handle_catalog_remove(params);
   if (method == "job.cancel") return handle_job_cancel(params);
+  if (method == "mask.preview") return handle_mask_preview(params, peer);
+  if (method == "mask.detect") return handle_mask_detect(params, peer);
+  if (method == "mask.stroke") return handle_mask_stroke(params, peer);
   throw RpcError(kMethodNotFound, "unknown method '" + std::string(method) + "'");
 }
 
@@ -482,6 +532,9 @@ void Server::finish_photo_open(const std::string& path, const std::shared_ptr<De
     std::fflush(stdout);
 
     const PhotoState& opened = photos_.at(photo_id);
+    // The sidecar names AI rasters by path; without them a `ready` component would render
+    // as "select everything" instead of what the model found.
+    load_mask_rasters(opened);
     broadcast_stack_changed(opened, "load", responder.peer);
     reply_result(responder, photo_open_result(opened));
   } catch (const std::exception& failure) {
@@ -543,6 +596,11 @@ nlohmann::json Server::handle_op_add(const nlohmann::json& params, Peer* peer) {
   op.name = name;
   // params is optional: an op added without one lands at the registry defaults.
   op.params = normalize_params(*definition, object_param(params, "params"), warnings);
+  if (params.contains("mask") && !params["mask"].is_null()) op.mask = params["mask"];
+  op.opacity = optional_opacity(params, kFullOpacity);
+  // sanitize_stack validates the mask and drops it when the op is a geometry op.
+  Stack single = sanitize_stack({op}, warnings);
+  op = single.front();
   warn_all(warnings, photo.id);
 
   Stack next = photo.history.current();
@@ -578,6 +636,18 @@ nlohmann::json Server::handle_op_update(const nlohmann::json& params, Peer* peer
   std::vector<std::string> warnings;
   target->params = normalize_params(*definition, merged, warnings);
   if (params.contains("enabled")) target->enabled = optional_flag(params, "enabled");
+  // A full replacement, never a merge: a mask is a list, and merging two lists by index
+  // is not a thing a caller could reason about. `null` clears it.
+  if (params.contains("mask")) {
+    if (params["mask"].is_null()) {
+      target->mask.reset();
+    } else if (!definition->maskable()) {
+      warnings.push_back("op '" + target->name + "' is not maskable: its mask is ignored");
+    } else {
+      target->mask = normalize_mask(params["mask"]);
+    }
+  }
+  if (params.contains("opacity")) target->opacity = optional_opacity(params, target->opacity);
   warn_all(warnings, photo.id);
 
   commit(photo, std::move(next), optional_flag(params, "transient"), "ui", peer);
@@ -948,6 +1018,306 @@ nlohmann::json Server::handle_job_cancel(const nlohmann::json& params) {
   return {{"cancelled", true}};
 }
 
+Op& Server::require_masked_op(Stack& stack, const nlohmann::json& params) {
+  const std::string op_id = require_string(params, "opId");
+  Op* op = find_op(stack, op_id);
+  if (op == nullptr) throw RpcError(kInvalidParams, "unknown opId '" + op_id + "'");
+  if (!op->mask.has_value() || !op->mask->contains("components") ||
+      (*op->mask)["components"].empty()) {
+    throw RpcError(kInvalidParams, "op '" + op_id + "' has no mask");
+  }
+  return *op;
+}
+
+nlohmann::json Server::handle_mask_preview(const nlohmann::json& params, Peer* peer) {
+  PhotoState& photo = photo_for(params);
+  Stack stack = photo.history.current();
+  const Op& op = require_masked_op(stack, params);
+  const std::string op_id = op.id;
+
+  std::string component_id;
+  if (params.contains("componentId") && !params["componentId"].is_null()) {
+    component_id = require_string(params, "componentId");
+    const Mask mask = mask_from_json(*op.mask);
+    const MaskComponent* component = find_component(mask, component_id);
+    if (component == nullptr) {
+      throw RpcError(kInvalidParams, "unknown componentId '" + component_id + "'");
+    }
+    // A component nobody has rasterised yet has no raster to hand out; it is not an empty
+    // one (protocol MaskPreviewResult).
+    if (!component->contributes()) {
+      throw RpcError(kInvalidParams, "component '" + component_id + "' is " +
+                                         std::string(mask_state_name(component->state)));
+    }
+    if (mask_kind_is_ai(component->kind) &&
+        !renderer_.has_mask_raster(photo.id, component_id,
+                                   component->params.value("raster", std::string()))) {
+      throw RpcError(kInvalidParams, "component '" + component_id + "' has no cached raster");
+    }
+  }
+
+  uint32_t view_id = 0;
+  if (params.contains("viewId") && !params["viewId"].is_null()) {
+    const ViewState& view = view_for(params);
+    if (view.photo_id != photo.id) {
+      throw RpcError(kInvalidParams, "viewId belongs to another photo");
+    }
+    view_id = view.id;
+  }
+
+  std::vector<uint8_t> frame;
+  const MaskReadout readout = send_mask_frame(peer, photo, view_id, op_id, component_id, frame);
+  return {{"width", readout.width}, {"height", readout.height}, {"coverage", readout.coverage}};
+}
+
+MaskReadout Server::send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view_id,
+                                    const std::string& op_id, const std::string& component_id,
+                                    std::vector<uint8_t>& frame) {
+  uint32_t target = view_id;
+  const bool temporary = target == 0;
+  if (temporary) {
+    // No view open yet: an overlay-sized throwaway, the same shape render_offscreen uses.
+    const double aspect = static_cast<double>(photo.width) / std::max(1U, photo.height);
+    uint32_t width = kMaskPreviewSize;
+    auto height = std::max(1U, static_cast<uint32_t>(std::lround(width / aspect)));
+    if (height > width) {
+      height = kMaskPreviewSize;
+      width = std::max(1U, static_cast<uint32_t>(std::lround(height * aspect)));
+    }
+    target = next_view_id_++;
+    renderer_.open_view(target, photo.id, width, height);
+  }
+
+  MaskReadout readout;
+  try {
+    const ViewGeometry geometry = renderer_.view_geometry(target);
+    frame.assign(kFrameHeaderBytes + (static_cast<size_t>(geometry.width) * geometry.height), 0);
+    readout = renderer_.read_mask(target, photo.history.current(), op_id, component_id, frame,
+                                  kFrameHeaderBytes);
+  } catch (...) {
+    if (temporary) renderer_.close_view(target);
+    throw;
+  }
+  if (temporary) renderer_.close_view(target);
+
+  // format 2 = r8, and the target field carries the view the raster was sized for — 0
+  // when the caller named none (protocol/frames.md, LMSK).
+  write_frame_header(frame, "LMSK", readout.width, readout.height, ++mask_seq_, view_id, 2);
+  if (peer_alive(peer)) {
+    peer->send(std::string_view(reinterpret_cast<const char*>(frame.data()), frame.size()),
+               uWS::OpCode::BINARY);
+  }
+  return readout;
+}
+
+nlohmann::json Server::handle_mask_detect(const nlohmann::json& params, Peer* peer) {
+  PhotoState& photo = photo_for(params);
+  const std::string op_id = require_string(params, "opId");
+  const std::string component_id = require_string(params, "componentId");
+  const nlohmann::json hint = object_param(params, "hint");
+  return {{"jobId", start_mask_detect(photo, op_id, component_id, hint, peer)}};
+}
+
+int64_t Server::start_mask_detect(PhotoState& photo, const std::string& op_id,
+                                  const std::string& component_id, const nlohmann::json& hint,
+                                  Peer* origin) {
+  Stack next = photo.history.current();
+  Op* op = find_op(next, op_id);
+  if (op == nullptr) throw RpcError(kInvalidParams, "unknown opId '" + op_id + "'");
+  if (!op->mask.has_value()) throw RpcError(kInvalidParams, "op '" + op_id + "' has no mask");
+  Mask mask = mask_from_json(*op->mask);
+  MaskComponent* component = find_component(mask, component_id);
+  if (component == nullptr) {
+    throw RpcError(kInvalidParams, "unknown componentId '" + component_id + "'");
+  }
+  if (!mask_kind_is_ai(component->kind)) {
+    throw RpcError(kInvalidParams, "component kind '" +
+                                       std::string(mask_kind_name(component->kind)) +
+                                       "' rasterises inline, not through mask.detect");
+  }
+
+  const int64_t job_id = next_job_id_++;
+  for (auto entry = hint.begin(); entry != hint.end(); ++entry) {
+    component->params[entry.key()] = entry.value();
+  }
+  component->params.erase("error");
+  component->state = MaskState::Pending;
+  component->job_id = job_id;
+
+  MaskDetectRequest request;
+  request.kind = component->kind;
+  request.params = component->params;
+  op->mask = mask_to_json(mask);
+  // Engine bookkeeping, not a user edit: pending replaces the current snapshot instead of
+  // costing an undo step. The result below commits for real, so it reaches the sidecar.
+  commit(photo, std::move(next), true, "ui", origin);
+
+  // What the detector sees. Phase 1 hands it the whole stack rendered small, which is
+  // also what an agent looking at render_preview would see; cropping to the sub-stack
+  // below the op is the generative path's problem (PROMPT.md 3.5) and lands with SAM 2.
+  try {
+    const OffscreenFrame input = render_offscreen(photo.id, kMaskDetectInputSize);
+    request.image = rgba_to_rgb(input.rgba, input.geometry.width, input.geometry.content_x,
+                                input.geometry.content_y, input.geometry.content_width,
+                                input.geometry.content_height);
+  } catch (const std::exception& error) {
+    warn(std::string("mask.detect could not render its input: ") + error.what(), photo.id);
+  }
+
+  job_started(job_id);
+  publish_progress(job_id, 0, "mask", 0, 1, "running", std::string(mask_kind_name(request.kind)));
+  const int64_t photo_id = photo.id;
+  MaskDetector* detector = mask_detector_.get();
+  worker_.submit([this, detector, request, photo_id, op_id, component_id, job_id] {
+    MaskDetectResult result;
+    try {
+      result = detector->detect(request);
+    } catch (const std::exception& error) {
+      result.ok = false;
+      result.message = error.what();
+    }
+    post([this, photo_id, op_id, component_id, job_id, result] {
+      finish_mask_detect(photo_id, op_id, component_id, job_id, result);
+    });
+  });
+  return job_id;
+}
+
+void Server::finish_mask_detect(int64_t photo_id, const std::string& op_id,
+                                const std::string& component_id, int64_t job_id,
+                                const MaskDetectResult& result) {
+  job_finished(job_id);
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) {
+    publish_progress(job_id, 0, "mask", 1, 1, "cancelled", "photo closed");
+    return;
+  }
+  PhotoState& photo = found->second;
+  Stack next = photo.history.current();
+  Op* op = find_op(next, op_id);
+  if (op == nullptr || !op->mask.has_value()) {
+    publish_progress(job_id, 0, "mask", 1, 1, "cancelled", "op is gone");
+    return;
+  }
+  Mask mask = mask_from_json(*op->mask);
+  MaskComponent* component = find_component(mask, component_id);
+  if (component == nullptr) {
+    publish_progress(job_id, 0, "mask", 1, 1, "cancelled", "component is gone");
+    return;
+  }
+  // A second mask.detect on the same component wins; this one's result is thrown away
+  // rather than overwriting a newer pending state.
+  if (component->job_id != job_id) {
+    publish_progress(job_id, 0, "mask", 1, 1, "cancelled", "superseded");
+    return;
+  }
+
+  std::string error;
+  if (!result.ok) {
+    component->state = MaskState::Failed;
+    component->params["error"] = result.message;
+    error = result.message;
+  } else {
+    // The raster's identity is its path: the hash in the filename already covers the
+    // params, the model and the source image (detect_raster_hash).
+    const std::string relative = mask_raster_relative_path(
+        component_id, detect_raster_hash(*component, result.model, photo.hash));
+    try {
+      write_gray_png(sidecar_dir_for(photo.path) + "/" + relative, result.raster);
+    } catch (const std::exception& failure) {
+      warn(std::string("mask raster not cached on disk: ") + failure.what(), photo.id);
+    }
+    renderer_.put_mask_raster(photo.id, component_id, relative, result.raster);
+    component->params["model"] = result.model;
+    component->params["sourceHash"] = photo.hash;
+    component->params["raster"] = relative;
+    component->params.erase("error");
+    component->state = MaskState::Ready;
+  }
+  component->job_id = 0;
+  op->mask = mask_to_json(mask);
+  commit(photo, std::move(next), false, "ui", nullptr);
+  publish_progress(job_id, 0, "mask", 1, 1, result.ok ? "done" : "error",
+                   result.ok ? std::string(mask_kind_name(component->kind)) : error, error);
+}
+
+nlohmann::json Server::handle_mask_stroke(const nlohmann::json& params, Peer* peer) {
+  PhotoState& photo = photo_for(params);
+  const std::string component_id = require_string(params, "componentId");
+  if (!params.contains("points") || !params["points"].is_array() || params["points"].empty()) {
+    throw RpcError(kInvalidParams, "params.points must be a non-empty array");
+  }
+
+  Stack next = photo.history.current();
+  Op& op = require_masked_op(next, params);
+  Mask mask = mask_from_json(*op.mask);
+  MaskComponent* component = find_component(mask, component_id);
+  if (component == nullptr) {
+    throw RpcError(kInvalidParams, "unknown componentId '" + component_id + "'");
+  }
+  if (component->kind != MaskKind::Brush) {
+    throw RpcError(kInvalidParams, "only a brush component takes strokes, not '" +
+                                       std::string(mask_kind_name(component->kind)) + "'");
+  }
+
+  BrushStroke stroke;
+  stroke.erase = optional_flag(params, "erase");
+  stroke.size = component->params.value("size", 0.08);
+  stroke.flow = component->params.value("flow", 100.0);
+  if (params.contains("size")) {
+    if (!params["size"].is_number()) throw RpcError(kInvalidParams, "params.size must be a number");
+    stroke.size = params["size"].get<double>();
+  }
+  if (params.contains("flow")) {
+    if (!params["flow"].is_number()) throw RpcError(kInvalidParams, "params.flow must be a number");
+    stroke.flow = params["flow"].get<double>();
+  }
+  for (const nlohmann::json& point : params["points"]) {
+    if (!point.is_array() || point.size() < 2 || point.size() > 3) {
+      throw RpcError(kInvalidParams, "a point is [x, y] or [x, y, pressure]");
+    }
+    StrokePoint at;
+    at.x = point[0].is_number() ? point[0].get<double>() : 0;
+    at.y = point[1].is_number() ? point[1].get<double>() : 0;
+    if (!point[0].is_number() || !point[1].is_number()) {
+      throw RpcError(kInvalidParams, "a point holds numbers");
+    }
+    if (point.size() == 3) {
+      if (!point[2].is_number()) throw RpcError(kInvalidParams, "pressure must be a number");
+      at.pressure = point[2].get<double>();
+    }
+    stroke.points.push_back(at);
+  }
+
+  append_brush_stroke(component->params, stroke);
+  // The engine owns the file the sidecar points at; the UI never names it.
+  component->params[std::string(kBrushStrokePathKey)] = brush_stroke_relative_path(component_id);
+  // Re-validating here is what turns a bad point into -32602 instead of a broken sidecar.
+  op.mask = normalize_mask(mask_to_json(mask));
+  commit(photo, std::move(next), optional_flag(params, "transient"), "ui", peer);
+  return stack_state(photo);
+}
+
+void Server::load_mask_rasters(const PhotoState& photo) {
+  for (const Op& op : photo.history.current()) {
+    if (!op.mask.has_value()) continue;
+    const Mask mask = mask_from_json(*op.mask);
+    for (const MaskComponent& component : mask.components) {
+      if (!mask_kind_is_ai(component.kind)) continue;
+      const std::string relative = component.params.value("raster", std::string());
+      if (relative.empty()) continue;
+      try {
+        std::optional<GrayImage> raster =
+            read_gray_png(sidecar_dir_for(photo.path) + "/" + relative);
+        if (!raster.has_value()) continue;
+        renderer_.put_mask_raster(photo.id, component.id, relative, std::move(*raster));
+      } catch (const std::exception& error) {
+        warn(std::string("mask raster not reloaded: ") + error.what(), photo.id);
+      }
+    }
+  }
+}
+
 void Server::import_job(int64_t job_id, int64_t thumbnail_job_id,
                         const std::vector<std::string>& paths, bool recursive) {
   const std::vector<std::string> files = collect_raw_files(paths, recursive);
@@ -1034,7 +1404,7 @@ bool Server::job_cancelled(int64_t job_id) {
 
 void Server::publish_progress(int64_t job_id, int64_t parent_job_id, std::string_view kind,
                               int64_t done, int64_t total, std::string_view state,
-                              const std::string& message) {
+                              const std::string& message, const std::string& error) {
   nlohmann::json params = {{"jobId", job_id},
                            {"kind", kind},
                            {"done", done},
@@ -1043,6 +1413,7 @@ void Server::publish_progress(int64_t job_id, int64_t parent_job_id, std::string
                            {"state", state}};
   if (parent_job_id > 0) params["parentJobId"] = parent_job_id;
   if (!message.empty()) params["message"] = message;
+  if (!error.empty()) params["error"] = error;
   // Notifications always leave from the server thread, whoever produced the progress.
   post([this, params] {
     broadcast({{"jsonrpc", "2.0"}, {"method", "job.progress"}, {"params", params}});
@@ -1131,6 +1502,29 @@ void Server::save_sidecar(PhotoState& photo) {
     write_sidecar(photo.sidecar_path, sidecar);
   } catch (const std::exception& error) {
     warn(std::string("sidecar not written: ") + error.what(), photo.id);
+  }
+
+  // Brush strokes ride the stack so they undo, and are mirrored beside the sidecar under
+  // the path the component names (PROMPT.md 3.3): one file per component, rewritten whole.
+  for (const Op& op : sidecar.stack) {
+    if (!op.mask.has_value()) continue;
+    for (const nlohmann::json& component : (*op.mask)["components"]) {
+      if (component.value("kind", std::string()) != "brush") continue;
+      const nlohmann::json& params = component["params"];
+      const std::string relative = params.value(std::string(kBrushStrokePathKey), std::string());
+      if (relative.empty()) continue;
+      const std::string path = sidecar_dir_for(photo.path) + "/" + relative;
+      try {
+        std::error_code failure;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), failure);
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        if (!file) throw std::runtime_error("cannot write " + path);
+        file << params.value(std::string(kBrushStrokeDataKey), nlohmann::json::array()).dump(1)
+             << "\n";
+      } catch (const std::exception& error) {
+        warn(std::string("brush strokes not written: ") + error.what(), photo.id);
+      }
+    }
   }
 }
 
@@ -1320,6 +1714,48 @@ std::vector<uint8_t> Server::render_preview_jpeg(int64_t photo_id, uint32_t max_
   }
   const Rgb8Image image = rgba_to_rgb(frame.rgba, geometry.width, x, y, width, height);
   return encode_jpeg(image, kPreviewQuality);
+}
+
+int64_t Server::detect_mask(int64_t photo_id, const std::string& op_id,
+                            const std::string& component_id) {
+  PhotoState& photo = require_photo(photo_id);
+  return start_mask_detect(photo, op_id, component_id, nlohmann::json::object(), nullptr);
+}
+
+std::vector<uint8_t> Server::render_mask_png(int64_t photo_id, const std::string& op_id,
+                                             const std::string& component_id, uint32_t max_size) {
+  PhotoState& photo = require_photo(photo_id);
+  const double aspect = static_cast<double>(photo.width) / std::max(1U, photo.height);
+  uint32_t width = std::clamp(max_size, 32U, 4096U);
+  auto height = std::max(1U, static_cast<uint32_t>(std::lround(width / aspect)));
+  if (height > width) {
+    height = std::clamp(max_size, 32U, 4096U);
+    width = std::max(1U, static_cast<uint32_t>(std::lround(height * aspect)));
+  }
+
+  const uint32_t view_id = next_view_id_++;
+  renderer_.open_view(view_id, photo_id, width, height);
+  GrayImage image;
+  try {
+    const ViewGeometry geometry = renderer_.view_geometry(view_id);
+    std::vector<uint8_t> raster(static_cast<size_t>(geometry.width) * geometry.height, 0);
+    renderer_.read_mask(view_id, photo.history.current(), op_id, component_id, raster, 0);
+    // The agent gets the picture, not the letterbox the view padded it with.
+    image.width = geometry.content_width;
+    image.height = geometry.content_height;
+    image.pixels.resize(static_cast<size_t>(image.width) * image.height);
+    for (uint32_t y = 0; y < image.height; ++y) {
+      const size_t from =
+          (static_cast<size_t>(geometry.content_y + y) * geometry.width) + geometry.content_x;
+      std::memcpy(image.pixels.data() + (static_cast<size_t>(y) * image.width),
+                  raster.data() + from, image.width);
+    }
+  } catch (...) {
+    renderer_.close_view(view_id);
+    throw;
+  }
+  renderer_.close_view(view_id);
+  return encode_gray_png(image);
 }
 
 nlohmann::json Server::catalog_list(int limit) {

@@ -3,6 +3,7 @@
 // mutation an RPC would have made — one op-stack, one history, one sidecar.
 #include "python/module.h"
 
+#include "ops/mask.h"
 #include "ops/registry.h"
 #include "python/json_convert.h"
 
@@ -167,6 +168,13 @@ struct ParamsRef {
   int64_t photo_id = 0;
   std::string op_id;
 };
+struct MaskRef {
+  int64_t photo_id = 0;
+  std::string op_id;
+};
+struct MasksRef {
+  int64_t photo_id = 0;
+};
 struct DevelopRef {
   int64_t photo_id = 0;
 };
@@ -262,6 +270,96 @@ void bind_params(py::module_& module) {
       });
 }
 
+nlohmann::json mask_json(int64_t photo_id, const std::string& op_id) {
+  const nlohmann::json op = op_json(photo_id, op_id);
+  if (!op.contains("mask")) return {{"components", nlohmann::json::array()}};
+  return op["mask"];
+}
+
+// Component-level keys live beside `params` in the schema, everything else is a param, so
+// `mask.add("radial", center=[0.4, 0.5], feather=70)` reads the way it looks.
+bool is_component_field(const std::string& key) {
+  return key == "id" || key == "mode" || key == "invert" || key == "feather" || key == "opacity";
+}
+
+void bind_mask(py::module_& module) {
+  py::class_<MaskRef>(module, "OpMask",
+                      "One op's mask: a component list combined top-down (PROMPT.md 3.7).")
+      .def("__len__",
+           [](const MaskRef& self) {
+             return mask_json(self.photo_id, self.op_id)["components"].size();
+           })
+      .def("__iter__",
+           [](const MaskRef& self) {
+             return py::iter(json_to_python(mask_json(self.photo_id, self.op_id)["components"]));
+           })
+      .def("__getitem__",
+           [](const MaskRef& self, int64_t index) {
+             const nlohmann::json components = mask_json(self.photo_id, self.op_id)["components"];
+             const int64_t at = index < 0 ? index + static_cast<int64_t>(components.size()) : index;
+             if (at < 0 || at >= static_cast<int64_t>(components.size())) throw py::index_error();
+             return json_to_python(components[static_cast<size_t>(at)]);
+           })
+      .def("to_list",
+           [](const MaskRef& self) {
+             return json_to_python(mask_json(self.photo_id, self.op_id)["components"]);
+           })
+      .def(
+          "add",
+          [](const MaskRef& self, const std::string& kind, const py::kwargs& fields) {
+            nlohmann::json component = {{"id", make_op_id()}, {"kind", kind}, {"mode", "add"}};
+            nlohmann::json params = nlohmann::json::object();
+            for (const auto& field : fields) {
+              const auto key = field.first.cast<std::string>();
+              const nlohmann::json value =
+                  python_to_json(py::reinterpret_borrow<py::object>(field.second));
+              if (is_component_field(key)) {
+                component[key] = value;
+              } else {
+                params[key] = value;
+              }
+            }
+            component["params"] = params;
+            const auto component_id = component["id"].get<std::string>();
+            edit_stack(self.photo_id, [&](Stack& stack) {
+              Op& op = require_op(stack, self.op_id);
+              nlohmann::json mask =
+                  op.mask.value_or(nlohmann::json{{"components", nlohmann::json::array()}});
+              mask["components"].push_back(component);
+              op.mask = normalize_mask(mask);
+            });
+            return component_id;
+          },
+          py::arg("kind"))
+      .def(
+          "remove",
+          [](const MaskRef& self, const std::string& component_id) {
+            edit_stack(self.photo_id, [&](Stack& stack) {
+              Op& op = require_op(stack, self.op_id);
+              if (!op.mask.has_value()) throw std::runtime_error("latent: the op has no mask");
+              nlohmann::json kept = nlohmann::json::array();
+              for (const nlohmann::json& component : (*op.mask)["components"]) {
+                if (component.value("id", std::string()) == component_id) continue;
+                kept.push_back(component);
+              }
+              // An op with no components left has no mask: it applies everywhere again.
+              if (kept.empty()) {
+                op.mask.reset();
+                return;
+              }
+              op.mask = normalize_mask(nlohmann::json{{"components", kept}});
+            });
+          },
+          py::arg("component_id"))
+      .def("clear",
+           [](const MaskRef& self) {
+             edit_stack(self.photo_id,
+                        [&](Stack& stack) { require_op(stack, self.op_id).mask.reset(); });
+           })
+      .def("__repr__",
+           [](const MaskRef& self) { return mask_json(self.photo_id, self.op_id).dump(); });
+}
+
 void bind_op(py::module_& module) {
   py::class_<OpRef>(module, "Op", "One entry of the op-stack.")
       .def_property_readonly("id", [](const OpRef& self) { return self.op_id; })
@@ -279,6 +377,21 @@ void bind_op(py::module_& module) {
           [](const OpRef& self, bool enabled) {
             edit_stack(self.photo_id,
                        [&](Stack& stack) { require_op(stack, self.op_id).enabled = enabled; });
+          })
+      .def_property_readonly("mask",
+                             [](const OpRef& self) { return MaskRef{self.photo_id, self.op_id}; })
+      .def_property(
+          "opacity",
+          [](const OpRef& self) {
+            // Absent on the wire means 100 (protocol Op.opacity).
+            return op_json(self.photo_id, self.op_id).value("opacity", kFullOpacity);
+          },
+          [](const OpRef& self, double opacity) {
+            if (!(opacity >= 0 && opacity <= kFullOpacity)) {
+              throw py::value_error("opacity must be between 0 and 100");
+            }
+            edit_stack(self.photo_id,
+                       [&](Stack& stack) { require_op(stack, self.op_id).opacity = opacity; });
           })
       .def("to_dict",
            [](const OpRef& self) { return json_to_python(op_json(self.photo_id, self.op_id)); })
@@ -421,7 +534,11 @@ void bind_develop(py::module_& module) {
                  base->params = params;
                  return;
                }
-               stack.push_back(Op{make_op_id(), name, params, std::nullopt, true});
+               Op created;
+               created.id = make_op_id();
+               created.name = name;
+               created.params = params;
+               stack.push_back(std::move(created));
              });
            })
       .def("__dir__", [](const DevelopRef&) {
@@ -466,6 +583,7 @@ void bind_photo(py::module_& module) {
           })
       .def_property_readonly("stack", [](const PhotoRef& self) { return StackRef{self.id}; })
       .def_property_readonly("develop", [](const PhotoRef& self) { return DevelopRef{self.id}; })
+      .def_property_readonly("masks", [](const PhotoRef& self) { return MasksRef{self.id}; })
       .def("stack_json",
            [](const PhotoRef& self) {
              return json_to_python(
@@ -501,7 +619,31 @@ py::object make_photo(int64_t id) {
   return py::cast(PhotoRef{id});
 }
 
+py::bytes mask_png(int64_t photo_id, const std::string& op_id, const py::object& component_id,
+                   uint32_t max_size) {
+  const std::string component =
+      component_id.is_none() ? std::string() : component_id.cast<std::string>();
+  const std::vector<uint8_t> png =
+      on_engine([&] { return engine().render_mask_png(photo_id, op_id, component, max_size); });
+  return {reinterpret_cast<const char*>(png.data()), png.size()};
+}
+
 void bind_services(py::module_& module) {
+  py::class_<MasksRef>(module, "Masks", "The AI mask jobs and rasters of one photo.")
+      .def(
+          "detect",
+          [](const MasksRef& self, const std::string& op_id, const std::string& component_id) {
+            // Returns the jobId; the component is `pending` until job.progress finishes.
+            return on_engine(
+                [&] { return engine().detect_mask(self.photo_id, op_id, component_id); });
+          },
+          py::arg("op_id"), py::arg("component_id"))
+      .def(
+          "preview",
+          [](const MasksRef& self, const std::string& op_id, const py::object& component_id,
+             uint32_t max_size) { return mask_png(self.photo_id, op_id, component_id, max_size); },
+          py::arg("op_id"), py::arg("component_id") = py::none(), py::arg("max") = 1024);
+
   py::class_<RenderRef>(module, "Render")
       .def(
           "preview",
@@ -584,6 +726,7 @@ RunResult run_code(const std::string& code, int64_t photo_id, const std::string&
 PYBIND11_EMBEDDED_MODULE(latent, module) {
   module.doc() = "Latent engine API: the op-stack, the develop sugar, previews.";
   bind_params(module);
+  bind_mask(module);
   bind_op(module);
   bind_stack(module);
   bind_develop(module);
@@ -669,6 +812,17 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
                             max_size, py::none());
       },
       py::arg("photo_id") = py::none(), py::arg("max_size") = 1024);
+  // MCP's render_preview(mask=(op_id, component_id?)): the raster as PNG bytes, so an
+  // agent can look at what it selected instead of guessing (PROMPT.md 3.7).
+  module.def(
+      "_preview_mask_png",
+      [](const py::object& photo_id, const std::string& op_id, const py::object& component_id,
+         uint32_t max_size) {
+        return mask_png(resolve_photo(photo_id.is_none() ? 0 : photo_id.cast<int64_t>()), op_id,
+                        component_id, max_size);
+      },
+      py::arg("photo_id"), py::arg("op_id"), py::arg("component_id") = py::none(),
+      py::arg("max_size") = 1024);
 }
 
 }  // namespace latent

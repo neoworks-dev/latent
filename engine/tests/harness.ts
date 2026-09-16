@@ -74,7 +74,11 @@ export interface Engine {
  * endpoints out of its stdout. stdout is drained for the whole run: cancelling the stream
  * would hand latentd a broken pipe the next time it logs.
  */
-export function startEngine(scratch: string, extraArgs: string[] = []): Engine {
+export function startEngine(
+  scratch: string,
+  extraArgs: string[] = [],
+  extraEnv: Record<string, string> = {},
+): Engine {
   if (!existsSync(engineExecutable)) throw new Error(`${engineExecutable} not built`);
   const process_ = Bun.spawn(
     [engineExecutable, "--port", "0", "--catalog", `${scratch}/catalog.db`, ...extraArgs],
@@ -83,6 +87,7 @@ export function startEngine(scratch: string, extraArgs: string[] = []): Engine {
         ...process.env,
         XDG_CONFIG_HOME: `${scratch}/config`,
         XDG_CACHE_HOME: `${scratch}/cache`,
+        ...extraEnv,
       },
       stdout: "pipe",
       stderr: "inherit",
@@ -132,7 +137,22 @@ export interface Client {
   close(): void;
   readonly notifications: Notification[];
   readonly thumbnails: Frame[];
+  /** LMSK rasters, one byte per pixel, newest last. */
+  readonly masks: Frame[];
   frame: Frame | null;
+}
+
+/** An r8 mask raster as an opaque greyscale RGBA image, ready for encodePng. */
+export function maskToRgba(mask: Frame): Uint8Array {
+  const rgba = new Uint8Array(mask.width * mask.height * 4);
+  for (let i = 0; i < mask.pixels.length; i++) {
+    const level = mask.pixels[i]!;
+    rgba[i * 4] = level;
+    rgba[i * 4 + 1] = level;
+    rgba[i * 4 + 2] = level;
+    rgba[i * 4 + 3] = 255;
+  }
+  return rgba;
 }
 
 export async function connect(endpoint: string): Promise<Client> {
@@ -144,10 +164,12 @@ export async function connect(endpoint: string): Promise<Client> {
   >();
   const notifications: Notification[] = [];
   const thumbnails: Frame[] = [];
+  const masks: Frame[] = [];
   let nextId = 1;
   const client: Client = {
     notifications,
     thumbnails,
+    masks,
     frame: null,
     call(method, params = {}) {
       const id = nextId++;
@@ -181,6 +203,15 @@ export async function connect(endpoint: string): Promise<Client> {
       if (magic === "LTHM") {
         assert(view.getUint32(20, true) === 1, "thumbnail frames must be format 1 (jpeg)");
         thumbnails.push(frame);
+        return;
+      }
+      if (magic === "LMSK") {
+        assert(view.getUint32(20, true) === 2, "mask frames must be format 2 (r8)");
+        assert(
+          frame.pixels.length === frame.width * frame.height,
+          "an LMSK body is one byte per pixel",
+        );
+        masks.push(frame);
         return;
       }
       assert(magic === "LFRM", `unexpected frame magic ${magic}`);

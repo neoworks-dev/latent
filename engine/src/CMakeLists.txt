@@ -3,6 +3,8 @@
 add_library(latent_ops STATIC
   ops/curve.cpp
   ops/history.cpp
+  ops/mask.cpp
+  ops/mask_raster.cpp
   ops/op.cpp
   ops/registry.cpp
   ops/sha256.cpp
@@ -13,13 +15,15 @@ target_link_libraries(latent_ops PUBLIC nlohmann_json::nlohmann_json)
 # latent_catalog is the other headless half: SQLite, LibRaw metadata, JPEG. The catalog
 # tests link it without pulling in a GPU device.
 add_library(latent_catalog STATIC
+  ai/mask_detect.cpp
   catalog/catalog.cpp
   catalog/thumbnail.cpp
   image/jpeg.cpp
+  image/png.cpp
   jobs/worker.cpp
   raw/raw_metadata.cpp)
 target_link_libraries(latent_catalog PUBLIC latent_ops unofficial::sqlite3::sqlite3
-  PkgConfig::LIBRAW
+  PkgConfig::LIBRAW PNG::PNG
   $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>)
 
 # Python home = the vcpkg install prefix (…/lib/python3.12 is Python3_STDLIB).
@@ -45,7 +49,9 @@ latent_embed_shaders(latent_core
   ${CMAKE_SOURCE_DIR}/shaders/ops.wgsl
   ${CMAKE_SOURCE_DIR}/shaders/blur.wgsl
   ${CMAKE_SOURCE_DIR}/shaders/neighborhood.wgsl
-  ${CMAKE_SOURCE_DIR}/shaders/display.wgsl)
+  ${CMAKE_SOURCE_DIR}/shaders/display.wgsl
+  ${CMAKE_SOURCE_DIR}/shaders/mask.wgsl
+  ${CMAKE_SOURCE_DIR}/shaders/mask_combine.wgsl)
 
 # The MCP SDK is pip-installed into the bundled interpreter; vcpkg has no port for it.
 # The stamp keeps it to once per build directory, and the script never fails the build.

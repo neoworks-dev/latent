@@ -1,10 +1,10 @@
-add_executable(latent_tests catalog_test.cpp curve_test.cpp registry_test.cpp sidecar_test.cpp
-  stack_test.cpp)
+add_executable(latent_tests catalog_test.cpp curve_test.cpp mask_test.cpp registry_test.cpp
+  sidecar_test.cpp stack_test.cpp)
 target_link_libraries(latent_tests PRIVATE latent_ops latent_catalog Catch2::Catch2WithMain)
 
 # The render tests need a device, so they are their own binary: latent_tests still runs on
 # a machine without an adapter.
-add_executable(latent_render_tests render_test.cpp)
+add_executable(latent_render_tests render_test.cpp mask_render_test.cpp)
 target_link_libraries(latent_render_tests PRIVATE latent_core Catch2::Catch2WithMain)
 
 include(Catch)

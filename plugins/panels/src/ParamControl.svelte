@@ -6,7 +6,19 @@
   import Slider from "./Slider.svelte";
   import ValueField from "./ValueField.svelte";
 
-  const { op, spec }: { op: OpDefinition; spec: OpParamSpec } = $props();
+  const {
+    op,
+    spec,
+    opId = null,
+  }: {
+    op: OpDefinition;
+    spec: OpParamSpec;
+    /**
+     * One stack entry to read and write instead of the first op of this name. The Masks
+     * column passes it so a local adjustment edits its own masked op, not the base one.
+     */
+    opId?: string | null;
+  } = $props();
   const viewer = kernelContext().viewer;
 
   const kind = $derived(controlKind(spec));
@@ -16,11 +28,15 @@
 
   // The stack is the truth: the control shows whatever the engine last reported, and
   // falls back to the described default while the op is not in the stack.
-  const current = $derived(paramValue(viewer.stack, op, spec));
+  const current = $derived(paramValue(viewer.stack, op, spec, opId));
   const disabled = $derived(viewer.photoId === null);
   const tint = $derived(trackTint(spec));
 
   function write(value: unknown, transient: boolean): void {
+    if (opId) {
+      void viewer.setOpParams(opId, { [spec.name]: value }, transient);
+      return;
+    }
     void viewer.setParam(op.name, { [spec.name]: value }, transient);
   }
 

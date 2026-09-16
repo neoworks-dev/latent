@@ -6,10 +6,20 @@ export type {
   EngineConnectionState,
   EngineFrame,
   FrameListener,
+  MaskListener,
   ThumbnailListener,
 } from "./engine";
 export type { LatentDesktopBridge } from "./desktop";
 export type { PaneDefinition, PaneRegistry } from "./panes";
 export { paneModes, panesForMode } from "./panes";
-export type { FrameDrawMarks, FrameSink, ViewerService } from "./viewer";
+export type {
+  FrameDrawMarks,
+  FrameSink,
+  OverlayDraw,
+  OverlayPointer,
+  OverlayRect,
+  ViewerOverlay,
+  ViewerService,
+} from "./viewer";
+export { containRect, imagePoint } from "./viewer";
 export { kernelContext, provideKernelContext } from "./svelte/context";

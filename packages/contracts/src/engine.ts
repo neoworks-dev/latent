@@ -25,6 +25,13 @@ export type FrameListener = (frame: EngineFrame) => void;
 /** `jpeg` is the frame's payload as a Blob — pixels stay binary, never base64 in JSON. */
 export type ThumbnailListener = (header: FrameHeader, jpeg: Blob) => void;
 
+/**
+ * One `LMSK` frame: `coverage` is r8, `header.width * header.height` bytes, 0 outside the
+ * mask and 255 fully inside. Like `EngineFrame.pixels` it is a view into the socket's own
+ * buffer — read it inside the call, copy it if it has to outlive one.
+ */
+export type MaskListener = (header: FrameHeader, coverage: Uint8Array) => void;
+
 export interface EngineClient {
   readonly state: EngineConnectionState;
   /** Resolves on the next open socket, immediately when already open. */
@@ -49,4 +56,11 @@ export interface EngineClient {
    * result's `missing` never gets a frame. Returns the unsubscribe.
    */
   onThumbnail(photoId: number, listener: ThumbnailListener): () => void;
+  /**
+   * Binary mask rasters (LMSK), sent before the `mask.preview` result. The frame's target
+   * is a viewId and several previews can be asked for the same view, so a listener sees
+   * every mask frame on the socket: keep one `mask.preview` in flight per purpose and pair
+   * the frame with the call it belongs to. Returns the unsubscribe.
+   */
+  onMask(listener: MaskListener): () => void;
 }

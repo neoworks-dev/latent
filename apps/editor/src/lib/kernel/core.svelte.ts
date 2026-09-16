@@ -6,6 +6,12 @@ import { WebSocketEngineClient } from "../engine/client";
 
 class ReactivePaneRegistry implements PaneRegistry {
   panes = $state<PaneDefinition[]>([]);
+  /** The rail mode, held here rather than in the shell so a plugin can hand over to one. */
+  mode = $state("edit");
+
+  setMode(mode: string): void {
+    this.mode = mode;
+  }
 
   register(definition: PaneDefinition): () => void {
     this.panes = [...this.panes, definition];

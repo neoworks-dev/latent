@@ -62,6 +62,11 @@ struct OpDefinition {
   // renderer's.
   PipelineStage stage = PipelineStage::Tone;
   std::vector<OpParamSpec> params;
+
+  // ops.describe `maskable`: every develop op takes a mask and an opacity. Geometry ops
+  // move pixels rather than changing them, so there is nothing to blend a mask into —
+  // a mask on one is ignored with an engine.log warning.
+  bool maskable() const { return panel != "geometry"; }
 };
 
 const std::vector<OpDefinition>& op_definitions();

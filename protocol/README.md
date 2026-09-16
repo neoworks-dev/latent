@@ -45,8 +45,8 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `photo.close` | `photoId` | — | |
 | `stack.get` | `photoId` | stack + `revision` + undo/redo flags + `histogram?` | Shape reused by every stack write |
 | `stack.set` | `photoId`, `stack` | as `stack.get` | |
-| `op.add` | `photoId`, `op`, `params?`, `index?`, `transient?` | as `stack.get` | `transient` = first tick of a drag: no snapshot, no sidecar; the drag undoes as one step |
-| `op.update` | `photoId`, `opId`, `params`, `enabled?`, `transient?` | as `stack.get` | `transient` = mid-drag: no snapshot, no sidecar write |
+| `op.add` | `photoId`, `op`, `params?`, `index?`, `transient?`, `mask?`, `opacity?` | as `stack.get` | `transient` = first tick of a drag: no snapshot, no sidecar; the drag undoes as one step |
+| `op.update` | `photoId`, `opId`, `params`, `enabled?`, `transient?`, `mask?`, `opacity?` | as `stack.get` | `transient` = mid-drag: no snapshot, no sidecar write. `mask` is a full replacement, `null` clears; a mask on a non-maskable op is dropped with an `engine.log` warning |
 | `op.remove` | `photoId`, `opId` | as `stack.get` | |
 | `history.undo` / `history.redo` | `photoId` | as `stack.get` | Cursor over snapshots, never a pop |
 | `view.open` | `photoId`, `width`, `height` | `viewId` | One canvas, one proxy size |
@@ -65,6 +65,9 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `catalog.thumbnails` | `photoIds`, `size?` | `requested`, `sent`, `missing[]` | One `LTHM` frame per photo, then the result |
 | `catalog.remove` | `photoIds` | `removed` | Rows only — never the files |
 | `job.cancel` | `jobId` | `cancelled` | Stops a running job at its next safe point |
+| `mask.preview` | `photoId`, `opId`, `componentId?`, `viewId?` | `width`, `height`, `coverage` | One `LMSK` frame (r8) first, then the result. Combined mask, or one component's raster |
+| `mask.detect` | `photoId`, `opId`, `componentId`, `hint?` | `jobId` | Starts the AI rasterisation of an AI-kind component; component goes `pending` → `ready`/`failed` via `stack.changed`, job ticks `job.progress` kind `mask` |
+| `mask.stroke` | `photoId`, `opId`, `componentId`, `points`, `erase?`, `size?`, `flow?`, `transient?` | as `stack.get` | Appends a brush segment; the engine owns strokes and rasters. One pointer-down = transient segments + one committed call = one undo step |
 
 ### `ops.describe`
 

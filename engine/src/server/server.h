@@ -10,9 +10,11 @@
 //     server thread has run the work.
 #pragma once
 
+#include "ai/mask_detect.h"
 #include "catalog/catalog.h"
 #include "jobs/worker.h"
 #include "ops/history.h"
+#include "ops/mask.h"
 #include "ops/op.h"
 #include "pipeline/renderer.h"
 #include "python/engine_api.h"
@@ -81,6 +83,10 @@ class Server : public EngineApi {
   std::vector<uint8_t> render_preview_jpeg(int64_t photo_id, uint32_t max_size,
                                            std::optional<PreviewRegion> region) override;
   nlohmann::json catalog_list(int limit) override;
+  int64_t detect_mask(int64_t photo_id, const std::string& op_id,
+                      const std::string& component_id) override;
+  std::vector<uint8_t> render_mask_png(int64_t photo_id, const std::string& op_id,
+                                       const std::string& component_id, uint32_t max_size) override;
   void warn(const std::string& message, int64_t photo_id) override;
 
  private:
@@ -154,6 +160,27 @@ class Server : public EngineApi {
                                                           const Responder& responder);
   nlohmann::json handle_catalog_remove(const nlohmann::json& params);
   nlohmann::json handle_job_cancel(const nlohmann::json& params);
+  nlohmann::json handle_mask_preview(const nlohmann::json& params, Peer* peer);
+  nlohmann::json handle_mask_detect(const nlohmann::json& params, Peer* peer);
+  nlohmann::json handle_mask_stroke(const nlohmann::json& params, Peer* peer);
+
+  // One mask.detect run: renders the input on the server thread, detects on the worker,
+  // and lands the raster back on the server thread as a stack.changed.
+  int64_t start_mask_detect(PhotoState& photo, const std::string& op_id,
+                            const std::string& component_id, const nlohmann::json& hint,
+                            Peer* origin);
+  void finish_mask_detect(int64_t photo_id, const std::string& op_id,
+                          const std::string& component_id, int64_t job_id,
+                          const MaskDetectResult& result);
+  // Renders `op_id`'s mask into a view sized like `view_id`'s proxy (or a throwaway view
+  // when it is 0) and sends the LMSK frame that precedes mask.preview's result.
+  MaskReadout send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view_id,
+                              const std::string& op_id, const std::string& component_id,
+                              std::vector<uint8_t>& frame);
+  // The op `params.opId` names, or -32602 when it is unknown or carries no mask.
+  static Op& require_masked_op(Stack& stack, const nlohmann::json& params);
+  // Reloads the PNG cache of every AI component a freshly opened sidecar carries.
+  void load_mask_rasters(const PhotoState& photo);
 
   // `thumbnail_job_id` was handed out with catalog.import's result, so the thumbnail job
   // always reports — with total 0 when the import found nothing or was cancelled.
@@ -165,7 +192,8 @@ class Server : public EngineApi {
   void job_finished(int64_t job_id);
   bool job_cancelled(int64_t job_id);
   void publish_progress(int64_t job_id, int64_t parent_job_id, std::string_view kind, int64_t done,
-                        int64_t total, std::string_view state, const std::string& message);
+                        int64_t total, std::string_view state, const std::string& message,
+                        const std::string& error = {});
   // Cache key for one row's thumbnails: the content hash when we have it, else the id.
   static std::string thumbnail_key(const CatalogPhoto& row);
 
@@ -218,11 +246,15 @@ class Server : public EngineApi {
   std::atomic<int64_t> next_job_id_{1};
   std::atomic<int64_t> next_run_id_{1};
   uint32_t thumbnail_seq_ = 0;
+  // LMSK frames count per mask.preview call, independently of the LFRM stream.
+  uint32_t mask_seq_ = 0;
   // Touched by the server thread (job.cancel) and the worker (its own loops).
   std::mutex jobs_mutex_;
   std::set<int64_t> running_jobs_;
   std::set<int64_t> cancelled_jobs_;
   Catalog catalog_;
+  // The stub or the "model not installed" one, picked once at startup (ai/mask_detect.h).
+  std::unique_ptr<MaskDetector> mask_detector_;
   Worker worker_;
   std::unique_ptr<PythonHost> python_;
 };

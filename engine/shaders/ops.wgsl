@@ -26,9 +26,10 @@ struct OpParams {
   origin: vec2f,  // image rect inside the letterboxed view, in pixels
   size: vec2f,
   kind: u32,
-  // Three words of padding so `v` starts on the 16-byte boundary a vec4f needs. A
-  // uniform array<u32, 3> would not do: in the uniform address space its stride is 16.
-  pad0: u32,
+  // Layer opacity 0..1, and two words of padding so `v` starts on the 16-byte boundary a
+  // vec4f needs. A uniform array<u32, 2> would not do: in the uniform address space its
+  // stride is 16.
+  opacity: f32,
   pad1: u32,
   pad2: u32,
   v: array<vec4f, 7>,
@@ -43,6 +44,17 @@ struct CurveLut {
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> op: OpParams;
 @group(0) @binding(2) var<uniform> curve: CurveLut;
+// The op's combined mask (shaders/mask.wgsl), r8. An unmasked op binds a 1x1 white
+// texture, which the clamp below turns into "everywhere" for free.
+@group(0) @binding(3) var mask: texture_2d<f32>;
+
+// out = mix(in, op(in), mask * opacity) — PROMPT.md 3.7, and the only place an op's
+// result is allowed to be partial.
+fn mask_at(position: vec2f) -> f32 {
+  let dims = vec2i(textureDimensions(mask));
+  let at = clamp(vec2i(position), vec2i(0, 0), dims - vec2i(1, 1));
+  return textureLoad(mask, at, 0).r * op.opacity;
+}
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
@@ -265,5 +277,5 @@ fn vignette_radius(position: vec2f, roundness: f32) -> f32 {
     }
     default: {}
   }
-  return vec4f(rgb, 1.0);
+  return vec4f(mix(texel.rgb, rgb, mask_at(in.pos.xy)), 1.0);
 }

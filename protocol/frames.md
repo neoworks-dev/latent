@@ -21,6 +21,14 @@ completed render; the UI keeps at most one `view.render` request in flight per v
 The 8 `reserved` bytes stay zero and stay reserved: the layout is fixed, and anything new
 a frame has to say goes in the JSON result of the call that produced it, not here.
 
+## `LMSK` — mask raster (engine → UI)
+
+Same header as `LFRM`; `viewId` holds the `viewId` the preview was sized for (0 when
+`mask.preview` was called without one); `format` = 2 (r8, one byte per pixel, 0 = outside,
+255 = fully inside); `seq` increments per `mask.preview` call on that socket. The body is
+`w·h` bytes, tightly packed. Sent by `mask.preview`, exactly one frame **before** its RPC
+result. The UI tints it over the view frame; it never uploads a mask back.
+
 ## `LTHM` — thumbnail (engine → UI)
 
 Same header as `LFRM` with `viewId` replaced by `photoId` (u32). JPEG bytes follow the

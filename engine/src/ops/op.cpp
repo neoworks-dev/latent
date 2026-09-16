@@ -27,6 +27,8 @@ nlohmann::json op_to_json(const Op& op) {
   nlohmann::json value = {
       {"id", op.id}, {"op", op.name}, {"params", op.params}, {"enabled", op.enabled}};
   if (op.mask.has_value()) value["mask"] = *op.mask;
+  // Absent means 100 (protocol Op.opacity), so a stack nobody has touched stays terse.
+  if (op.opacity != kFullOpacity) value["opacity"] = op.opacity;
   return value;
 }
 
@@ -47,6 +49,14 @@ Op op_from_json(const nlohmann::json& value) {
   if (value.contains("mask") && !value["mask"].is_null()) {
     if (!value["mask"].is_object()) throw OpError("op.mask must be an object");
     op.mask = value["mask"];
+  }
+  if (value.contains("opacity") && !value["opacity"].is_null()) {
+    if (!value["opacity"].is_number()) throw OpError("op.opacity must be a number");
+    const double opacity = value["opacity"].get<double>();
+    if (!(opacity >= 0 && opacity <= kFullOpacity)) {
+      throw OpError("op.opacity must be between 0 and 100");
+    }
+    op.opacity = opacity;
   }
   if (value.contains("enabled")) {
     if (!value["enabled"].is_boolean()) throw OpError("op.enabled must be a boolean");

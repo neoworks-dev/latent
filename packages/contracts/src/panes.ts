@@ -21,6 +21,13 @@ export interface PaneDefinition {
 export interface PaneRegistry {
   register(definition: PaneDefinition): () => void;
   list(region?: PaneDefinition["region"]): PaneDefinition[];
+  /**
+   * The rail mode the right column is showing. The shell draws it; a plugin reads it to
+   * know whether it is on screen, and sets it to hand over — the mask badge in the Edit
+   * column switches to "masks" the way Lightroom's does.
+   */
+  readonly mode: string;
+  setMode(mode: string): void;
 }
 
 /** The panes a rail mode shows: its own, plus everything that is not mode-specific. */

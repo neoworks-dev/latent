@@ -1,6 +1,9 @@
 #include "pipeline/renderer.h"
 
+#include "image/png.h"
 #include "ops/curve.h"
+#include "ops/mask.h"
+#include "ops/mask_raster.h"
 #include "ops/registry.h"
 
 #include <chrono>
@@ -12,6 +15,8 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace latent {
@@ -30,10 +35,74 @@ struct OpUniform {
   float origin[2] = {0, 0};
   float size[2] = {1, 1};
   uint32_t kind = 0;
-  uint32_t pad[3] = {0, 0, 0};
+  float opacity = 1;
+  uint32_t pad[2] = {0, 0};
   float v[28] = {};
 };
 static_assert(sizeof(OpUniform) == 144, "must match OpParams in ops.wgsl");
+
+// Kind numbers must match the switch in shaders/mask.wgsl.
+enum class MaskPass : uint32_t {
+  None = 0,
+  Linear = 1,
+  Radial = 2,
+  Luminance = 3,
+  Color = 4,
+  Raster = 5,
+};
+
+// Combine modes, matching the switch in shaders/mask_combine.wgsl. Replace seeds the
+// accumulator with the first component that contributes, whatever its own mode says: a
+// subtract or an intersect against nothing would leave the whole mask empty.
+enum class CombineMode : uint32_t { Replace = 0, Add = 1, Subtract = 2, Intersect = 3 };
+constexpr uint32_t kCombineModes = 4;
+
+struct MaskUniform {
+  float origin[2] = {0, 0};
+  float size[2] = {1, 1};
+  uint32_t kind = 0;
+  uint32_t invert = 0;
+  float feather = 0;
+  float opacity = 1;
+  float v[24] = {};
+};
+static_assert(sizeof(MaskUniform) == 128, "must match MaskParams in mask.wgsl");
+
+struct CombineUniform {
+  uint32_t mode = 0;
+  uint32_t pad[3] = {0, 0, 0};
+};
+static_assert(sizeof(CombineUniform) == 16, "must match CombineParams in mask_combine.wgsl");
+
+// One component's textures inside a view: the r8 raster mask.wgsl wrote, plus the upload
+// a brush or an AI kind is rasterised from.
+struct MaskComponentTexture {
+  std::string hash;
+  TextureHandle texture;
+  TextureViewHandle view;
+  std::string source_hash;
+  TextureHandle source;
+  TextureViewHandle source_view;
+};
+
+// One op's mask inside a view: two r8 accumulators the fold ping-pongs between, plus the
+// per-component rasters mask.preview hands out one at a time.
+struct MaskEntry {
+  std::string hash;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  TextureHandle accum[2];
+  TextureViewHandle accum_view[2];
+  int final_index = 0;
+  std::unordered_map<std::string, MaskComponentTexture> components;
+};
+
+// An AI component's raster as the engine holds it between mask.detect and the render that
+// uses it: resolution-independent, resampled into whatever a view needs.
+struct StoredRaster {
+  std::string hash;
+  GrayImage image;
+};
 
 struct FitUniform {
   float scale[2] = {1, 1};
@@ -416,6 +485,140 @@ OpUniform op_uniform(const Op& op, OpKind kind, const ViewGeometry& geometry) {
   return uniform;
 }
 
+// Which branch of mask.wgsl rasterises this kind. Brush and every AI kind arrive as an
+// uploaded raster, so they share one branch.
+MaskPass mask_pass_kind(MaskKind kind) {
+  switch (kind) {
+    case MaskKind::Linear:
+      return MaskPass::Linear;
+    case MaskKind::Radial:
+      return MaskPass::Radial;
+    case MaskKind::Luminance:
+      return MaskPass::Luminance;
+    case MaskKind::Color:
+      return MaskPass::Color;
+    default:
+      return MaskPass::Raster;
+  }
+}
+
+CombineMode combine_mode(MaskMode mode) {
+  switch (mode) {
+    case MaskMode::Subtract:
+      return CombineMode::Subtract;
+    case MaskMode::Intersect:
+      return CombineMode::Intersect;
+    default:
+      return CombineMode::Add;
+  }
+}
+
+// Oklab from linear sRGB, the same transform shaders/mask.wgsl uses. Colour samples are
+// converted here so the shader compares two points instead of transforming per pixel.
+std::array<float, 3> linear_to_oklab(double red, double green, double blue) {
+  const double l = (0.4122214708 * red) + (0.5363325363 * green) + (0.0514459929 * blue);
+  const double m = (0.2119034982 * red) + (0.6806995451 * green) + (0.1073969566 * blue);
+  const double s = (0.0883024619 * red) + (0.2817188376 * green) + (0.6299787005 * blue);
+  const double lr = std::cbrt(std::max(l, 0.0));
+  const double mr = std::cbrt(std::max(m, 0.0));
+  const double sr = std::cbrt(std::max(s, 0.0));
+  return {static_cast<float>((0.2104542553 * lr) + (0.7936177850 * mr) - (0.0040720468 * sr)),
+          static_cast<float>((1.9779984951 * lr) - (2.4285922050 * mr) + (0.4505937099 * sr)),
+          static_cast<float>((0.0259040371 * lr) + (0.7827717662 * mr) - (0.8086757660 * sr))};
+}
+
+double component_number(const nlohmann::json& params, const char* key, double fallback) {
+  const auto found = params.find(key);
+  if (found == params.end() || !found->is_number()) return fallback;
+  return found->get<double>();
+}
+
+std::array<double, 2> component_pair(const nlohmann::json& params, const char* key, double x,
+                                     double y) {
+  const auto found = params.find(key);
+  if (found == params.end() || !found->is_array() || found->size() != 2) return {x, y};
+  return {(*found)[0].get<double>(), (*found)[1].get<double>()};
+}
+
+MaskUniform mask_uniform(const MaskComponent& component, const ViewGeometry& geometry) {
+  MaskUniform uniform;
+  uniform.kind = static_cast<uint32_t>(mask_pass_kind(component.kind));
+  uniform.invert = component.invert ? 1U : 0U;
+  uniform.feather = static_cast<float>(component.feather / 100.0);
+  uniform.opacity = static_cast<float>(component.opacity / 100.0);
+  uniform.origin[0] = static_cast<float>(geometry.content_x);
+  uniform.origin[1] = static_cast<float>(geometry.content_y);
+  uniform.size[0] = static_cast<float>(geometry.content_width);
+  uniform.size[1] = static_cast<float>(geometry.content_height);
+
+  switch (component.kind) {
+    case MaskKind::Linear: {
+      const auto start = component_pair(component.params, "start", 0.5, 0.0);
+      const auto end = component_pair(component.params, "end", 0.5, 1.0);
+      uniform.v[0] = static_cast<float>(start[0]);
+      uniform.v[1] = static_cast<float>(start[1]);
+      uniform.v[2] = static_cast<float>(end[0]);
+      uniform.v[3] = static_cast<float>(end[1]);
+      return uniform;
+    }
+    case MaskKind::Radial: {
+      const auto centre = component_pair(component.params, "center", 0.5, 0.5);
+      const auto radius = component_pair(component.params, "radius", 0.3, 0.3);
+      uniform.v[0] = static_cast<float>(centre[0]);
+      uniform.v[1] = static_cast<float>(centre[1]);
+      uniform.v[2] = static_cast<float>(radius[0]);
+      uniform.v[3] = static_cast<float>(radius[1]);
+      uniform.v[4] = static_cast<float>(component_number(component.params, "angle", 0.0) *
+                                        std::numbers::pi / 180.0);
+      return uniform;
+    }
+    case MaskKind::Luminance: {
+      const auto range = component_pair(component.params, "range", 0.5, 1.0);
+      uniform.v[0] = static_cast<float>(range[0]);
+      uniform.v[1] = static_cast<float>(range[1]);
+      uniform.v[2] = static_cast<float>(component_number(component.params, "smoothness", 0.1));
+      return uniform;
+    }
+    case MaskKind::Color: {
+      const auto samples = component.params.find("samples");
+      size_t count = 0;
+      if (samples != component.params.end() && samples->is_array()) {
+        for (const nlohmann::json& sample : *samples) {
+          if (count >= 5) break;
+          const std::array<float, 3> lab = linear_to_oklab(
+              sample[0].get<double>(), sample[1].get<double>(), sample[2].get<double>());
+          uniform.v[((count + 1) * 4) + 0] = lab[0];
+          uniform.v[((count + 1) * 4) + 1] = lab[1];
+          uniform.v[((count + 1) * 4) + 2] = lab[2];
+          ++count;
+        }
+      }
+      uniform.v[0] = static_cast<float>(count);
+      uniform.v[1] = static_cast<float>(component_number(component.params, "range", 0.2));
+      uniform.v[2] = static_cast<float>(component_number(component.params, "smoothness", 0.1));
+      return uniform;
+    }
+    default:
+      // A brush's softness is already in its stamps (ops/mask_raster.cpp); blurring the
+      // raster on top of that would feather it twice.
+      if (component.kind == MaskKind::Brush) uniform.feather = 0;
+      return uniform;
+  }
+}
+
+// What invalidates a cached raster: the mask's own JSON, the view's size, and the content
+// rect inside it — mask coordinates are normalised over that rect, so a crop moves them.
+// The op's *input* deliberately does not: a masked slider drag must not re-rasterise, and
+// the price is that a luminance or colour mask keeps the levels it was built from until
+// the mask or the frame changes (see the report's UI to-do for mask.refresh).
+std::string mask_cache_key(const nlohmann::json& canonical, const ViewGeometry& geometry) {
+  const nlohmann::json keyed = {
+      {"m", canonical},
+      {"r",
+       {geometry.content_x, geometry.content_y, geometry.content_width, geometry.content_height}}};
+  return mask_hash(keyed, geometry.width, geometry.height);
+}
+
 WGPUBindGroupEntry texture_entry(uint32_t binding, WGPUTextureView view) {
   WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
   entry.binding = binding;
@@ -471,6 +674,9 @@ struct Renderer::Photo {
   uint32_t height = 0;
   TextureHandle linear;
   TextureViewHandle linear_view;
+  // AI mask rasters by componentId: written by mask.detect, reloaded from the PNG cache
+  // at photo.open, shared by every view of this photo.
+  std::unordered_map<std::string, StoredRaster> rasters;
 };
 
 struct Renderer::View {
@@ -492,6 +698,8 @@ struct Renderer::View {
   BufferHandle curve_uniforms;
   uint32_t op_capacity = 0;
   uint32_t curve_capacity = 0;
+  // One entry per masked op, keyed by opId and invalidated by the mask's hash.
+  std::unordered_map<std::string, MaskEntry> masks;
 };
 
 Renderer::Renderer(uint32_t max_texture_dim) : gpu_(max_texture_dim) {
@@ -513,6 +721,29 @@ Renderer::Renderer(uint32_t max_texture_dim) : gpu_(max_texture_dim) {
       neighborhood.get(), WGPUTextureFormat_RGBA16Float, "neighborhood");
   display_pipeline_ =
       gpu_.create_fullscreen_pipeline(display.get(), WGPUTextureFormat_RGBA8Unorm, "display");
+
+  const ShaderModuleHandle mask = gpu_.create_shader(shaders::kMask, "mask");
+  const ShaderModuleHandle mask_combine = gpu_.create_shader(shaders::kMaskCombine, "mask-combine");
+  mask_pipeline_ = gpu_.create_fullscreen_pipeline(mask.get(), WGPUTextureFormat_R8Unorm, "mask");
+  mask_combine_pipeline_ = gpu_.create_fullscreen_pipeline(
+      mask_combine.get(), WGPUTextureFormat_R8Unorm, "mask-combine");
+
+  const auto sampled =
+      static_cast<WGPUTextureUsage>(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
+  const uint8_t white = 255;
+  const uint8_t black = 0;
+  white_mask_ = gpu_.create_texture(1, 1, WGPUTextureFormat_R8Unorm, sampled, "mask-white");
+  gpu_.write_texture(white_mask_.get(), 1, 1, 1, &white, 1);
+  white_mask_view_.reset(wgpuTextureCreateView(white_mask_.get(), nullptr));
+  empty_mask_ = gpu_.create_texture(1, 1, WGPUTextureFormat_R8Unorm, sampled, "mask-empty");
+  gpu_.write_texture(empty_mask_.get(), 1, 1, 1, &black, 1);
+  empty_mask_view_.reset(wgpuTextureCreateView(empty_mask_.get(), nullptr));
+
+  combine_uniforms_ = gpu_.create_uniform_buffer(kOpUniformStride * kCombineModes, "mask-modes");
+  for (uint32_t mode = 0; mode < kCombineModes; ++mode) {
+    const CombineUniform uniform{mode, {0, 0, 0}};
+    gpu_.write_buffer(combine_uniforms_.get(), kOpUniformStride * mode, &uniform, sizeof(uniform));
+  }
 }
 
 Renderer::~Renderer() {
@@ -746,12 +977,149 @@ void Renderer::build_base(View& view) {
   view.base_valid = true;
 }
 
-RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
-                              size_t offset) {
-  using clock = std::chrono::steady_clock;
-  View& view = view_for(view_id);
-  const auto started = clock::now();
+struct Renderer::Pass {
+  OpKind kind = OpKind::None;
+  OpUniform uniform;
+  int curve_slot = 0;
+  const Op* op = nullptr;
+  // Empty when the op has no mask; otherwise the canonical mask JSON and its cache key.
+  nlohmann::json mask_json;
+  std::string mask_hash;
+  bool mask_dirty = false;
+  WGPUTextureView mask_view = nullptr;
+};
 
+void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canonical,
+                          const std::string& hash, WGPUTextureView input) {
+  const Mask mask = mask_from_json(canonical);
+  const Photo& photo = *photos_.at(view.photo_id);
+  MaskEntry& entry = view.masks[op.id];
+  const uint32_t width = view.geometry.width;
+  const uint32_t height = view.geometry.height;
+  const auto usage =
+      static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment |
+                                    WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc);
+  if (entry.width != width || entry.height != height) {
+    entry.components.clear();
+    for (int i = 0; i < 2; ++i) {
+      entry.accum[i] =
+          gpu_.create_texture(width, height, WGPUTextureFormat_R8Unorm, usage, "mask-accum");
+      entry.accum_view[i].reset(wgpuTextureCreateView(entry.accum[i].get(), nullptr));
+    }
+    entry.width = width;
+    entry.height = height;
+  }
+
+  // A pending or failed component contributes nothing, and so does an AI component whose
+  // raster this engine has not been handed — binding the white placeholder for it would
+  // select the whole frame, which is the opposite of "not ready yet".
+  std::vector<const MaskComponent*> active;
+  for (const MaskComponent& component : mask.components) {
+    if (!component.contributes()) continue;
+    if (mask_kind_is_ai(component.kind) && !photo.rasters.contains(component.id)) continue;
+    active.push_back(&component);
+  }
+  if (mask_uniform_capacity_ < active.size()) {
+    mask_uniforms_ =
+        gpu_.create_uniform_buffer(kOpUniformStride * std::max<size_t>(active.size(), 1), "masks");
+    mask_uniform_capacity_ = static_cast<uint32_t>(active.size());
+  }
+
+  // Brush stroke lists and model rasters become r8 uploads before anything is encoded: a
+  // queue write between two render passes of the same encoder is not ordered against them.
+  for (const MaskComponent* component : active) {
+    if (mask_pass_kind(component->kind) != MaskPass::Raster) continue;
+    MaskComponentTexture& texture = entry.components[component->id];
+    GrayImage image;
+    std::string source_key;
+    if (component->kind == MaskKind::Brush) {
+      source_key = mask_cache_key(component->params, view.geometry);
+      if (texture.source_hash == source_key) continue;
+      image = rasterize_brush(brush_strokes(component->params), component->feather,
+                              view.geometry.content_width, view.geometry.content_height);
+    } else {
+      const StoredRaster& stored = photo.rasters.at(component->id);
+      source_key = stored.hash + "@" + std::to_string(view.geometry.content_width) + "x" +
+                   std::to_string(view.geometry.content_height);
+      if (texture.source_hash == source_key) continue;
+      image =
+          resample_gray(stored.image, view.geometry.content_width, view.geometry.content_height);
+    }
+    texture.source = gpu_.create_texture(
+        image.width, image.height, WGPUTextureFormat_R8Unorm,
+        static_cast<WGPUTextureUsage>(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst),
+        "mask-source");
+    gpu_.write_texture(texture.source.get(), image.width, image.height, 1, image.pixels.data(),
+                       image.pixels.size());
+    texture.source_view.reset(wgpuTextureCreateView(texture.source.get(), nullptr));
+    texture.source_hash = source_key;
+    // A new upload invalidates the raster that was rendered from the old one.
+    texture.hash.clear();
+  }
+
+  std::vector<BindGroupHandle> keep;
+  WGPUCommandEncoder encoder = gpu_.begin_commands("mask-build");
+  int accum_index = 0;
+  bool first = true;
+  size_t slot = 0;
+  for (const MaskComponent* component : active) {
+    MaskComponentTexture& texture = entry.components[component->id];
+    const std::string key = mask_cache_key(component_to_json(*component), view.geometry);
+    if (!texture.texture) {
+      texture.texture =
+          gpu_.create_texture(width, height, WGPUTextureFormat_R8Unorm, usage, "mask-component");
+      texture.view.reset(wgpuTextureCreateView(texture.texture.get(), nullptr));
+      texture.hash.clear();
+    }
+    if (texture.hash != key) {
+      const MaskUniform uniform = mask_uniform(*component, view.geometry);
+      gpu_.write_buffer(mask_uniforms_.get(), kOpUniformStride * slot, &uniform, sizeof(uniform));
+      WGPUTextureView raster =
+          texture.source_view ? texture.source_view.get() : white_mask_view_.get();
+      const std::array<WGPUBindGroupEntry, 3> entries = {
+          texture_entry(0, input),
+          buffer_entry(1, mask_uniforms_.get(), kOpUniformStride * slot, sizeof(MaskUniform)),
+          texture_entry(2, raster)};
+      keep.push_back(gpu_.create_bind_group(mask_pipeline_.get(), entries));
+      gpu_.encode_fullscreen_pass(encoder, mask_pipeline_.get(), keep.back().get(),
+                                  texture.view.get());
+      texture.hash = key;
+      ++slot;
+    }
+
+    const CombineMode mode = first ? CombineMode::Replace : combine_mode(component->mode);
+    const int target = first ? 0 : 1 - accum_index;
+    WGPUTextureView above = first ? empty_mask_view_.get() : entry.accum_view[accum_index].get();
+    const std::array<WGPUBindGroupEntry, 3> fold = {
+        texture_entry(0, above), texture_entry(1, texture.view.get()),
+        buffer_entry(2, combine_uniforms_.get(), kOpUniformStride * static_cast<uint32_t>(mode),
+                     sizeof(CombineUniform))};
+    keep.push_back(gpu_.create_bind_group(mask_combine_pipeline_.get(), fold));
+    gpu_.encode_fullscreen_pass(encoder, mask_combine_pipeline_.get(), keep.back().get(),
+                                entry.accum_view[target].get());
+    accum_index = target;
+    first = false;
+  }
+  if (first) {
+    // Every component is still pending: the mask is empty, so the op does nothing.
+    const std::array<WGPUBindGroupEntry, 3> fold = {
+        texture_entry(0, empty_mask_view_.get()), texture_entry(1, empty_mask_view_.get()),
+        buffer_entry(2, combine_uniforms_.get(), 0, sizeof(CombineUniform))};
+    keep.push_back(gpu_.create_bind_group(mask_combine_pipeline_.get(), fold));
+    gpu_.encode_fullscreen_pass(encoder, mask_combine_pipeline_.get(), keep.back().get(),
+                                entry.accum_view[0].get());
+  }
+  gpu_.submit(encoder);
+  gpu_.wait_idle();
+  gpu_.raise_pending_error();
+
+  entry.final_index = accum_index;
+  entry.hash = hash;
+  std::erase_if(entry.components,
+                [&mask](const auto& kept) { return find_component(mask, kept.first) == nullptr; });
+}
+
+WGPUTextureView Renderer::run_passes(View& view, const Stack& stack) {
   // Geometry is not a pass: it changes where the proxy samples from and how big the image
   // rect is, so a change to it rebuilds the base. Everything else leaves the base alone.
   const GeometryParams geometry_params = geometry_from_stack(stack);
@@ -775,11 +1143,6 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
     return left_stage < right_stage;
   });
 
-  struct Pass {
-    OpKind kind = OpKind::None;
-    OpUniform uniform;
-    int curve_slot = 0;
-  };
   std::vector<Pass> passes;
   std::vector<CurveTable> curves;
   for (const Op* op : ordered) {
@@ -788,6 +1151,7 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
     if (is_neutral(*op, kind)) continue;
     Pass pass;
     pass.kind = kind;
+    pass.op = op;
     if (kind == OpKind::ToneCurve) {
       CurveTable table{};
       if (!curve_table(*op, table)) continue;
@@ -795,7 +1159,17 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
       curves.push_back(table);
     }
     pass.uniform = op_uniform(*op, kind, view.geometry);
-    passes.push_back(pass);
+    pass.uniform.opacity = static_cast<float>(std::clamp(op->opacity, 0.0, kFullOpacity) / 100.0);
+    // An empty component list is not a mask: the op still applies everywhere, at its
+    // opacity. A list whose components are all pending is, and rasterises to nothing.
+    if (op->mask.has_value() && op->mask->contains("components") &&
+        !(*op->mask)["components"].empty()) {
+      pass.mask_json = *op->mask;
+      pass.mask_hash = mask_cache_key(pass.mask_json, view.geometry);
+      const auto found = view.masks.find(op->id);
+      pass.mask_dirty = found == view.masks.end() || found->second.hash != pass.mask_hash;
+    }
+    passes.push_back(std::move(pass));
   }
 
   if (view.op_capacity < passes.size()) {
@@ -822,7 +1196,24 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
   WGPUTextureView source = view.base_view.get();
   size_t target_index = 0;
   for (size_t i = 0; i < passes.size(); ++i) {
-    const Pass& pass = passes[i];
+    Pass& pass = passes[i];
+    // A luminance or colour component reads the op's input, so the chain below it has to
+    // have run. Everything already encoded goes out, the mask is built, and the encoder
+    // starts again. Only a mask edit lands here: a cached one costs nothing.
+    if (pass.mask_dirty) {
+      gpu_.submit(encoder);
+      gpu_.wait_idle();
+      gpu_.raise_pending_error();
+      bind_groups.clear();
+      build_mask(view, *pass.op, pass.mask_json, pass.mask_hash, source);
+      encoder = gpu_.begin_commands("view-render");
+    }
+    pass.mask_view = white_mask_view_.get();
+    if (!pass.mask_hash.empty()) {
+      const MaskEntry& entry = view.masks.at(pass.op->id);
+      pass.mask_view = entry.accum_view[entry.final_index].get();
+    }
+
     const WGPUBindGroupEntry uniform =
         buffer_entry(1, view.op_uniforms.get(), kOpUniformStride * i, sizeof(OpUniform));
     if (pass.kind >= OpKind::Texture) {
@@ -834,9 +1225,10 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
                                     view.scratch_view.get());
         neighbours = view.scratch_view.get();
       }
-      const std::array<WGPUBindGroupEntry, 3> entries = {
+      const std::array<WGPUBindGroupEntry, 4> entries = {
           texture_entry(0, source), texture_entry(1, neighbours),
-          buffer_entry(2, view.op_uniforms.get(), kOpUniformStride * i, sizeof(OpUniform))};
+          buffer_entry(2, view.op_uniforms.get(), kOpUniformStride * i, sizeof(OpUniform)),
+          texture_entry(3, pass.mask_view)};
       bind_groups.push_back(gpu_.create_bind_group(neighborhood_pipeline_.get(), entries));
       WGPUTextureView target = view.ping_view[target_index % 2].get();
       gpu_.encode_fullscreen_pass(encoder, neighborhood_pipeline_.get(), bind_groups.back().get(),
@@ -845,20 +1237,113 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
       ++target_index;
       continue;
     }
-    const std::array<WGPUBindGroupEntry, 3> entries = {
+    const std::array<WGPUBindGroupEntry, 4> entries = {
         texture_entry(0, source), uniform,
         buffer_entry(2, view.curve_uniforms.get(),
-                     kCurveSlotStride * static_cast<uint64_t>(pass.curve_slot), kCurveSlotStride)};
+                     kCurveSlotStride * static_cast<uint64_t>(pass.curve_slot), kCurveSlotStride),
+        texture_entry(3, pass.mask_view)};
     bind_groups.push_back(gpu_.create_bind_group(ops_pipeline_.get(), entries));
     WGPUTextureView target = view.ping_view[target_index % 2].get();
     gpu_.encode_fullscreen_pass(encoder, ops_pipeline_.get(), bind_groups.back().get(), target);
     source = target;
     ++target_index;
   }
+  gpu_.submit(encoder);
+  gpu_.wait_idle();
+  gpu_.raise_pending_error();
+  return source;
+}
+
+void Renderer::put_mask_raster(int64_t photo_id, std::string_view component_id,
+                               std::string_view hash, GrayImage raster) {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) return;
+  StoredRaster& stored = found->second->rasters[std::string(component_id)];
+  stored.hash = std::string(hash);
+  stored.image = std::move(raster);
+  // Every view holding an upload of the old raster has to redo it.
+  for (auto& [view_id, view] : views_) {
+    if (view->photo_id != photo_id) continue;
+    for (auto& [op_id, entry] : view->masks) {
+      entry.components.erase(std::string(component_id));
+      entry.hash.clear();
+    }
+  }
+}
+
+bool Renderer::has_mask_raster(int64_t photo_id, std::string_view component_id,
+                               std::string_view hash) const {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) return false;
+  const auto stored = found->second->rasters.find(std::string(component_id));
+  return stored != found->second->rasters.end() && stored->second.hash == hash;
+}
+
+MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::string_view op_id,
+                                std::string_view component_id, std::vector<uint8_t>& out,
+                                size_t offset) {
+  View& view = view_for(view_id);
+  WGPUTextureView last = run_passes(view, stack);
+
+  const Op* op = find_op(stack, op_id);
+  if (op == nullptr) throw std::runtime_error("unknown opId '" + std::string(op_id) + "'");
+  if (!op->mask.has_value() || !op->mask->contains("components") ||
+      (*op->mask)["components"].empty()) {
+    throw std::runtime_error("op '" + std::string(op_id) + "' has no mask");
+  }
+  // A disabled or neutral op has no pass, so run_passes never built its mask; the overlay
+  // still has to be able to show it.
+  const std::string hash = mask_cache_key(*op->mask, view.geometry);
+  const auto found = view.masks.find(op->id);
+  if (found == view.masks.end() || found->second.hash != hash) {
+    build_mask(view, *op, *op->mask, hash, last);
+  }
+
+  const MaskEntry& entry = view.masks.at(op->id);
+  WGPUTexture texture = entry.accum[entry.final_index].get();
+  if (!component_id.empty()) {
+    const auto component = entry.components.find(std::string(component_id));
+    if (component == entry.components.end() || !component->second.texture) {
+      throw std::runtime_error("component '" + std::string(component_id) + "' has no raster");
+    }
+    texture = component->second.texture.get();
+  }
+
+  const size_t bytes = static_cast<size_t>(entry.width) * entry.height;
+  if (out.size() < offset + bytes) throw std::runtime_error("mask buffer too small");
+  gpu_.read_texture(texture, entry.width, entry.height, 1,
+                    std::span<uint8_t>(out.data() + offset, bytes));
+
+  MaskReadout readout;
+  readout.width = entry.width;
+  readout.height = entry.height;
+  size_t inside = 0;
+  size_t counted = 0;
+  for (uint32_t y = view.geometry.content_y;
+       y < view.geometry.content_y + view.geometry.content_height; ++y) {
+    for (uint32_t x = view.geometry.content_x;
+         x < view.geometry.content_x + view.geometry.content_width; ++x) {
+      ++counted;
+      if (out[offset + (static_cast<size_t>(y) * entry.width) + x] > 127) ++inside;
+    }
+  }
+  readout.coverage =
+      counted == 0 ? 0.0 : static_cast<double>(inside) / static_cast<double>(counted);
+  return readout;
+}
+
+RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
+                              size_t offset) {
+  using clock = std::chrono::steady_clock;
+  View& view = view_for(view_id);
+  const auto started = clock::now();
+
+  WGPUTextureView source = run_passes(view, stack);
   const std::array<WGPUBindGroupEntry, 2> display_entries = {
       texture_entry(0, source), buffer_entry(1, view.frame_uniform.get(), 0, sizeof(FrameUniform))};
-  bind_groups.push_back(gpu_.create_bind_group(display_pipeline_.get(), display_entries));
-  gpu_.encode_fullscreen_pass(encoder, display_pipeline_.get(), bind_groups.back().get(),
+  const BindGroupHandle display = gpu_.create_bind_group(display_pipeline_.get(), display_entries);
+  WGPUCommandEncoder encoder = gpu_.begin_commands("view-display");
+  gpu_.encode_fullscreen_pass(encoder, display_pipeline_.get(), display.get(),
                               view.output_view.get());
   gpu_.submit(encoder);
   gpu_.wait_idle();

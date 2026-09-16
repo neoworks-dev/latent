@@ -458,7 +458,44 @@ Code: `engine/probe/`. All five steps run; numbers are measured, not estimated.
 | 2 LibRaw | Sony ILCE-6400 ARW 24.2 MP: open+unpack+AHD demosaic **1223 ms** single-threaded, RGB→RGBA pad 85 ms. vcpkg libraw 0.22.2. |
 | 3 Frame path | 2560×1440 rgba8 over loopback WebSocket into an Electron canvas, 100 slider ticks: **p50 17.1 ms, p95 22.9 ms, mean 20.8 ms** (max 347 = first frame). Engine side 1.6 ms render + 5.0 ms readback; the rest is transport + `putImageData`. Under the 30 ms kill line; daemon model stands. Optimisation later: WebGL texture upload instead of `putImageData`. **Follow-up (same day, 811×1245 = 4 MB frames):** canvas was never the cost (`putImageData` 0.4 ms). Chromium's WebSocket receive is ~11 ms p50 for 4 MB, linear in bytes (0.5 MB → 2.6 ms), a Worker-owned socket is slower, `desynchronized` widens p95. After WebGL2 painter: request→pixels-on-GPU 11.0 / 16.2 ms p50/p95, +~8 ms vsync to presented. Remaining lever is bytes: half-res proxy while dragging, full on release. |
 | 4 Python + MCP | Bundled CPython 3.12.13 from vcpkg embedded via pybind11: interpreter up in **5.7 ms**. `PyConfig.home` must point at the vcpkg prefix and the executable needs `-rdynamic` (static libpython; extension modules resolve symbols against it). MCP Python SDK **2.2.0** (`MCPServer`, not `FastMCP`) served streamable HTTP from inside the daemon; `initialize` + `tools/call` round trip from curl returned a value computed in C++. |
-| 5 ORT CUDA | onnxruntime 1.30.0 cuda13 prebuilt links and loads the SAM 2 hiera-base-plus encoder (`~/.local/share/latent/models/`). Session init failed only because another process held 11.9 of 16 GB VRAM at the time (ComfyUI). Re-run `probe_onnx` with free VRAM before Phase 1. |
+| 5 ORT CUDA | onnxruntime 1.30.0 cuda13 prebuilt links and loads the SAM 2 hiera-base-plus encoder (`~/.local/share/latent/models/`). Session init failed at first only because another process held 11.9 of 16 GB VRAM at the time (ComfyUI). Re-run with free VRAM: first run 222 ms, steady-state **82 ms** per 1024² encode, `RESULT PASS`. |
+
+#### 8.1.1 Mask models — 2026-09-16
+
+Prepared, validated and timed in `scripts/models/` (full I/O tables, preprocessing and
+C++ port notes in `scripts/models/README.md`). All numbers CUDA EP, p50 of 10 after
+warm-up, sample raw decoded to 1026×1536.
+
+| Model | Store size | Stage | p50 | Session load | VRAM peak |
+|---|---|---|---|---|---|
+| SAM 2 hiera-base-plus | 360 MB | encoder 1024² | **102.4 ms** | 458 ms | 2560 MB |
+| | | decoder, 1 box prompt | **6.4 ms** | | |
+| Florence-2 base (4 ONNX graphs) | 1248 MB | vision encoder 768² | **48.3 ms** | 1562 ms | 2088 MB |
+| | | text encoder + greedy decode (9 tokens) | **21.2 ms** | | |
+| BiRefNet-lite fp16 | 114 MB | alpha matte 1024² | **201.1 ms** | 1130 ms | 6214 MB |
+| SegFormer-B2 ADE20K | 110 MB | semantic 512² | **21.4 ms** | 194 ms | 868 MB |
+
+Text prompt → mask end to end is ~180 ms (Florence 70 + SAM 2 encode 102 + decode 6).
+All mask kinds are jobs; none is in a slider tick.
+
+**Florence-2 → SAM 2 is the right tool for `text` and nothing else.** Florence never
+abstains, so `sky` on a studio backdrop returned 57 % of the frame, and `<OD>` saturates
+at ~30 detections it spends on shoes, so a crowd came back as 3 of ~40 people. Measured
+on three CC0 photos plus the sample raw: `subject`/`background` → BiRefNet-lite (MIT,
+salient-object alpha, matches Lightroom's Select Subject), `sky`/`people` → SegFormer-B2
+ADE20K classes 2 and 12 (0.0000 sky on the studio raw, 39 % people on the crowd).
+SegFormer's licence is NVIDIA Source Code License-**NC** — fine personally, a blocker if
+Latent is ever sold.
+
+Two traps found. `probe_onnx`'s "input image is not float32" is a use-after-free in the
+probe, not a model property: `Ort::TypeInfo` from `GetInputTypeInfo` is a temporary and
+`GetTensorTypeAndShapeInfo()` is a non-owning view into it — keep the `TypeInfo` in a
+named local. And the SAM 2 decoder's `num_labels` dim cannot exceed 1 (`has_mask_input`
+is rank 1 and fails to broadcast at `/Mul_14`), so multi-object prompts are a loop.
+
+VRAM, not disk, is the limit: all four sessions resident plus BiRefNet's 822 MB
+transient exhausted 16 GB. Load one mask model per job, drop the session, keep only the
+SAM 2 encoder output cached per photo (16.8 MB, saves 100 ms per extra prompt).
 
 ## 9. Naming
 

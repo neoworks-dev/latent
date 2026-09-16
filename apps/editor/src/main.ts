@@ -1,6 +1,8 @@
 import "./app.css";
 import { catalogPlugin } from "@latent/plugin-catalog";
 import { consolePlugin } from "@latent/plugin-console";
+import { layersPlugin } from "@latent/plugin-layers";
+import { masksPlugin } from "@latent/plugin-masks";
 import { panelsPlugin } from "@latent/plugin-panels";
 import { Context } from "@neoworks/extension-system";
 import { mount } from "svelte";
@@ -21,6 +23,10 @@ void root.plugin(panesPlugin);
 void root.plugin(enginePlugin, { url: await engineUrl() });
 void root.plugin(viewerPlugin);
 void root.plugin(panelsPlugin);
+// Masks before Layers: the layer rows draw their thumbnails through the masks plugin's
+// preview queue, and the rail shows the modes in the order the panes registered.
+void root.plugin(masksPlugin);
+void root.plugin(layersPlugin);
 void root.plugin(catalogPlugin);
 void root.plugin(consolePlugin);
 

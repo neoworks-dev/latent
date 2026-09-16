@@ -7,6 +7,8 @@
 //   bun run mock-engine [--port 0]
 import type {
   EngineHelloResult,
+  Mask,
+  MaskComponent,
   NotificationName,
   Op,
   OpDefinition,
@@ -22,6 +24,24 @@ import type {
 import { FRAME_HEADER_BYTES } from "@latent/protocol";
 import type { ServerWebSocket } from "bun";
 import { MockCatalog, scanRawFiles } from "./mock-catalog";
+import {
+  combineMask,
+  coverageOf,
+  isAiKind,
+  maskFrame,
+  mergeEngineOwned,
+  placeholderRegion,
+  seedComponentStates,
+  seedState,
+  type BrushSegment,
+  type ImageSampler,
+} from "./mock-masks";
+
+/** The layer half of `op.add` / `op.update`: a whole mask (or `null`) and an opacity. */
+interface LayerWrite {
+  mask?: Mask | null;
+  opacity?: number;
+}
 
 type Tint = NonNullable<OpParamDisplay["tint"]>;
 
@@ -104,7 +124,9 @@ function define(
   label: string,
   params: OpParamSpec[],
 ): OpDefinition {
-  return { name, panel, section, order, label, params };
+  // Every develop op takes a mask and an opacity; geometry ops move the whole frame and
+  // cannot (PROMPT.md §3.7), which is exactly what `maskable` tells the UI.
+  return { name, panel, section, order, label, params, maskable: panel !== "geometry" };
 }
 
 // `section` and `order` mirror the engine's registry (engine/src/ops/registry.cpp), which
@@ -279,29 +301,47 @@ export class PhotoState {
     };
   }
 
-  addOp(op: string, params: Record<string, unknown>, index?: number, transient = false): Op {
+  addOp(
+    op: string,
+    params: Record<string, unknown>,
+    index?: number,
+    transient = false,
+    layer: LayerWrite = {},
+  ): Op {
     const entry: Op = { id: `op${this.nextOpId++}`, op, params: { ...params }, enabled: true };
+    if (layer.mask) entry.mask = { components: layer.mask.components.map(seedState) };
+    if (layer.opacity !== undefined) entry.opacity = layer.opacity;
     const next = [...this.stack];
     next.splice(index ?? next.length, 0, entry);
     this.commit(next, transient);
     return entry;
   }
 
+  /**
+   * `params` merges, `mask` replaces whole (and `null` clears it), `opacity` and `enabled`
+   * are set when given — the contract of `op.update`. Whatever only the engine knows about
+   * a component it already has — its state, its strokes, its raster — is carried forward.
+   */
   updateOp(
     opId: string,
     params: Record<string, unknown>,
     enabled: boolean | undefined,
     transient: boolean,
+    layer: LayerWrite = {},
   ): void {
     const next = this.stack.map((entry) => {
       if (entry.id !== opId) return entry;
-      return {
+      const updated: Op = {
         ...entry,
         params: { ...entry.params, ...params },
         enabled: enabled ?? entry.enabled,
       };
+      if (layer.opacity !== undefined) updated.opacity = layer.opacity;
+      if (layer.mask === null) delete updated.mask;
+      else if (layer.mask) updated.mask = layer.mask;
+      return updated;
     });
-    this.commit(next, transient);
+    this.commit(mergeEngineOwned(this.stack, next), transient);
   }
 
   removeOp(opId: string): void {
@@ -312,7 +352,47 @@ export class PhotoState {
   }
 
   setStack(stack: Op[]): void {
-    this.commit(stack, false);
+    this.commit(seedComponentStates(stack), false);
+  }
+
+  /**
+   * Rewrites one mask component in place. Strokes go through here transiently while the
+   * pointer is down and once committed on release, so a stroke undoes in one step; the
+   * engine-owned `state` changes of a detect job never snapshot at all.
+   */
+  updateComponent(
+    opId: string,
+    componentId: string,
+    patch: (component: MaskComponent) => MaskComponent,
+    transient: boolean,
+  ): MaskComponent {
+    const op = this.stack.find((entry) => entry.id === opId);
+    const component = op?.mask?.components.find((entry) => entry.id === componentId);
+    if (!op || !component) throw new Error(`unknown mask component ${componentId}`);
+    const patched = patch(component);
+    const next = this.stack.map((entry) => {
+      if (entry.id !== opId || !entry.mask) return entry;
+      const components = entry.mask.components.map((candidate) =>
+        candidate.id === componentId ? patched : candidate,
+      );
+      return { ...entry, mask: { components } };
+    });
+    this.commit(next, transient);
+    return patched;
+  }
+
+  component(opId: string, componentId: string): MaskComponent {
+    const op = this.stack.find((entry) => entry.id === opId);
+    const component = op?.mask?.components.find((entry) => entry.id === componentId);
+    if (!component) throw new Error(`unknown mask component ${componentId}`);
+    return component;
+  }
+
+  maskOf(opId: string): Mask {
+    const op = this.stack.find((entry) => entry.id === opId);
+    if (!op) throw new Error(`unknown opId ${opId}`);
+    if (!op.mask) throw new Error(`op ${opId} has no mask`);
+    return op.mask;
   }
 
   undo(): void {
@@ -348,6 +428,25 @@ function paramOf(stack: Op[], op: string, name: string, fallback: number): numbe
   const value = entry.params[name];
   if (typeof value !== "number") return fallback;
   return value;
+}
+
+/**
+ * The synthetic photo before any op: a smooth colour gradient with a grid. The frame
+ * renderer and the luminance/colour mask kinds read the same function, so a mask built on
+ * brightness lines up with the pixels the viewer is showing.
+ */
+export function baseColor(u: number, v: number, grid: number): [number, number, number] {
+  return [0.14 + 0.3 * u + grid, 0.16 + 0.24 * (1 - v) + grid, 0.3 - 0.18 * u + 0.16 * v + grid];
+}
+
+/** The grid lines, in pixels of the frame the sampler is asked about. */
+function gridAt(x: number, y: number): number {
+  return x % 64 < 2 || y % 64 < 2 ? 0.18 : 0;
+}
+
+/** `baseColor` in the coordinates a mask rasteriser works in: 0..1 over the image. */
+export function imageSampler(width: number, height: number): ImageSampler {
+  return (u, v) => baseColor(u, v, gridAt(Math.floor(u * width), Math.floor(v * height)));
 }
 
 /**
@@ -388,10 +487,10 @@ export function renderFrame(
     const v = y / height;
     for (let x = 0; x < width; x++) {
       const u = x / width;
-      const grid = x % 64 < 2 || y % 64 < 2 ? 0.18 : 0;
-      let r = (0.14 + 0.3 * u + grid) * warm;
-      let g = 0.16 + 0.24 * (1 - v) + grid;
-      let b = (0.3 - 0.18 * u + 0.16 * v + grid) * cool;
+      const base = baseColor(u, v, gridAt(x, y));
+      let r = base[0] * warm;
+      let g = base[1];
+      let b = base[2] * cool;
       const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
       r = luma + (r - luma) * vivid;
       g = luma + (g - luma) * vivid;
@@ -451,6 +550,88 @@ const mockCatalogPath = "/tmp/latent-mock/catalog.db";
  */
 const maxThumbnailPhotoId = 0xffffffff;
 
+/**
+ * Long edge of a mask preview raster. The engine rasterises at the view's proxy size; a
+ * mock rasterising in TS stays small and lets the overlay scale it.
+ */
+const maskPreviewMaxEdge = 512;
+
+/**
+ * The mask and opacity of an `op.add` / `op.update`. `mask: null` is a clear and has to be
+ * told apart from an absent one, which leaves the mask alone.
+ */
+function layerWrite(params: Record<string, unknown>): LayerWrite {
+  const write: LayerWrite = {};
+  if (params.mask === null) write.mask = null;
+  else if (params.mask) write.mask = params.mask as Mask;
+  if (typeof params.opacity === "number") write.opacity = params.opacity;
+  return write;
+}
+
+/** An id out of an untyped params bag, without stringifying whatever else arrived. */
+function idOf(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  throw new Error(`expected an id, got ${typeof value}`);
+}
+
+/** A prompt out of the same bag: anything that is not text is no prompt at all. */
+function textOf(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value;
+}
+
+function numberOf(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return value;
+}
+
+/** A stroke segment appended to a brush component — the engine owns the stroke list. */
+function appendSegment(component: MaskComponent, segment: BrushSegment): MaskComponent {
+  const previous = component.params?.strokeData;
+  const strokeData = Array.isArray(previous) ? [...previous, segment] : [segment];
+  return {
+    ...component,
+    state: "ready",
+    params: {
+      ...component.params,
+      // The stroke list lives in the op so a snapshot captures it; `strokes` is the path
+      // the engine mirrors it to.
+      strokes: `brush/${component.id}.bin`,
+      strokeData,
+    },
+  };
+}
+
+function finishState(cancelled: boolean, failed: boolean): "done" | "cancelled" | "error" {
+  if (cancelled) return "cancelled";
+  if (failed) return "error";
+  return "done";
+}
+
+/** What a detect job leaves behind: a raster and the model that made it, or a failure. */
+function finishComponent(
+  component: MaskComponent,
+  failed: boolean,
+  hinted: Record<string, unknown>,
+): MaskComponent {
+  if (failed) {
+    // `params.error` is where a failed detect says why; the component itself has no room
+    // for a message and the job's notification is gone by the time a client redraws.
+    return { ...component, state: "failed", params: { ...hinted, error: "no prompt to detect" } };
+  }
+  return {
+    ...component,
+    state: "ready",
+    params: {
+      ...hinted,
+      model: component.kind === "text" ? "florence2+sam2-mock" : "sam2-mock",
+      sourceHash: "0".repeat(16),
+      raster: placeholderRegion(component.kind, hinted),
+    },
+  };
+}
+
 function requireThumbnailable(photoId: number): void {
   if (photoId <= maxThumbnailPhotoId) return;
   throw new Error(
@@ -467,6 +648,8 @@ export class MockEngine {
   private nextViewId = 1;
   private nextJobId = 1;
   private nextRunId = 1;
+  /** `seq` of the next LMSK frame; it counts mask previews the way LFRM counts renders. */
+  private maskSeq = 0;
 
   constructor(private readonly broadcast: Broadcast) {}
 
@@ -554,6 +737,7 @@ export class MockEngine {
     if (method === "job.cancel")
       return { result: { cancelled: this.cancelJob(Number(params.jobId)) } };
     if (method.startsWith("catalog.")) return this.handleCatalog(method, params);
+    if (method.startsWith("mask.")) return this.handleMask(method, params);
     const photoId = Number(params.photoId);
     const result = this.handleStack(method, params);
     if (this.isCommit(method, params)) this.markEdited(photoId);
@@ -666,6 +850,165 @@ export class MockEngine {
       return { result: { removed } };
     }
     throw new Error(`unknown method ${method}`);
+  }
+
+  /**
+   * `mask.preview`, `mask.detect`, `mask.stroke`. Rasters never leave the engine as JSON:
+   * the preview answers with one LMSK frame and a coverage number, and the UI only ever
+   * sends parameters and stroke points back.
+   */
+  private handleMask(method: string, params: Record<string, unknown>): HandledCall {
+    const photoId = Number(params.photoId);
+    const photo = this.photo(photoId);
+    const opId = idOf(params.opId);
+    if (method === "mask.preview") {
+      const componentId = params.componentId === undefined ? null : idOf(params.componentId);
+      const viewId = params.viewId === undefined ? 0 : Number(params.viewId);
+      const mask = this.previewMask(photo, opId, componentId);
+      const size = this.previewSize(photoId, viewId);
+      const bytes = combineMask(
+        mask,
+        size.width,
+        size.height,
+        imageSampler(size.width, size.height),
+      );
+      this.maskSeq += 1;
+      return {
+        result: { width: size.width, height: size.height, coverage: coverageOf(bytes) },
+        frames: [maskFrame(size.width, size.height, this.maskSeq, viewId, bytes)],
+      };
+    }
+    if (method === "mask.detect") {
+      const componentId = idOf(params.componentId);
+      const hint = (params.hint ?? {}) as Record<string, unknown>;
+      return {
+        result: { jobId: this.startDetect(photoId, opId, componentId, hint) },
+        changed: photoId,
+      };
+    }
+    if (method === "mask.stroke") {
+      const componentId = idOf(params.componentId);
+      const component = photo.component(opId, componentId);
+      if (component.kind !== "brush") {
+        throw new Error(`component ${componentId} is a ${component.kind}, not a brush`);
+      }
+      const segment: BrushSegment = {
+        points: (params.points ?? []) as number[][],
+        size: numberOf(params.size, numberOf(component.params?.size, 0.08)),
+        flow: numberOf(params.flow, numberOf(component.params?.flow, 100)),
+        erase: params.erase === true,
+      };
+      const transient = params.transient === true;
+      photo.updateComponent(opId, componentId, (entry) => appendSegment(entry, segment), transient);
+      if (!transient) this.markEdited(photoId);
+      return { result: photo.snapshot(), changed: photoId };
+    }
+    throw new Error(`unknown method ${method}`);
+  }
+
+  /** The combined mask, or one component's own raster — which is an error while it pends. */
+  private previewMask(photo: PhotoState, opId: string, componentId: string | null): Mask {
+    const mask = photo.maskOf(opId);
+    if (componentId === null) return mask;
+    const component = photo.component(opId, componentId);
+    if (component.state === "pending" || component.state === "failed") {
+      throw new Error(`component ${componentId} is ${component.state} and has no raster`);
+    }
+    return { components: [{ ...component, mode: "add" }] };
+  }
+
+  /**
+   * The raster is sized like the view it will be laid over, capped at
+   * `maskPreviewMaxEdge` — the UI scales it onto the drawn image, and a 1:1 raster at
+   * viewport resolution is the real engine's job, not a TS loop's.
+   */
+  private previewSize(photoId: number, viewId: number): { width: number; height: number } {
+    const size = this.proxySize(photoId, viewId);
+    const scale = Math.min(1, maskPreviewMaxEdge / Math.max(size.width, size.height));
+    const { width, height } = size;
+    return {
+      width: Math.max(1, Math.round(width * scale)),
+      height: Math.max(1, Math.round(height * scale)),
+    };
+  }
+
+  /** The view's size when the preview names one, else the photo's own. */
+  private proxySize(photoId: number, viewId: number): { width: number; height: number } {
+    const view = this.views.get(viewId);
+    if (view) return { width: view.width, height: view.height };
+    if (this.catalog.has(photoId)) {
+      const row = this.catalog.photo(photoId);
+      return { width: row.width, height: row.height };
+    }
+    return { width: 1024, height: 683 };
+  }
+
+  /**
+   * The AI rasterisation of one component: `pending` right away, a few `job.progress`
+   * ticks, then `ready` with a placeholder region — or `failed`, which is what a text
+   * component without a prompt gets. Never inline in the call, exactly like the engine.
+   */
+  private startDetect(
+    photoId: number,
+    opId: string,
+    componentId: string,
+    hint: Record<string, unknown>,
+  ): number {
+    const photo = this.photo(photoId);
+    const component = photo.component(opId, componentId);
+    if (!isAiKind(component.kind)) {
+      throw new Error(`component ${componentId} is a ${component.kind}: nothing to detect`);
+    }
+    const jobId = this.nextJobId++;
+    const job: Job = { cancelled: false, finished: false };
+    this.jobs.set(jobId, job);
+    const merged = { ...component.params, ...hint };
+    // Only `text` needs words from the user; every other kind detects from the pixels.
+    const prompt = component.kind === "text" ? textOf(merged.prompt) : "ok";
+    photo.updateComponent(
+      opId,
+      componentId,
+      (entry) => ({ ...entry, state: "pending", jobId }),
+      true,
+    );
+
+    const total = 3;
+    let done = 0;
+    const tick = (): void => {
+      done += 1;
+      const finished = done >= total || job.cancelled;
+      const failed = prompt.trim() === "";
+      const progress: Record<string, unknown> = {
+        jobId,
+        kind: "mask",
+        done,
+        total,
+        finished,
+        state: finished ? finishState(job.cancelled, failed) : "running",
+        message: `${component.kind} mask`,
+      };
+      if (finished && failed) progress.error = "no prompt to detect";
+      this.broadcast("job.progress", progress);
+      if (!finished) {
+        this.timer(tick, 40);
+        return;
+      }
+      job.finished = true;
+      photo.updateComponent(
+        opId,
+        componentId,
+        (entry) => finishComponent(entry, failed || job.cancelled, merged),
+        true,
+      );
+      this.broadcast("stack.changed", {
+        ...photo.snapshot(),
+        photoId,
+        source: "external",
+        client: "external",
+      });
+    };
+    this.timer(tick, 40);
+    return jobId;
   }
 
   /**
@@ -824,7 +1167,10 @@ export class MockEngine {
     const opParams = (params.params ?? {}) as Record<string, unknown>;
     if (method === "stack.get") return photo.snapshot();
     if (method === "stack.set") {
-      photo.setStack(params.stack as Op[]);
+      // The UI writes masks and layer opacity through the whole stack, and its copy of a
+      // component is one the engine handed it: rasterisation state and strokes are kept
+      // from the engine's own stack rather than taken from the writer.
+      photo.setStack(mergeEngineOwned(photo.stack, params.stack as Op[]));
       return photo.snapshot();
     }
     if (method === "op.add") {
@@ -833,12 +1179,19 @@ export class MockEngine {
         opParams,
         params.index as number | undefined,
         params.transient === true,
+        layerWrite(params),
       );
       return photo.snapshot();
     }
     if (method === "op.update") {
       const enabled = typeof params.enabled === "boolean" ? params.enabled : undefined;
-      photo.updateOp(String(params.opId), opParams, enabled, params.transient === true);
+      photo.updateOp(
+        idOf(params.opId),
+        opParams,
+        enabled,
+        params.transient === true,
+        layerWrite(params),
+      );
       return photo.snapshot();
     }
     if (method === "op.remove") {

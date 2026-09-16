@@ -51,8 +51,21 @@ def get_stack(photo_id: int | None = None) -> dict[str, Any]:
 
 
 @server.tool()
-def render_preview(photo_id: int | None = None, max_size: int = 1024) -> Image:
-    """A JPEG of the photo's current state, long edge at most `max_size`."""
+def render_preview(
+    photo_id: int | None = None,
+    max_size: int = 1024,
+    mask: list[str] | None = None,
+) -> Image:
+    """A JPEG of the photo's current state, long edge at most `max_size`.
+
+    Pass `mask=["<op_id>"]` to get that op's combined mask instead, as a greyscale PNG
+    (white = the op applies, black = it does not), or `mask=["<op_id>", "<component_id>"]`
+    for one component's raster. That is how to check what a selection actually caught.
+    """
+    if mask:
+        component_id = mask[1] if len(mask) > 1 else None
+        raster = latent._preview_mask_png(photo_id, mask[0], component_id, max_size)
+        return Image(data=raster, format="png")
     return Image(data=latent._preview_jpeg(photo_id, max_size), format="jpeg")
 
 
