@@ -74,11 +74,33 @@
         "view.close",
         "view.render",
         "python.run",
+        "catalog.import",
+        "catalog.list",
+        "catalog.get",
+        "catalog.folders",
+        "catalog.setRating",
+        "catalog.setFlag",
+        "catalog.collections",
+        "catalog.collectionSet",
+        "catalog.thumbnail",
         "stack.changed",
-        "engine.log"
+        "engine.log",
+        "catalog.changed",
+        "job.progress"
+      ]
+    },
+    "NotificationName": {
+      "description": "Engine → UI messages without an id. Calling one as a method is a -32601 error.",
+      "type": "string",
+      "enum": [
+        "stack.changed",
+        "engine.log",
+        "catalog.changed",
+        "job.progress"
       ]
     },
     "PhotoId": {
+      "description": "Stable catalog id (SQLite rowid). photo.open returns the same id for the same file; a file not yet in the catalog is added on open.",
       "type": "integer",
       "minimum": 1
     },
@@ -340,7 +362,9 @@
         "photoId",
         "width",
         "height",
-        "camera"
+        "camera",
+        "hash",
+        "sidecarLoaded"
       ],
       "properties": {
         "photoId": {
@@ -354,6 +378,14 @@
         },
         "camera": {
           "type": "string"
+        },
+        "hash": {
+          "type": "string",
+          "description": "SHA-256 hex of the raw file, as stored in the sidecar."
+        },
+        "sidecarLoaded": {
+          "type": "boolean",
+          "description": "True when an existing .latent sidecar was read and its stack restored."
         }
       }
     },
@@ -434,8 +466,7 @@
       "type": "object",
       "required": [
         "photoId",
-        "op",
-        "params"
+        "op"
       ],
       "additionalProperties": false,
       "properties": {
@@ -447,7 +478,8 @@
         },
         "params": {
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": true,
+          "description": "Omitted keys take the registry defaults; omitted entirely adds the op at defaults."
         },
         "index": {
           "type": "integer",
@@ -594,11 +626,20 @@
       "type": "object",
       "required": [
         "seq",
+        "width",
+        "height",
         "renderMs",
         "readbackMs"
       ],
       "properties": {
         "seq": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer",
+          "description": "Size of the frame that was sent, so a client that dropped it still knows the view size."
+        },
+        "height": {
           "type": "integer"
         },
         "renderMs": {
@@ -666,8 +707,10 @@
             },
             "source": {
               "type": "string",
+              "description": "`ui` = the receiving client made this change itself; `external` = another socket did; `python`/`mcp` = a script or agent; `history` = undo/redo; `load` = sidecar restore on open.",
               "enum": [
                 "ui",
+                "external",
                 "python",
                 "mcp",
                 "history",
@@ -696,7 +739,194 @@
         },
         "message": {
           "type": "string"
+        },
+        "photoId": {
+          "$ref": "#/definitions/PhotoId",
+          "description": "Set when the message concerns one photo (e.g. a clamped op param)."
         }
+      }
+    },
+
+    "PhotoFlag": {
+      "type": "string",
+      "enum": ["none", "pick", "reject"]
+    },
+    "CatalogPhoto": {
+      "description": "One catalog row. `photoId` is the stable id used everywhere else.",
+      "type": "object",
+      "required": ["photoId", "path", "folder", "filename", "width", "height", "camera", "rating", "flag", "hasSidecar", "importedAt"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "path": { "type": "string" },
+        "folder": { "type": "string", "description": "Absolute directory containing the file." },
+        "filename": { "type": "string" },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "camera": { "type": "string" },
+        "lens": { "type": "string" },
+        "capturedAt": { "type": "string", "description": "ISO 8601 from EXIF; absent when unknown." },
+        "importedAt": { "type": "string", "description": "ISO 8601." },
+        "editedAt": { "type": "string", "description": "ISO 8601 of the last non-transient stack change; absent when never edited." },
+        "rating": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "flag": { "$ref": "#/definitions/PhotoFlag" },
+        "hasSidecar": { "type": "boolean" },
+        "iso": { "type": "integer" },
+        "shutter": { "type": "string", "description": "e.g. \"1/250\"" },
+        "aperture": { "type": "number" },
+        "focalLength": { "type": "number" }
+      }
+    },
+    "CatalogCollection": {
+      "type": "object",
+      "required": ["collectionId", "name", "count"],
+      "properties": {
+        "collectionId": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "count": { "type": "integer" }
+      }
+    },
+    "JobId": { "type": "integer", "minimum": 1 },
+
+    "CatalogImportParams": {
+      "description": "Registers files (or every raw in the given directories) in the catalog and queues thumbnails. Returns immediately; progress arrives as job.progress notifications.",
+      "type": "object",
+      "required": ["paths"],
+      "additionalProperties": false,
+      "properties": {
+        "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "recursive": { "type": "boolean", "description": "Descend into subdirectories. Default true." }
+      }
+    },
+    "CatalogImportResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "CatalogListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "folder": { "type": "string", "description": "Exact folder match; omit for every photo." },
+        "collectionId": { "type": "integer" },
+        "flag": { "$ref": "#/definitions/PhotoFlag" },
+        "minRating": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "sort": { "type": "string", "enum": ["capturedAt", "importedAt", "filename", "rating", "editedAt"] },
+        "descending": { "type": "boolean" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "offset": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "CatalogListResult": {
+      "type": "object",
+      "required": ["photos", "total"],
+      "properties": {
+        "photos": { "type": "array", "items": { "$ref": "#/definitions/CatalogPhoto" } },
+        "total": { "type": "integer", "description": "Matches before limit/offset." }
+      }
+    },
+    "CatalogGetParams": {
+      "type": "object",
+      "required": ["photoId"],
+      "additionalProperties": false,
+      "properties": { "photoId": { "$ref": "#/definitions/PhotoId" } }
+    },
+    "CatalogGetResult": { "$ref": "#/definitions/CatalogPhoto" },
+    "CatalogFoldersParams": { "type": "object", "additionalProperties": false },
+    "CatalogFoldersResult": {
+      "type": "object",
+      "required": ["folders"],
+      "properties": {
+        "folders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "count"],
+            "properties": { "path": { "type": "string" }, "count": { "type": "integer" } }
+          }
+        }
+      }
+    },
+    "CatalogSetRatingParams": {
+      "type": "object",
+      "required": ["photoId", "rating"],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "rating": { "type": "integer", "minimum": 0, "maximum": 5 }
+      }
+    },
+    "CatalogSetRatingResult": { "$ref": "#/definitions/CatalogPhoto" },
+    "CatalogSetFlagParams": {
+      "type": "object",
+      "required": ["photoId", "flag"],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "flag": { "$ref": "#/definitions/PhotoFlag" }
+      }
+    },
+    "CatalogSetFlagResult": { "$ref": "#/definitions/CatalogPhoto" },
+    "CatalogCollectionsParams": { "type": "object", "additionalProperties": false },
+    "CatalogCollectionsResult": {
+      "type": "object",
+      "required": ["collections"],
+      "properties": {
+        "collections": { "type": "array", "items": { "$ref": "#/definitions/CatalogCollection" } }
+      }
+    },
+    "CatalogCollectionSetParams": {
+      "description": "Create (name without collectionId), rename (both), add/remove members, or delete a collection.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "collectionId": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "add": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } },
+        "remove": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } },
+        "delete": { "type": "boolean" }
+      }
+    },
+    "CatalogCollectionSetResult": { "$ref": "#/definitions/CatalogCollectionsResult" },
+    "CatalogThumbnailParams": {
+      "description": "Sends an LTHM binary frame (JPEG, target = photoId) before the result. Cached on disk by the engine; generated from the embedded preview when the raw has one, else from a fast half-size decode.",
+      "type": "object",
+      "required": ["photoId"],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "size": { "type": "integer", "minimum": 32, "maximum": 2048, "description": "Long edge in px. Default 256." }
+      }
+    },
+    "CatalogThumbnailResult": {
+      "type": "object",
+      "required": ["photoId", "width", "height"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" }
+      }
+    },
+    "CatalogChangedParams": {
+      "description": "Notification: catalog rows changed. Clients re-list what they show.",
+      "type": "object",
+      "required": ["photoIds", "reason"],
+      "properties": {
+        "photoIds": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } },
+        "reason": { "type": "string", "enum": ["import", "rating", "flag", "collection", "edit", "remove"] }
+      }
+    },
+    "JobProgressParams": {
+      "description": "Notification for long-running engine work (import, thumbnails, later export).",
+      "type": "object",
+      "required": ["jobId", "kind", "done", "total", "finished"],
+      "properties": {
+        "jobId": { "$ref": "#/definitions/JobId" },
+        "kind": { "type": "string", "enum": ["import", "thumbnails", "export"] },
+        "done": { "type": "integer" },
+        "total": { "type": "integer" },
+        "finished": { "type": "boolean" },
+        "message": { "type": "string" },
+        "error": { "type": "string" }
       }
     }
   }
