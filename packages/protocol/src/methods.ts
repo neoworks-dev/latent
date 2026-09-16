@@ -20,14 +20,26 @@ export interface MethodMap {
   "view.close": { params: G.ViewCloseParams; result: G.ViewCloseResult };
   "view.render": { params: G.ViewRenderParams; result: G.ViewRenderResult };
   "python.run": { params: G.PythonRunParams; result: G.PythonRunResult };
+  "catalog.import": { params: G.CatalogImportParams; result: G.CatalogImportResult };
+  "catalog.list": { params: G.CatalogListParams; result: G.CatalogListResult };
+  "catalog.get": { params: G.CatalogGetParams; result: G.CatalogPhoto };
+  "catalog.folders": { params: G.CatalogFoldersParams; result: G.CatalogFoldersResult };
+  "catalog.setRating": { params: G.CatalogSetRatingParams; result: G.CatalogPhoto };
+  "catalog.setFlag": { params: G.CatalogSetFlagParams; result: G.CatalogPhoto };
+  "catalog.collections": { params: G.CatalogCollectionsParams; result: G.CatalogCollectionsResult };
+  "catalog.collectionSet": { params: G.CatalogCollectionSetParams; result: G.CatalogCollectionsResult };
+  "catalog.thumbnail": { params: G.CatalogThumbnailParams; result: G.CatalogThumbnailResult };
 }
 
 export interface NotificationMap {
   "stack.changed": G.StackChangedParams;
   "engine.log": G.EngineLogParams;
+  "catalog.changed": G.CatalogChangedParams;
+  "job.progress": G.JobProgressParams;
 }
 
 export type MethodName = keyof MethodMap;
+export type NotificationName = keyof NotificationMap;
 
 /** Runtime list, kept in sync with the schema's MethodName enum by the protocol test. */
 export const methods: readonly MethodName[] = [
@@ -46,4 +58,20 @@ export const methods: readonly MethodName[] = [
   "view.close",
   "view.render",
   "python.run",
+  "catalog.import",
+  "catalog.list",
+  "catalog.get",
+  "catalog.folders",
+  "catalog.setRating",
+  "catalog.setFlag",
+  "catalog.collections",
+  "catalog.collectionSet",
+  "catalog.thumbnail",
+];
+
+export const notifications: readonly NotificationName[] = [
+  "stack.changed",
+  "engine.log",
+  "catalog.changed",
+  "job.progress",
 ];

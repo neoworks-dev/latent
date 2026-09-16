@@ -17,8 +17,26 @@ export type MethodName =
   | "view.close"
   | "view.render"
   | "python.run"
+  | "catalog.import"
+  | "catalog.list"
+  | "catalog.get"
+  | "catalog.folders"
+  | "catalog.setRating"
+  | "catalog.setFlag"
+  | "catalog.collections"
+  | "catalog.collectionSet"
+  | "catalog.thumbnail"
   | "stack.changed"
-  | "engine.log";
+  | "engine.log"
+  | "catalog.changed"
+  | "job.progress";
+/**
+ * Engine → UI messages without an id. Calling one as a method is a -32601 error.
+ */
+export type NotificationName = "stack.changed" | "engine.log" | "catalog.changed" | "job.progress";
+/**
+ * Stable catalog id (SQLite rowid). photo.open returns the same id for the same file; a file not yet in the catalog is added on open.
+ */
 export type PhotoId = number;
 export type ViewId = number;
 export type OpId = string;
@@ -28,8 +46,13 @@ export type Stack = Op[];
  */
 export type StackChangedParams = StackGetResult & {
   photoId: PhotoId;
-  source: "ui" | "python" | "mcp" | "history" | "load";
+  /**
+   * `ui` = the receiving client made this change itself; `external` = another socket did; `python`/`mcp` = a script or agent; `history` = undo/redo; `load` = sidecar restore on open.
+   */
+  source: "ui" | "external" | "python" | "mcp" | "history" | "load";
 };
+export type PhotoFlag = "none" | "pick" | "reject";
+export type JobId = number;
 
 /**
  * JSON-RPC 2.0 methods between the Latent engine and its UI. Each method has <Method>Params and <Method>Result. Phase 0 surface only.
@@ -38,6 +61,7 @@ export interface LatentProtocol {
   Envelope?: Envelope;
   RpcError?: RpcError;
   MethodName?: MethodName;
+  NotificationName?: NotificationName;
   PhotoId?: PhotoId;
   ViewId?: ViewId;
   OpId?: OpId;
@@ -79,6 +103,30 @@ export interface LatentProtocol {
   PythonRunResult?: PythonRunResult;
   StackChangedParams?: StackChangedParams;
   EngineLogParams?: EngineLogParams;
+  PhotoFlag?: PhotoFlag;
+  CatalogPhoto?: CatalogPhoto;
+  CatalogCollection?: CatalogCollection;
+  JobId?: JobId;
+  CatalogImportParams?: CatalogImportParams;
+  CatalogImportResult?: CatalogImportResult;
+  CatalogListParams?: CatalogListParams;
+  CatalogListResult?: CatalogListResult;
+  CatalogGetParams?: CatalogGetParams;
+  CatalogGetResult?: CatalogPhoto;
+  CatalogFoldersParams?: CatalogFoldersParams;
+  CatalogFoldersResult?: CatalogFoldersResult;
+  CatalogSetRatingParams?: CatalogSetRatingParams;
+  CatalogSetRatingResult?: CatalogPhoto;
+  CatalogSetFlagParams?: CatalogSetFlagParams;
+  CatalogSetFlagResult?: CatalogPhoto;
+  CatalogCollectionsParams?: CatalogCollectionsParams;
+  CatalogCollectionsResult?: CatalogCollectionsResult;
+  CatalogCollectionSetParams?: CatalogCollectionSetParams;
+  CatalogCollectionSetResult?: CatalogCollectionsResult;
+  CatalogThumbnailParams?: CatalogThumbnailParams;
+  CatalogThumbnailResult?: CatalogThumbnailResult;
+  CatalogChangedParams?: CatalogChangedParams;
+  JobProgressParams?: JobProgressParams;
 }
 /**
  * JSON-RPC 2.0 envelope. `id` absent on notifications.
@@ -168,6 +216,14 @@ export interface PhotoOpenResult {
   width: number;
   height: number;
   camera: string;
+  /**
+   * SHA-256 hex of the raw file, as stored in the sidecar.
+   */
+  hash: string;
+  /**
+   * True when an existing .latent sidecar was read and its stack restored.
+   */
+  sidecarLoaded: boolean;
 }
 export interface PhotoCloseParams {
   photoId: PhotoId;
@@ -190,7 +246,10 @@ export interface StackSetParams {
 export interface OpAddParams {
   photoId: PhotoId;
   op: string;
-  params: {
+  /**
+   * Omitted keys take the registry defaults; omitted entirely adds the op at defaults.
+   */
+  params?: {
     [k: string]: unknown | undefined;
   };
   /**
@@ -242,13 +301,18 @@ export interface ViewRenderParams {
 }
 export interface ViewRenderResult {
   seq: number;
+  /**
+   * Size of the frame that was sent, so a client that dropped it still knows the view size.
+   */
+  width: number;
+  height: number;
   renderMs: number;
   readbackMs: number;
 }
 export interface PythonRunParams {
   code: string;
   /**
-   * Bound to `latent.photo` for the run.
+   * Stable catalog id (SQLite rowid). photo.open returns the same id for the same file; a file not yet in the catalog is added on open.
    */
   photoId?: number;
 }
@@ -264,4 +328,153 @@ export interface PythonRunResult {
 export interface EngineLogParams {
   level: "debug" | "info" | "warn" | "error";
   message: string;
+  /**
+   * Stable catalog id (SQLite rowid). photo.open returns the same id for the same file; a file not yet in the catalog is added on open.
+   */
+  photoId?: number;
+}
+/**
+ * One catalog row. `photoId` is the stable id used everywhere else.
+ */
+export interface CatalogPhoto {
+  photoId: PhotoId;
+  path: string;
+  /**
+   * Absolute directory containing the file.
+   */
+  folder: string;
+  filename: string;
+  width: number;
+  height: number;
+  camera: string;
+  lens?: string;
+  /**
+   * ISO 8601 from EXIF; absent when unknown.
+   */
+  capturedAt?: string;
+  /**
+   * ISO 8601.
+   */
+  importedAt: string;
+  /**
+   * ISO 8601 of the last non-transient stack change; absent when never edited.
+   */
+  editedAt?: string;
+  rating: number;
+  flag: PhotoFlag;
+  hasSidecar: boolean;
+  iso?: number;
+  /**
+   * e.g. "1/250"
+   */
+  shutter?: string;
+  aperture?: number;
+  focalLength?: number;
+}
+export interface CatalogCollection {
+  collectionId: number;
+  name: string;
+  count: number;
+}
+/**
+ * Registers files (or every raw in the given directories) in the catalog and queues thumbnails. Returns immediately; progress arrives as job.progress notifications.
+ */
+export interface CatalogImportParams {
+  /**
+   * @minItems 1
+   */
+  paths: [string, ...string[]];
+  /**
+   * Descend into subdirectories. Default true.
+   */
+  recursive?: boolean;
+}
+export interface CatalogImportResult {
+  jobId: JobId;
+}
+export interface CatalogListParams {
+  /**
+   * Exact folder match; omit for every photo.
+   */
+  folder?: string;
+  collectionId?: number;
+  flag?: PhotoFlag;
+  minRating?: number;
+  sort?: "capturedAt" | "importedAt" | "filename" | "rating" | "editedAt";
+  descending?: boolean;
+  limit?: number;
+  offset?: number;
+}
+export interface CatalogListResult {
+  photos: CatalogPhoto[];
+  /**
+   * Matches before limit/offset.
+   */
+  total: number;
+}
+export interface CatalogGetParams {
+  photoId: PhotoId;
+}
+export interface CatalogFoldersParams {}
+export interface CatalogFoldersResult {
+  folders: {
+    path: string;
+    count: number;
+  }[];
+}
+export interface CatalogSetRatingParams {
+  photoId: PhotoId;
+  rating: number;
+}
+export interface CatalogSetFlagParams {
+  photoId: PhotoId;
+  flag: PhotoFlag;
+}
+export interface CatalogCollectionsParams {}
+export interface CatalogCollectionsResult {
+  collections: CatalogCollection[];
+}
+/**
+ * Create (name without collectionId), rename (both), add/remove members, or delete a collection.
+ */
+export interface CatalogCollectionSetParams {
+  collectionId?: number;
+  name?: string;
+  add?: PhotoId[];
+  remove?: PhotoId[];
+  delete?: boolean;
+}
+/**
+ * Sends an LTHM binary frame (JPEG, target = photoId) before the result. Cached on disk by the engine; generated from the embedded preview when the raw has one, else from a fast half-size decode.
+ */
+export interface CatalogThumbnailParams {
+  photoId: PhotoId;
+  /**
+   * Long edge in px. Default 256.
+   */
+  size?: number;
+}
+export interface CatalogThumbnailResult {
+  photoId: PhotoId;
+  width: number;
+  height: number;
+}
+/**
+ * Notification: catalog rows changed. Clients re-list what they show.
+ */
+export interface CatalogChangedParams {
+  photoIds: PhotoId[];
+  reason: "import" | "rating" | "flag" | "collection" | "edit" | "remove";
+}
+/**
+ * Notification for long-running engine work (import, thumbnails, later export).
+ */
+export interface JobProgressParams {
+  jobId: JobId;
+  kind: "import" | "thumbnails" | "export";
+  done: number;
+  total: number;
+  finished: boolean;
+  message?: string;
+  error?: string;
 }

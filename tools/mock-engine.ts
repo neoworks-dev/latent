@@ -260,6 +260,8 @@ class MockEngine {
         width: 4024,
         height: 6024,
         camera: "Mock X-T5",
+        hash: "0".repeat(64),
+        sidecarLoaded: false,
       };
       return { result: opened, changed: photoId };
     }
@@ -287,7 +289,13 @@ class MockEngine {
     return { result: this.handleStack(method, params), changed: Number(params.photoId) };
   }
 
-  render(viewId: number): { frame: ArrayBuffer; renderMs: number; seq: number } {
+  render(viewId: number): {
+    frame: ArrayBuffer;
+    renderMs: number;
+    seq: number;
+    width: number;
+    height: number;
+  } {
     const view = this.views.get(viewId);
     if (!view) throw new Error(`unknown viewId ${viewId}`);
     view.seq += 1;
@@ -299,7 +307,13 @@ class MockEngine {
       viewId,
       this.photo(view.photoId).stack,
     );
-    return { frame, renderMs: performance.now() - started, seq: view.seq };
+    return {
+      frame,
+      renderMs: performance.now() - started,
+      seq: view.seq,
+      width: view.width,
+      height: view.height,
+    };
   }
 
   resize(viewId: number, width?: number, height?: number): void {
@@ -375,6 +389,8 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
             socket.send(new Uint8Array(rendered.frame));
             reply(socket, request.id, {
               seq: rendered.seq,
+              width: rendered.width,
+              height: rendered.height,
               renderMs: rendered.renderMs,
               readbackMs: 0,
             });
