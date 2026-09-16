@@ -1,9 +1,12 @@
 #include "ops/sidecar.h"
 
+#include "ops/registry.h"
 #include "ops/sha256.h"
 
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -70,6 +73,43 @@ TEST_CASE("a missing sidecar is not an error, a broken one is") {
   const std::string future = (directory / "future.latent").string();
   std::ofstream(future) << R"({"version": 99, "source": {}, "stack": []})";
   REQUIRE_THROWS_AS(read_sidecar(future), OpError);
+
+  std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("a sidecar from a newer or older engine still loads") {
+  const std::filesystem::path directory = temp_dir();
+  const std::string path = (directory / "forward.latent").string();
+  // An op this build has never heard of, next to one written before the op set grew.
+  // The codec keeps both; dropping the unknown one is the server's decision, made when
+  // the stack is rendered, not the reader's.
+  std::ofstream(path) << R"({
+    "version": 1,
+    "source": {"path": "/photos/DSC00120.ARW", "hash": "abc"},
+    "stack": [
+      {"id": "aaaa0001", "op": "lens_blur", "params": {"amount": 50}, "enabled": true},
+      {"id": "aaaa0002", "op": "white_balance", "params": {"temperature": 20, "tint": -5},
+       "enabled": true},
+      {"id": "aaaa0003", "op": "vibrance", "params": {"value": 30}, "enabled": true}
+    ]
+  })";
+
+  const std::optional<Sidecar> read = read_sidecar(path);
+  REQUIRE(read.has_value());
+  REQUIRE(read->stack.size() == 3);
+  REQUIRE(read->stack[0].name == "lens_blur");
+  REQUIRE(read->stack[0].params["amount"] == 50);
+
+  // The white balance op predates the Kelvin mode: normalising it must not touch the two
+  // values it does carry, and must leave it in the relative mode they were written for.
+  std::vector<std::string> warnings;
+  const nlohmann::json white_balance =
+      normalize_params_for(read->stack[1].name, read->stack[1].params, warnings);
+  REQUIRE(white_balance["mode"] == "relative");
+  REQUIRE(white_balance["temperature"] == 20.0);
+  REQUIRE(white_balance["tint"] == -5.0);
+  REQUIRE(normalize_params_for("vibrance", read->stack[2].params, warnings)["value"] == 30.0);
+  REQUIRE(warnings.empty());
 
   std::filesystem::remove_all(directory);
 }

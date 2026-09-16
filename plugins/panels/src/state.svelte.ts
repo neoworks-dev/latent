@@ -1,14 +1,23 @@
 import type { OpDefinition } from "@latent/protocol";
-import { groupByPanel, type PanelGroup } from "./panels";
+import { groupBySection, type PanelGroup } from "./panels";
 
-/** What `ops.describe` returned, grouped for the panel column. Never edit state. */
+/**
+ * What `ops.describe` returned, grouped for the panel column, plus which sections are
+ * folded. Never edit state — the fold is view state and belongs to the UI, the values
+ * do not and come from the engine on every read.
+ */
 export class PanelsState {
   ops = $state<OpDefinition[]>([]);
-  groups = $derived<PanelGroup[]>(groupByPanel(this.ops));
+  groups = $derived<PanelGroup[]>(groupBySection(this.ops));
 
-  opsFor(panel: string): OpDefinition[] {
-    const group = this.groups.find((candidate) => candidate.panel === panel);
-    if (!group) return [];
-    return group.ops;
+  /** Sections are open until folded, so a section the engine adds later shows up open. */
+  private folded = $state<Record<string, boolean>>({});
+
+  isOpen(section: string): boolean {
+    return this.folded[section] !== true;
+  }
+
+  toggle(section: string): void {
+    this.folded[section] = this.isOpen(section);
   }
 }

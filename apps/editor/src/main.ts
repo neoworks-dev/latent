@@ -1,4 +1,6 @@
 import "./app.css";
+import { catalogPlugin } from "@latent/plugin-catalog";
+import { consolePlugin } from "@latent/plugin-console";
 import { panelsPlugin } from "@latent/plugin-panels";
 import { Context } from "@neoworks/extension-system";
 import { mount } from "svelte";
@@ -19,6 +21,8 @@ void root.plugin(panesPlugin);
 void root.plugin(enginePlugin, { url: await engineUrl() });
 void root.plugin(viewerPlugin);
 void root.plugin(panelsPlugin);
+void root.plugin(catalogPlugin);
+void root.plugin(consolePlugin);
 
 const target = document.getElementById("app");
 if (!target) throw new Error("index.html is missing #app");

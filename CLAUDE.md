@@ -55,9 +55,12 @@ mirror Lightroom 1:1.
   `~/.claude/skills/comfy`). Graphs in `engine/workflows/`: fragments + blueprint, `comfy
   workflow compose`; compiled JSON is a template, substitute by node id at runtime.
 - SAM 2 has no text input. Text select = Florence-2 box → SAM 2. ORT with CUDA EP.
-- Frame budget: < 16 ms slider tick end-to-end. Measured 2026-09-16: p50 17.1 ms at
-  2560×1440 (engine 1.6 render + 5.0 readback). Numbers in `PROMPT.md` §8.1. Re-measure after
-  any change to the frame path; never read back full-res for preview (249 ms).
+- Frame budget: < 16 ms slider tick end-to-end. Measured 2026-09-16: request→GPU 11.0 ms
+  p50 at 811×1245 after WebGL2 painter; ~11 ms of it is Chromium's WebSocket receive of a
+  4 MB frame, linear in bytes. Canvas draw is 0.0 ms. Numbers in `PROMPT.md` §8.1. Lever
+  left: fewer bytes (half-res proxy while dragging). Re-measure after any frame-path change
+  (`node apps/desktop/scripts/screenshot.ts --engine real --flow latency`); never read back
+  full-res for preview (249 ms).
 - Sample raw for tests: `~/Downloads/DSC00120.ARW` (Sony A6400, 24 MP). Models:
   `~/.local/share/latent/models/`. ORT CUDA needs free VRAM; ComfyUI can hold 12 GB.
 

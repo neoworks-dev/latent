@@ -1,25 +1,25 @@
 <script lang="ts">
   import { kernelContext } from "@latent/contracts";
   import { Button } from "@neoworks-dev/ui";
+  import { FramePainter } from "./painter";
 
   const { paneId: _paneId }: { paneId: string } = $props();
   const ctx = kernelContext();
   const viewer = ctx.viewer;
 
   let canvas = $state<HTMLCanvasElement | null>(null);
-  let imageData: ImageData | null = null;
 
+  // The GL context lives as long as this canvas does, and the viewer draws through it
+  // directly — no frame ever passes through reactive state.
   $effect(() => {
-    const frame = viewer.lastFrame;
-    if (!frame || !canvas) return;
-    const { width, height } = frame.header;
-    if (canvas.width !== width || canvas.height !== height || !imageData) {
-      canvas.width = width;
-      canvas.height = height;
-      imageData = new ImageData(width, height);
-    }
-    imageData.data.set(frame.pixels);
-    canvas.getContext("2d")?.putImageData(imageData, 0, 0);
+    const element = canvas;
+    if (!element) return;
+    const painter = new FramePainter(element);
+    const detach = viewer.attachFrameSink((frame) => painter.draw(frame));
+    return () => {
+      detach();
+      painter.dispose();
+    };
   });
 
   async function openPath(path: string): Promise<void> {
@@ -68,7 +68,9 @@
   <div class="flex items-center gap-3 border-b border-line px-3 py-1.5 text-xs text-muted">
     <Button size="sm" onclick={openPhoto}>Open…</Button>
     <span>{viewer.status}</span>
-    <span class="ml-auto tabular-nums">{viewer.latencyMs.toFixed(1)} ms</span>
+    <span class="ml-auto tabular-nums" data-latency>
+      {viewer.latencyMs.toFixed(1)} ms ({viewer.engineMs.toFixed(1)} engine)
+    </span>
   </div>
   <canvas bind:this={canvas} class="min-h-0 w-full min-w-0 flex-1 object-contain"></canvas>
 </div>

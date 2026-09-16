@@ -15,6 +15,14 @@ export interface FrameHeader {
   format: number;
 }
 
+/** Everything after the header: rgba8 pixels for `LFRM`, JPEG bytes for `LTHM`. */
+export function frameBody(buffer: ArrayBuffer): Uint8Array<ArrayBuffer> {
+  if (buffer.byteLength < FRAME_HEADER_BYTES) {
+    throw new Error(`binary frame too short: ${buffer.byteLength} bytes`);
+  }
+  return new Uint8Array(buffer, FRAME_HEADER_BYTES);
+}
+
 export function parseFrameHeader(buffer: ArrayBuffer): FrameHeader {
   if (buffer.byteLength < FRAME_HEADER_BYTES) {
     throw new Error(`binary frame too short: ${buffer.byteLength} bytes`);

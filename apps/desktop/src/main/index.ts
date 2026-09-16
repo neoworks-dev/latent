@@ -46,6 +46,18 @@ ipcMain.handle("dialog:pickFiles", async (event): Promise<string[]> => {
   if (result.canceled) return [];
   return result.filePaths;
 });
+ipcMain.handle("dialog:pickDirectory", async (event): Promise<string | null> => {
+  const parent = BrowserWindow.fromWebContents(event.sender);
+  const options: Electron.OpenDialogOptions = {
+    title: "Import folder",
+    properties: ["openDirectory"],
+  };
+  const result = parent
+    ? await dialog.showOpenDialog(parent, options)
+    : await dialog.showOpenDialog(options);
+  if (result.canceled) return null;
+  return result.filePaths[0] ?? null;
+});
 
 function createWindow(): void {
   const window = new BrowserWindow({
