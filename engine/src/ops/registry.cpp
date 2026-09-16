@@ -77,6 +77,19 @@ OpParamSpec choice(std::string name, std::string label, std::vector<std::string>
   return spec;
 }
 
+// Free text: a generative prompt, or a model name whose legal values only the backend
+// knows. `display.kind` is `text` — no generated control holds one, so the hint says which
+// hand-built panel does.
+OpParamSpec text_field(std::string name, std::string label, std::string default_value) {
+  OpParamSpec spec;
+  spec.name = std::move(name);
+  spec.label = std::move(label);
+  spec.type = ParamType::String;
+  spec.default_value = std::move(default_value);
+  spec.display_kind = "text";
+  return spec;
+}
+
 // A point curve: the list of control points for one channel, drawn by the curve editor.
 OpParamSpec curve(std::string name, std::string label) {
   OpParamSpec spec;
@@ -217,6 +230,22 @@ std::vector<OpDefinition> build_definitions() {
                                {unipolar("amount", "Amount", 0), unipolar("size", "Size", 25),
                                 unipolar("roughness", "Roughness", 50)}));
 
+  // Generative (PROMPT.md 3.5). Both are maskable like any develop op — the mask is the
+  // region the model repaints — and both are cached rasters rather than formulas: the
+  // params below describe the *next* run, `Op.result` holds the last one's pixels. Neither
+  // renders anything until generative.run has produced a result, and neither ever re-runs
+  // on its own. `model` and `backend` are free text because the legal values are whatever
+  // the ComfyUI install has; generative.status reports them.
+  OpParamSpec seed = with_default(slider("seed", "Seed", 0, 999999, 1, ""), 0);
+  seed.type = ParamType::Integer;
+  const OpParamSpec model = text_field("model", "Model", "");
+  const OpParamSpec backend = choice("backend", "Backend", {"auto", "comfy", "stub"});
+  definitions.push_back(define("generative_fill", "generative", "Generative", 1,
+                               PipelineStage::Generative, "Generative Fill",
+                               {text_field("prompt", "Prompt", ""), model, seed, backend}));
+  definitions.push_back(define("remove", "generative", "Generative", 2, PipelineStage::Generative,
+                               "Remove", {model, seed, backend}));
+
   definitions.push_back(
       define("sharpening", "detail", "Detail", 1, PipelineStage::Sharpening, "Sharpening",
              {slider("amount", "Amount", 0, 150, 1, ""),
@@ -278,6 +307,8 @@ std::string_view type_name(ParamType type) {
       return "enum";
     case ParamType::Curve:
       return "curve";
+    case ParamType::String:
+      return "string";
   }
   return "number";
 }
@@ -312,6 +343,10 @@ nlohmann::json coerce(const OpDefinition& definition, const OpParamSpec& spec,
         value.is_string() && std::find(spec.values.begin(), spec.values.end(),
                                        value.get<std::string>()) != spec.values.end();
     if (!known) throw OpError(where + " must be one of the declared enum values");
+    return value;
+  }
+  if (spec.type == ParamType::String) {
+    if (!value.is_string()) throw OpError(where + " must be a string");
     return value;
   }
   if (spec.type == ParamType::Curve) {

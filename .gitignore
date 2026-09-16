@@ -13,3 +13,4 @@ engine/vcpkg_installed/
 .claude/scheduled_tasks.lock
 .venv/
 __pycache__/
+.task/

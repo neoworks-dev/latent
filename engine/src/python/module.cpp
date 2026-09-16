@@ -3,6 +3,7 @@
 // mutation an RPC would have made — one op-stack, one history, one sidecar.
 #include "python/module.h"
 
+#include "generative/generative.h"
 #include "ops/mask.h"
 #include "ops/registry.h"
 #include "python/json_convert.h"
@@ -175,6 +176,7 @@ struct MaskRef {
 struct MasksRef {
   int64_t photo_id = 0;
 };
+struct GenerativeRef {};
 struct DevelopRef {
   int64_t photo_id = 0;
 };
@@ -182,6 +184,25 @@ struct RenderRef {};
 struct CatalogRef {};
 
 py::object make_photo(int64_t id);
+
+// `photos=` on latent.export: a Photo, an id, a list of either, or None for the current
+// photo. Everything an agent or a script is likely to have in hand.
+std::vector<int64_t> export_photo_ids(const py::object& photos) {
+  const auto one = [](const py::handle& entry) -> int64_t {
+    if (py::isinstance<PhotoRef>(entry)) return entry.cast<PhotoRef>().id;
+    return entry.cast<int64_t>();
+  };
+  if (photos.is_none()) return {resolve_photo(0)};
+  if (py::isinstance<py::list>(photos) || py::isinstance<py::tuple>(photos)) {
+    std::vector<int64_t> ids;
+    for (const py::handle& entry : photos) {
+      ids.push_back(one(entry));
+    }
+    if (ids.empty()) throw py::value_error("export needs at least one photo");
+    return ids;
+  }
+  return {one(photos)};
+}
 
 py::list photo_list(const std::vector<PhotoSummary>& photos) {
   py::list out;
@@ -393,6 +414,28 @@ void bind_op(py::module_& module) {
             edit_stack(self.photo_id,
                        [&](Stack& stack) { require_op(stack, self.op_id).opacity = opacity; });
           })
+      // Generative ops only (PROMPT.md 3.5): the cached raster's path, the hash it was made
+      // from, and whether the stack has moved under it since. Empty on every other op.
+      .def_property_readonly("result",
+                             [](const OpRef& self) {
+                               return op_json(self.photo_id, self.op_id)
+                                   .value("result", std::string());
+                             })
+      .def_property_readonly("stale",
+                             [](const OpRef& self) {
+                               return on_engine([&] {
+                                 const Stack stack = engine().photo_stack(self.photo_id);
+                                 const Op* op = find_op(stack, self.op_id);
+                                 return op != nullptr && generative_is_stale(stack, *op);
+                               });
+                             })
+      .def("run",
+           [](const OpRef& self) {
+             // Returns the jobId. The op is untouched until the job lands, and nothing in
+             // the engine ever starts one on its own.
+             return on_engine(
+                 [&] { return engine().run_generative(self.photo_id, self.op_id); });
+           })
       .def("to_dict",
            [](const OpRef& self) { return json_to_python(op_json(self.photo_id, self.op_id)); })
       .def("__repr__", [](const OpRef& self) {
@@ -644,6 +687,15 @@ void bind_services(py::module_& module) {
              uint32_t max_size) { return mask_png(self.photo_id, op_id, component_id, max_size); },
           py::arg("op_id"), py::arg("component_id") = py::none(), py::arg("max") = 1024);
 
+  py::class_<GenerativeRef>(module, "Generative",
+                            "The generative backends: which one is selected, whether ComfyUI "
+                            "is reachable, and which graphs have their weights.")
+      .def("status", [](const GenerativeRef&) {
+        // Spawns the `comfy` CLI, so it blocks the server thread for as long as a Python
+        // process takes to start. Fine for a script or an agent; never in a slider tick.
+        return json_to_python(on_engine([] { return engine().generative_state(); }));
+      });
+
   py::class_<RenderRef>(module, "Render")
       .def(
           "preview",
@@ -734,10 +786,14 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
   bind_services(module);
   module.attr("render") = py::cast(RenderRef{});
   module.attr("catalog") = py::cast(CatalogRef{});
+  module.attr("generative") = py::cast(GenerativeRef{});
 
   // PEP 562: `latent.photo` has to be looked up per access, and a module attribute cannot
   // be a property. Everything else resolves normally and never reaches this.
   module.def("__getattr__", [](const std::string& name) -> py::object {
+    // `latent.merge` is the pure-Python submodule; importing it here is what makes
+    // `latent.merge.hdr(...)` work without an `import latent.merge` first.
+    if (name == "merge") return py::module_::import("latent.merge");
     if (name != "photo") {
       throw py::attribute_error("module 'latent' has no attribute '" + name + "'");
     }
@@ -761,6 +817,56 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
         return on_engine([&] { return engine().redo(id); });
       },
       py::arg("photo") = py::none());
+
+  module.def(
+      "export",
+      [](const py::object& photos, const std::string& output_dir, const std::string& format,
+         const std::string& color_space, const py::object& quality, const py::object& long_edge,
+         const py::object& width, const py::object& height, const py::object& dpi,
+         const py::object& sharpen, const std::string& sharpen_amount,
+         const py::object& file_name_template) {
+        nlohmann::json params;
+        params["photoIds"] = export_photo_ids(photos);
+        params["outputDir"] = output_dir;
+        params["format"] = format;
+        params["colorSpace"] = color_space;
+        if (!quality.is_none()) params["quality"] = quality.cast<int>();
+        nlohmann::json resize = nlohmann::json::object();
+        if (!long_edge.is_none()) resize["longEdge"] = long_edge.cast<int>();
+        if (!width.is_none()) resize["width"] = width.cast<int>();
+        if (!height.is_none()) resize["height"] = height.cast<int>();
+        if (!dpi.is_none()) resize["dpi"] = dpi.cast<int>();
+        if (!resize.empty()) params["resize"] = resize;
+        if (!sharpen.is_none()) {
+          params["sharpen"] = {{"target", sharpen.cast<std::string>()},
+                               {"amount", sharpen_amount}};
+        }
+        if (!file_name_template.is_none()) {
+          params["fileNameTemplate"] = file_name_template.cast<std::string>();
+        }
+        return json_to_python(on_engine([&] { return engine().start_export(params); }));
+      },
+      py::arg("photos"), py::arg("output_dir"), py::arg("format") = "jpeg",
+      py::arg("color_space") = "srgb", py::arg("quality") = py::none(),
+      py::arg("long_edge") = py::none(), py::arg("width") = py::none(),
+      py::arg("height") = py::none(), py::arg("dpi") = py::none(),
+      py::arg("sharpen") = py::none(), py::arg("sharpen_amount") = "standard",
+      py::arg("file_name_template") = py::none(),
+      "Queue a batch export and return {jobId, total, files}. `photos` is a Photo, an id, "
+      "a list of either, or None for the current photo. The files are written while the "
+      "job runs; watch job.progress kind 'export' for its state.");
+
+  // Photo Merge. The keyword surface lives in engine/python/latent/merge.py, because the
+  // three merges and their preview differ only in which keys this dict carries.
+  module.def(
+      "_start_merge",
+      [](const py::dict& request) {
+        const nlohmann::json params = python_to_json(request);
+        return json_to_python(on_engine([&] { return engine().start_merge(params); }));
+      },
+      py::arg("request"),
+      "Queue a merge and return {jobId}. `request` is the merge.* params plus `kind` and "
+      "`preview`; the merged photo's id arrives on the job's last job.progress.");
 
   // The underscored entry points are what engine/python/latent/mcp_server.py calls; they
   // take plain ids because an MCP client only ever has ids.

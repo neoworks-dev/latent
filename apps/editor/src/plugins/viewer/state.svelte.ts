@@ -1,5 +1,21 @@
-import type { EngineClient, EngineFrame, FrameSink, ViewerService } from "@latent/contracts";
-import type { Mask, Op, OpUpdateParams, StackGetResult } from "@latent/protocol";
+import {
+  type EngineClient,
+  type EngineFrame,
+  FIT_VIEWPORT,
+  type FrameSink,
+  type GeometryMode,
+  type GeometryView,
+  IDENTITY_IMAGE_TRANSFORM,
+  type ImageTransform,
+  oneToOneScale,
+  panViewport,
+  type ViewerService,
+  type ViewportFrame,
+  type ViewportState,
+  zoomLabel,
+  zoomViewport,
+} from "@latent/contracts";
+import type { Mask, Op, OpUpdateParams, StackGetResult, ViewRenderParams } from "@latent/protocol";
 import { FrameTimingLog } from "../../lib/engine/frame-timing";
 import { ViewerOverlayState } from "./overlay.svelte";
 
@@ -20,7 +36,7 @@ interface PendingAdd {
  * The only local state is in-flight bookkeeping — one render and one `op.update` at a
  * time, with the newest value replacing whatever is queued behind them.
  */
-export class ViewerState implements ViewerService {
+export class ViewerState implements ViewerService, GeometryView {
   photoId = $state<number | null>(null);
   viewId = $state<number | null>(null);
   stack = $state<Op[]>([]);
@@ -32,7 +48,31 @@ export class ViewerState implements ViewerService {
   engineMs = $state(0);
   /** Which op the Masks and Layers columns are pointed at. View state, not edit state. */
   selectedOpId = $state<string | null>(null);
+  /**
+   * How the frames are rendered: `full` is the crop tool's uncropped image. View state —
+   * it goes on the render call, never into the stack. Deliberately *not* `$state`: the
+   * crop column sets it from an `$effect` on mount, and a signal read by the same effect
+   * that writes it re-runs forever (effect_update_depth_exceeded).
+   */
+  geometry: GeometryMode = "stack";
+  /**
+   * Zoom and pan. View state as well: it rides on `view.render`, the engine holds it per
+   * view, and nothing about it reaches the stack or the sidecar.
+   */
+  viewport = $state<ViewportState>(FIT_VIEWPORT);
+  /** `Fit`, `100%`, `250%` — the status bar's readout. */
+  zoom = $state("Fit");
   readonly overlay = new ViewerOverlayState();
+
+  // The last frame the engine answered about, which is what a zoom is computed against.
+  private frame: ViewportFrame = {
+    contentRect: [0, 0, 1, 1],
+    frameWidth: 1,
+    frameHeight: 1,
+    transform: IDENTITY_IMAGE_TRANSFORM,
+    scale: 1,
+  };
+  private photoWidth = 0;
 
   private renderWidth = 1;
   private renderHeight = 1;
@@ -132,6 +172,10 @@ export class ViewerState implements ViewerService {
     await this.engine.whenOpen();
     const photo = await this.engine.call("photo.open", { path });
     this.photoId = photo.photoId;
+    this.photoWidth = photo.width;
+    // A new photo is a new frame: whatever the last one was zoomed to means nothing here.
+    this.viewport = FIT_VIEWPORT;
+    this.zoom = "Fit";
     // Switching photos: the previous view is the engine's to free, not ours to leak.
     const previousView = this.viewId;
     if (previousView !== null) await this.engine.call("view.close", { viewId: previousView });
@@ -155,6 +199,65 @@ export class ViewerState implements ViewerService {
     this.requestRender();
   }
 
+  /**
+   * Zoom about a point of the *canvas*, in its own CSS pixels — the wheel's cursor, or the
+   * middle of the box for a keystroke. The frame is device pixels, so the anchor is scaled
+   * by the same ratio the canvas is drawn at.
+   */
+  zoomTo(scale: number, anchorX?: number, anchorY?: number): void {
+    const x = anchorX === undefined ? this.frame.frameWidth / 2 : anchorX * devicePixelRatio;
+    const y = anchorY === undefined ? this.frame.frameHeight / 2 : anchorY * devicePixelRatio;
+    this.setViewport(zoomViewport(this.frame, scale, x, y));
+  }
+
+  /** A step of the wheel or of `+`/`-`: a ratio, so every zoom level feels the same. */
+  zoomBy(factor: number, anchorX?: number, anchorY?: number): void {
+    this.zoomTo(this.viewport.scale * factor, anchorX, anchorY);
+  }
+
+  /** Fit ↔ 1:1, what `Z` toggles. */
+  toggleZoom(anchorX?: number, anchorY?: number): void {
+    const oneToOne = oneToOneScale(this.frame, this.photoWidth);
+    const fitted = this.viewport.fit || this.viewport.scale < oneToOne - 0.001;
+    this.zoomTo(fitted ? oneToOne : 1, anchorX, anchorY);
+  }
+
+  zoomToFit(): void {
+    this.setViewport(FIT_VIEWPORT);
+  }
+
+  zoomToActual(): void {
+    this.zoomTo(oneToOneScale(this.frame, this.photoWidth));
+  }
+
+  /** A pan drag, in canvas CSS pixels: the picture follows the pointer. */
+  panBy(dx: number, dy: number): void {
+    this.setViewport(
+      panViewport(this.frame, this.viewport, dx * devicePixelRatio, dy * devicePixelRatio),
+    );
+  }
+
+  private setViewport(next: ViewportState): void {
+    const current = this.viewport;
+    if (
+      next.fit === current.fit &&
+      next.scale === current.scale &&
+      next.centerX === current.centerX &&
+      next.centerY === current.centerY
+    ) {
+      return;
+    }
+    this.viewport = next;
+    this.requestRender();
+  }
+
+  /** The crop tool's switch: the next frames show the whole image, or the cropped one. */
+  setGeometry(mode: GeometryMode): void {
+    if (mode === this.geometry) return;
+    this.geometry = mode;
+    this.requestRender();
+  }
+
   requestRender(): void {
     if (this.viewId === null) return;
     if (this.renderInFlight) {
@@ -163,17 +266,51 @@ export class ViewerState implements ViewerService {
     }
     this.renderInFlight = true;
     this.renderSentAt = performance.now();
+    const params: ViewRenderParams = {
+      viewId: this.viewId,
+      width: this.renderWidth,
+      height: this.renderHeight,
+    };
+    // Left out unless a tool asked for it, so an engine older than the field still answers.
+    if (this.geometry !== "stack") params.geometry = this.geometry;
+    // Always sent, because the field is sticky per view: leaving it out means "stay where
+    // you are", so Ctrl+0 has to say `scale: 1` rather than say nothing. A scale of 1 with
+    // no centre is fit, which is what every render did before the field existed.
+    params.viewport = this.viewport.fit
+      ? { scale: 1 }
+      : {
+          scale: this.viewport.scale,
+          centerX: this.viewport.centerX,
+          centerY: this.viewport.centerY,
+        };
     void this.engine
-      .call("view.render", {
-        viewId: this.viewId,
-        width: this.renderWidth,
-        height: this.renderHeight,
-      })
+      .call("view.render", params)
       .then((result) => {
         this.engineMs = result.renderMs + result.readbackMs;
-        // Where the photo sits inside the frame the engine just sent. An engine that does
-        // not answer with one leaves the overlay on its own letterbox of the frame.
+        // Where the photo sits inside the frame the engine just sent, and how to get from
+        // a mask coordinate to a frame pixel. An engine that answers with neither leaves
+        // the overlay on its own letterbox of the frame, which is the uncropped case.
         this.overlay.setContentRect(result.contentRect ?? null);
+        const transform = (result.imageTransform ?? null) as ImageTransform | null;
+        this.overlay.setImageTransform(transform);
+        this.frame = {
+          contentRect: result.contentRect ?? [0, 0, result.width, result.height],
+          frameWidth: result.width,
+          frameHeight: result.height,
+          transform: transform ?? IDENTITY_IMAGE_TRANSFORM,
+          scale: result.viewport?.scale ?? 1,
+        };
+        // The engine clamps the pan and echoes what it used; showing what was asked for
+        // instead would leave the readout a frame ahead of the picture.
+        if (result.viewport) {
+          this.viewport = {
+            scale: result.viewport.scale ?? 1,
+            centerX: result.viewport.centerX ?? 0.5,
+            centerY: result.viewport.centerY ?? 0.5,
+            fit: result.viewport.fit ?? true,
+          };
+        }
+        this.zoom = zoomLabel(this.viewport, oneToOneScale(this.frame, this.photoWidth));
       })
       .catch((error: Error) => {
         this.status = error.message;

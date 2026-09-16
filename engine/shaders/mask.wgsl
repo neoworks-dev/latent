@@ -1,11 +1,16 @@
 // One fragment pass per mask component, writing an r8unorm raster the op passes sample
 // (PROMPT.md 3.7). Kind numbers must match MaskPass in src/pipeline/renderer.cpp.
 //
-// Coordinates. `uv` is normalised over the *content rect* — the image as the view shows
-// it after crop, rotate and transform — so what the user paints on is what the mask
-// covers, and mask.preview's raster maps 1:1 onto the frame. Shapes are computed in
-// aspect-corrected space so a radial is round and a gradient's iso-lines are square to
-// the drag.
+// Coordinates. Every shape is evaluated in *image space*: the view pixel this invocation
+// owns is carried back through the geometry stage (crop, straighten, rotate, flip, the
+// Transform sliders, lens distortion and the viewport's zoom and pan) into 0..1 over the
+// uncropped photo, and the shape is asked about that point. A mask therefore stays on the
+// subject when the geometry moves afterwards, which is what Lightroom does. The output is
+// still a view-sized raster, so mask.preview's frame maps 1:1 onto the viewer's canvas.
+//
+// Shapes are computed in aspect-corrected image space so a radial is round on the photo
+// and a gradient's iso-lines are square to the drag; feather is in the same units, which
+// means it scales with the image and not with the window.
 //
 //   1 linear     v0 = start.xy, end.xy
 //   2 radial     v0 = centre.xy, radius.xy; v1.x = angle in radians
@@ -36,12 +41,41 @@ struct MaskParams {
   invert: u32,
   feather: f32,  // 0..1
   opacity: f32,  // 0..1
+  m0: vec4f,     // rows of the view pixel -> working frame homography, xyz used
+  m1: vec4f,
+  m2: vec4f,
+  geom: vec4f,   // x: lens distortion k, y: working aspect, z: quadrant, w: image aspect
+  flip: vec4f,   // xy: -1 mirrors that axis of the working frame
   v: array<vec4f, 6>,
 };
 
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> mask: MaskParams;
 @group(0) @binding(2) var raster: texture_2d<f32>;
+
+// View pixel -> image 0..1, the same chain downscale.wgsl walks to find its source texel:
+// the homography, then the radial distortion term, then the quadrant and the mirrors.
+// Kept in step with it by hand; both read the geometry ops through ops/geometry.cpp.
+fn to_image(pos: vec2f) -> vec2f {
+  let h = vec3f(pos, 1.0);
+  let w = dot(mask.m2.xyz, h);
+  if (abs(w) < 1e-6) { return vec2f(-1.0, -1.0); }
+  var working = vec2f(dot(mask.m0.xyz, h), dot(mask.m1.xyz, h)) / w;
+
+  let k = mask.geom.x;
+  if (k != 0.0) {
+    let aspect = vec2f(mask.geom.y, 1.0);
+    let norm = 1.0 / length(aspect);
+    let centred = (working - 0.5) * 2.0 * aspect * norm;
+    working = (centred * (1.0 + k * dot(centred, centred))) / (2.0 * aspect * norm) + 0.5;
+  }
+
+  let quadrant = i32(mask.geom.z + 0.5);
+  if (quadrant == 1) { working = vec2f(working.y, 1.0 - working.x); }
+  else if (quadrant == 2) { working = vec2f(1.0 - working.x, 1.0 - working.y); }
+  else if (quadrant == 3) { working = vec2f(1.0 - working.y, working.x); }
+  return select(working, 1.0 - working, mask.flip.xy < vec2f(0.0));
+}
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
@@ -97,8 +131,9 @@ fn blurred_raster(uv: vec2f) -> f32 {
 }
 
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
-  let uv = (in.pos.xy - mask.origin) / max(mask.size, vec2f(1.0));
-  let aspect = mask.size.x / max(mask.size.y, 1.0);
+  // Image space, not the frame: `uv` is where this view pixel sits on the uncropped photo.
+  let uv = to_image(in.pos.xy);
+  let aspect = mask.geom.w;
   let point = vec2f(uv.x * aspect, uv.y);
   let feather = max(mask.feather, 0.001);
   var value = 0.0;
@@ -147,7 +182,7 @@ fn blurred_raster(uv: vec2f) -> f32 {
         value = 1.0 - smoothstep(max(range - edge, 0.0), range, nearest);
       }
     }
-    // raster: a brush stroke list or a model's output, already in content space.
+    // raster: a brush stroke list or a model's output, both stored in image space.
     case 5u: {
       value = blurred_raster(uv);
     }

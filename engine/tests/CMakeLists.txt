@@ -1,6 +1,8 @@
-add_executable(latent_tests ai_test.cpp catalog_test.cpp curve_test.cpp image_test.cpp
-  mask_test.cpp registry_test.cpp sidecar_test.cpp stack_test.cpp)
-target_link_libraries(latent_tests PRIVATE latent_ops latent_catalog Catch2::Catch2WithMain)
+add_executable(latent_tests ai_test.cpp catalog_test.cpp curve_test.cpp generative_test.cpp
+  image_test.cpp mask_space_test.cpp mask_test.cpp merge_test.cpp registry_test.cpp
+  sidecar_test.cpp stack_test.cpp)
+target_link_libraries(latent_tests PRIVATE latent_ops latent_catalog latent_merge
+  latent_generative Catch2::Catch2WithMain)
 target_compile_definitions(latent_tests PRIVATE
   LATENT_TEST_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 # libonnxruntime.so is a prebuilt tarball under third_party, not on the loader path.
@@ -8,7 +10,8 @@ set_target_properties(latent_tests PROPERTIES BUILD_RPATH "${ORT_LIB_DIR}")
 
 # The render tests need a device, so they are their own binary: latent_tests still runs on
 # a machine without an adapter.
-add_executable(latent_render_tests render_test.cpp mask_render_test.cpp)
+add_executable(latent_render_tests render_test.cpp mask_render_test.cpp export_test.cpp
+  generative_render_test.cpp)
 target_link_libraries(latent_render_tests PRIVATE latent_core Catch2::Catch2WithMain)
 set_target_properties(latent_render_tests PROPERTIES BUILD_RPATH "${ORT_LIB_DIR}")
 

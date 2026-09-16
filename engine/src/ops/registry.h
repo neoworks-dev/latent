@@ -16,7 +16,10 @@ namespace latent {
 
 // Curve params carry an array of control points, `[{"x": 0, "y": 0}, …]`, both axes 0..1,
 // ascending in x. An empty array is the identity curve. See ops/curve.h.
-enum class ParamType { Number, Integer, Boolean, Enum, Curve };
+// String carries free text a generated panel cannot hold — a generative prompt, a model
+// name the engine only learns from the backend at runtime. `ops.describe` reports it as
+// `"string"` and the hand-built Generative panel draws it.
+enum class ParamType { Number, Integer, Boolean, Enum, Curve, String };
 
 struct OpParamSpec {
   std::string name;
@@ -42,6 +45,12 @@ enum class PipelineStage : int {
   Geometry = 10,
   Optics = 20,
   NoiseReduction = 30,
+  // Generative results are composited before the tone and colour passes, so the develop
+  // settings apply to the generated pixels as well as to everything around them — a patch
+  // that kept the exposure it was generated at would show as a rectangle the first time a
+  // slider moved. The crop the backend was handed is rendered through exactly the passes
+  // below this line (PROMPT.md 3.5, generative_input_stack in src/generative/).
+  Generative = 35,
   Tone = 40,
   Color = 50,
   Effects = 60,

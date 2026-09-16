@@ -1,0 +1,142 @@
+{
+ "156": {
+  "class_type": "LoadImage",
+  "_meta": {
+   "title": "load crop.png"
+  },
+  "inputs": {
+   "image": "inputs/crop.png"
+  }
+ },
+ "207": {
+  "class_type": "LoadImage",
+  "_meta": {
+   "title": "load mask.png"
+  },
+  "inputs": {
+   "image": "inputs/mask.png"
+  }
+ },
+ "258": {
+  "class_type": "ImageToMask",
+  "_meta": {
+   "title": "\u2192 mask"
+  },
+  "inputs": {
+   "image": [
+    "207",
+    0
+   ],
+   "channel": "red"
+  }
+ },
+ "101": {
+  "class_type": "CheckpointLoaderSimple",
+  "inputs": {
+   "ckpt_name": "RealVisXL_V5.0_fp16.safetensors"
+  }
+ },
+ "102": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "empty background, seamless continuation of the surrounding scene, nothing there",
+   "clip": [
+    "101",
+    1
+   ]
+  }
+ },
+ "103": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "object, subject, person, text, watermark, blurry, low quality, artifacts",
+   "clip": [
+    "101",
+    1
+   ]
+  }
+ },
+ "104": {
+  "class_type": "InpaintModelConditioning",
+  "inputs": {
+   "noise_mask": true,
+   "positive": [
+    "102",
+    0
+   ],
+   "negative": [
+    "103",
+    0
+   ],
+   "vae": [
+    "101",
+    2
+   ],
+   "pixels": [
+    "156",
+    0
+   ],
+   "mask": [
+    "258",
+    0
+   ]
+  }
+ },
+ "105": {
+  "class_type": "KSampler",
+  "inputs": {
+   "seed": 0,
+   "steps": 25,
+   "cfg": 5.0,
+   "sampler_name": "dpmpp_2m",
+   "scheduler": "karras",
+   "denoise": 1.0,
+   "model": [
+    "101",
+    0
+   ],
+   "positive": [
+    "104",
+    0
+   ],
+   "negative": [
+    "104",
+    1
+   ],
+   "latent_image": [
+    "104",
+    2
+   ]
+  }
+ },
+ "106": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "105",
+    0
+   ],
+   "vae": [
+    "101",
+    2
+   ]
+  }
+ },
+ "309": {
+  "class_type": "SaveImage",
+  "_meta": {
+   "title": "save composed final (image)"
+  },
+  "inputs": {
+   "images": [
+    "106",
+    0
+   ],
+   "filename_prefix": "outputs/latent-remove"
+  }
+ },
+ "_meta": {
+  "schema": "compose/1",
+  "blueprint": "engine/workflows/remove/blueprint.yaml"
+ }
+}

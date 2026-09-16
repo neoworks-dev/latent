@@ -31,11 +31,21 @@ export interface MethodMap {
   "catalog.thumbnail": { params: G.CatalogThumbnailParams; result: G.CatalogThumbnailResult };
   "mask.preview": { params: G.MaskPreviewParams; result: G.MaskPreviewResult };
   "mask.detect": { params: G.MaskDetectParams; result: G.MaskDetectResult };
+  "generative.run": { params: G.GenerativeRunParams; result: G.GenerativeRunResult };
+  "generative.status": { params: G.GenerativeStatusParams; result: G.GenerativeStatusResult };
   // MaskStrokeResult is a `$ref` alias of StackGetResult; the generator dedupes it.
   "mask.stroke": { params: G.MaskStrokeParams; result: G.StackGetResult };
+  // Returns a jobId at once; the files land while job.progress kind `export` ticks.
+  "export.run": { params: G.ExportRunParams; result: G.ExportRunResult };
   "catalog.thumbnails": { params: G.CatalogThumbnailsParams; result: G.CatalogThumbnailsResult };
   "catalog.remove": { params: G.CatalogRemoveParams; result: G.CatalogRemoveResult };
   "job.cancel": { params: G.JobCancelParams; result: G.JobCancelResult };
+  // All four answer `{ jobId }`; the merged photo's id arrives on the job's last
+  // job.progress, in `result`, because the merge itself takes minutes.
+  "merge.hdr": { params: G.MergeHdrParams; result: G.MergeHdrResult };
+  "merge.panorama": { params: G.MergePanoramaParams; result: G.MergePanoramaResult };
+  "merge.hdrPanorama": { params: G.MergeHdrPanoramaParams; result: G.MergeHdrPanoramaResult };
+  "merge.preview": { params: G.MergePreviewParams; result: G.MergePreviewResult };
 }
 
 export interface NotificationMap {
@@ -79,9 +89,16 @@ export const methods: readonly MethodName[] = [
   "catalog.thumbnails",
   "catalog.remove",
   "job.cancel",
+  "merge.hdr",
+  "merge.panorama",
+  "merge.hdrPanorama",
+  "merge.preview",
   "mask.preview",
   "mask.detect",
+  "generative.run",
+  "generative.status",
   "mask.stroke",
+  "export.run",
 ];
 
 export const notifications: readonly NotificationName[] = [

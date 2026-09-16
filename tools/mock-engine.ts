@@ -23,10 +23,26 @@ import type {
 } from "@latent/protocol";
 import { FRAME_HEADER_BYTES } from "@latent/protocol";
 import type { ServerWebSocket } from "bun";
+import { applyGeometry, contentRectOf, type ContentRect, geometryOf } from "./mock-crop";
 import { MockCatalog, scanRawFiles } from "./mock-catalog";
 import { applyLut, curveTable } from "./mock-curve";
 import {
+  annotateStale,
+  generativeDefinitions,
+  generativeStatus,
+  inputHash,
+  insideResult,
+  isGenerativeOp,
+  resultRect,
+  resultTint,
+} from "./mock-generative";
+import {
+  applyViewport,
   combineMask,
+  FIT,
+  geometryMap,
+  type MockGeometryMap,
+  type MockViewport,
   coverageOf,
   isAiKind,
   maskFrame,
@@ -37,6 +53,8 @@ import {
   type BrushSegment,
   type ImageSampler,
 } from "./mock-masks";
+import { MockExport } from "./mock-export";
+import { MockMerge } from "./mock-merge";
 
 /** The layer half of `op.add` / `op.update`: a whole mask (or `null`) and an opacity. */
 interface LayerWrite {
@@ -271,6 +289,7 @@ export const opDefinitions: OpDefinition[] = [
     bipolar("offsetX", "X offset"),
     bipolar("offsetY", "Y offset"),
   ]),
+  ...generativeDefinitions,
 ];
 
 /**
@@ -295,11 +314,21 @@ export class PhotoState {
 
   snapshot(): StackGetResult {
     return {
-      stack: this.stack,
+      // `stale` is derived from the ops under each generative one, so it is added on the
+      // way out and never stored, exactly as the engine does it.
+      stack: annotateStale(this.stack),
       revision: this.revision,
       canUndo: this.canUndo,
       canRedo: this.canRedo,
     };
+  }
+
+  /** The engine-owned fields a finished generative job writes onto its op. */
+  finishGenerative(opId: string, fields: Partial<Op>): void {
+    this.commit(
+      this.stack.map((entry) => (entry.id === opId ? { ...entry, ...fields } : entry)),
+      false,
+    );
   }
 
   addOp(
@@ -480,6 +509,9 @@ export function renderFrame(
   // The curve is the last of the tone stage, after the light sliders, as in the engine's
   // pipeline. Its tables are built once per frame, not once per pixel.
   const curve = curveTable(paramsOf(stack, "tone_curve"));
+  // Generative results composite before the tone stage, so the develop settings apply to
+  // them too — the same order the engine's PipelineStage::Generative gives them.
+  const generative = stack.filter((op) => op.enabled && isGenerativeOp(op.op) && op.result);
 
   const buffer = new ArrayBuffer(FRAME_HEADER_BYTES + width * height * 4);
   const header = new DataView(buffer);
@@ -499,6 +531,13 @@ export function renderFrame(
     for (let x = 0; x < width; x++) {
       const u = x / width;
       const base = baseColor(u, v, gridAt(x, y));
+      for (const op of generative) {
+        if (!insideResult(op, u, v)) continue;
+        const tint = resultTint(op);
+        base[0] = 0.5 * tint[0];
+        base[1] = 0.5 * tint[1];
+        base[2] = 0.5 * tint[2];
+      }
       let r = base[0] * warm;
       let g = base[1];
       let b = base[2] * cool;
@@ -529,6 +568,8 @@ interface View {
   width: number;
   height: number;
   seq: number;
+  /** Zoom and pan, sticky per view exactly as in the engine. */
+  viewport: MockViewport;
 }
 
 interface RpcRequest {
@@ -669,6 +710,25 @@ export class MockEngine {
   private nextRunId = 1;
   /** `seq` of the next LMSK frame; it counts mask previews the way LFRM counts renders. */
   private maskSeq = 0;
+  /**
+   * `http://127.0.0.1:<port>`, set by `startMockEngine` once the listener bound. A merge
+   * preview's `previewUrl` points back at this server, so the mock has to know its own
+   * address the way `latentd` does.
+   */
+  baseUrl = "";
+  private readonly merges = new MockMerge({
+    catalog: this.catalog,
+    broadcast: (method, params) => this.broadcast(method, params),
+    startJob: () => this.startJob(),
+    timer: (callback, delayMs) => this.timer(callback, delayMs),
+    origin: () => this.baseUrl,
+  });
+  private readonly exports = new MockExport({
+    broadcast: (method, params) => this.broadcast(method, params),
+    startJob: () => this.startJob(),
+    timer: (callback, delayMs) => this.timer(callback, delayMs),
+    sourcePath: (photoId) => this.sourcePath(photoId),
+  });
 
   constructor(private readonly broadcast: Broadcast) {}
 
@@ -676,6 +736,11 @@ export class MockEngine {
   stop(): void {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
+  }
+
+  /** The merge preview PNG behind a `/preview/<name>.png` request, if this mock made it. */
+  previewPng(pathname: string): Uint8Array<ArrayBuffer> | undefined {
+    return this.merges.servePreview(pathname);
   }
 
   photo(photoId: number): PhotoState {
@@ -727,6 +792,7 @@ export class MockEngine {
         width: Number(params.width),
         height: Number(params.height),
         seq: 0,
+        viewport: FIT,
       });
       return { result: { viewId } };
     }
@@ -756,20 +822,37 @@ export class MockEngine {
     if (method === "job.cancel")
       return { result: { cancelled: this.cancelJob(Number(params.jobId)) } };
     if (method.startsWith("catalog.")) return this.handleCatalog(method, params);
+    if (method === "generative.status") return { result: generativeStatus() };
+    if (method === "generative.run") {
+      const photoId = Number(params.photoId);
+      return {
+        result: { jobId: this.startGenerative(photoId, idOf(params.opId)) },
+        changed: photoId,
+      };
+    }
     if (method.startsWith("mask.")) return this.handleMask(method, params);
+    if (method.startsWith("merge.")) return this.merges.handle(method, params);
+    if (method.startsWith("export.")) return this.exports.handle(method, params);
     const photoId = Number(params.photoId);
     const result = this.handleStack(method, params);
     if (this.isCommit(method, params)) this.markEdited(photoId);
     return { result, changed: photoId };
   }
 
-  render(viewId: number): {
+  /** `geometry` is view.render's: "full" renders the image uncropped, as the crop tool asks. */
+  render(
+    viewId: number,
+    geometry: "stack" | "full" = "stack",
+  ): {
     frame: ArrayBuffer;
     renderMs: number;
     seq: number;
     width: number;
     height: number;
+    contentRect: ContentRect;
     revision: number;
+    map: MockGeometryMap;
+    viewport: MockViewport;
   } {
     const view = this.views.get(viewId);
     if (!view) throw new Error(`unknown viewId ${viewId}`);
@@ -777,12 +860,23 @@ export class MockEngine {
     const photo = this.photo(view.photoId);
     const started = performance.now();
     const frame = renderFrame(view.width, view.height, view.seq, viewId, photo.stack);
+    // The ops move pixels after the frame is painted rather than while it is: the mock's
+    // renderer is a per-pixel loop already, and one more pass keeps the two apart.
+    const resolved = geometryOf(photo.stack, geometry === "full");
+    const fitted = applyGeometry(frame, FRAME_HEADER_BYTES, view.width, view.height, resolved);
+    // Zoom and pan are one more scale of the picture that is now in the buffer, and the
+    // matrix that goes out carries both halves (tools/mock-masks.ts).
+    const map = geometryMap(resolved, fitted, view.width, view.height, view.viewport);
+    applyViewport(frame, FRAME_HEADER_BYTES, view.width, view.height, fitted, map);
     return {
       frame,
       renderMs: performance.now() - started,
       seq: view.seq,
       width: view.width,
       height: view.height,
+      contentRect: map.content,
+      map,
+      viewport: view.viewport,
       // The state these pixels came from: a client compares it with the revision of the
       // last stack.changed to know whether its canvas is current.
       revision: photo.revision,
@@ -794,6 +888,21 @@ export class MockEngine {
     if (!view || !width || !height) return;
     view.width = width;
     view.height = height;
+  }
+
+  /** `view.render`'s viewport: sticky per view, absent leaves it where it was. */
+  setViewport(viewId: number, given: unknown): void {
+    const view = this.views.get(viewId);
+    if (!view || !given || typeof given !== "object") return;
+    const fields = given as Record<string, unknown>;
+    const scale = Math.min(32, Math.max(1, numberOf(fields.scale, 1)));
+    const hasCentre = fields.centerX !== undefined && fields.centerY !== undefined;
+    view.viewport = {
+      scale,
+      centerX: numberOf(fields.centerX, 0.5),
+      centerY: numberOf(fields.centerY, 0.5),
+      fit: !hasCentre || scale <= 1,
+    };
   }
 
   private photoState(photoId: number): PhotoState {
@@ -885,20 +994,31 @@ export class MockEngine {
       const viewId = params.viewId === undefined ? 0 : Number(params.viewId);
       const mask = this.previewMask(photo, opId, componentId);
       const size = this.previewSize(photoId, viewId);
+      // Resolved at the raster's own grid, not the view's: `previewSize` caps the long
+      // edge, and the bytes below are written at that size.
+      const resolved = geometryOf(photo.stack, false);
+      const fitted = contentRectOf(resolved, size.width, size.height);
+      const map = geometryMap(
+        resolved,
+        fitted,
+        size.width,
+        size.height,
+        this.views.get(viewId)?.viewport ?? FIT,
+      );
       const bytes = combineMask(
         mask,
         size.width,
         size.height,
         imageSampler(size.width, size.height),
+        map,
       );
       this.maskSeq += 1;
       return {
         result: {
           width: size.width,
           height: size.height,
-          // `combineMask` rasterises over the whole raster, so as with LFRM the mock has
-          // no letterbox and the content rect is the frame.
-          contentRect: [0, 0, size.width, size.height],
+          contentRect: map.content,
+          imageTransform: map.imageToView,
           coverage: coverageOf(bytes),
         },
         frames: [maskFrame(size.width, size.height, this.maskSeq, viewId, bytes)],
@@ -1038,6 +1158,66 @@ export class MockEngine {
   }
 
   /**
+   * One generative run: a few `job.progress` ticks with kind `generative`, then the op
+   * fields a real backend's answer would have written — `result`, `inputHash`,
+   * `resultRect`. No pixels move over the wire; the frame renderer tints the rect, and the
+   * stale badge follows from the hash the way it does in the engine (PROMPT.md 3.5).
+   */
+  private startGenerative(photoId: number, opId: string): number {
+    const photo = this.photo(photoId);
+    const op = photo.stack.find((entry) => entry.id === opId);
+    if (!op) throw new Error(`unknown opId ${opId}`);
+    if (!isGenerativeOp(op.op)) throw new Error(`op ${opId} is a ${op.op}, not a generative op`);
+    if ((op.mask?.components.length ?? 0) === 0) {
+      throw new Error("a generative op needs a mask: it is the region to repaint");
+    }
+
+    const jobId = this.nextJobId++;
+    const job: Job = { cancelled: false, finished: false };
+    this.jobs.set(jobId, job);
+    const hash = inputHash(photo.stack, opId);
+    const rect = resultRect(op);
+    const total = 5;
+    let done = 0;
+    const tick = (): void => {
+      done += 1;
+      const finished = done >= total || job.cancelled;
+      this.broadcast("job.progress", {
+        jobId,
+        kind: "generative",
+        done,
+        total,
+        finished,
+        state: finished ? finishState(job.cancelled, false) : "running",
+        message: job.cancelled ? "cancelled" : "mock-tint",
+      });
+      if (!finished) {
+        this.timer(tick, 120);
+        return;
+      }
+      job.finished = true;
+      // A cancelled run leaves the last result exactly as it was — that is the whole point
+      // of a cached raster.
+      if (!job.cancelled) {
+        photo.finishGenerative(opId, {
+          result: `generative/${opId}.png`,
+          inputHash: hash,
+          resultRect: rect,
+        });
+        this.markEdited(photoId);
+      }
+      this.broadcast("stack.changed", {
+        ...photo.snapshot(),
+        photoId,
+        source: "external",
+        client: "external",
+      });
+    };
+    this.timer(tick, 120);
+    return jobId;
+  }
+
+  /**
    * Walks the paths for raws and registers them over a few ticks, so the UI sees a real
    * job.progress sequence instead of one instant answer. Returns before any of it runs.
    * The thumbnail job is named in the same answer and reported when the import ends —
@@ -1116,6 +1296,20 @@ export class MockEngine {
     }
     this.timer(tick, 60);
     return { jobId, thumbnailJobId };
+  }
+
+  /** A cancellable job id, for work that runs outside this class (Photo Merge). */
+  /** Where an exported file's `{name}` comes from. An id nobody imported has none. */
+  private sourcePath(photoId: number): string {
+    if (!this.catalog.has(photoId)) return "";
+    return this.catalog.photo(photoId).path;
+  }
+
+  private startJob(): { jobId: number; job: Job } {
+    const jobId = this.nextJobId++;
+    const job: Job = { cancelled: false, finished: false };
+    this.jobs.set(jobId, job);
+    return { jobId, job };
   }
 
   /** A job that is unknown or already finished cannot be cancelled — that is not an error. */
@@ -1248,6 +1442,11 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
     hostname: "127.0.0.1",
     fetch(request, bunServer) {
       if (bunServer.upgrade(request)) return undefined;
+      // The one thing this server answers over HTTP: a merge preview. `previewUrl` is an
+      // absolute URL a renderer puts straight in an <img src>, which a file:// path could
+      // not be — so the engine that wrote the PNG is also the one that serves it.
+      const png = engine.previewPng(new URL(request.url).pathname);
+      if (png) return new Response(png, { headers: { "content-type": "image/png" } });
       return new Response("latent mock engine: websocket only", { status: 426 });
     },
     websocket: {
@@ -1268,16 +1467,18 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
               params.width as number | undefined,
               params.height as number | undefined,
             );
-            const rendered = engine.render(viewId);
+            engine.setViewport(viewId, params.viewport);
+            const rendered = engine.render(viewId, params.geometry === "full" ? "full" : "stack");
             socket.send(new Uint8Array(rendered.frame));
             reply(socket, request.id, {
               seq: rendered.seq,
               width: rendered.width,
               height: rendered.height,
-              // `renderFrame` paints the whole buffer, so the mock never letterboxes: the
-              // content rect is the frame. The field is still sent, so the UI exercises
-              // the engine's path and not only its fallback.
-              contentRect: [0, 0, rendered.width, rendered.height],
+              // Where the geometry ops and the viewport put the image inside that buffer
+              // (tools/mock-crop.ts, tools/mock-masks.ts).
+              contentRect: rendered.contentRect,
+              imageTransform: rendered.map.imageToView,
+              viewport: rendered.viewport,
               renderMs: rendered.renderMs,
               readbackMs: 0,
               revision: rendered.revision,
@@ -1312,6 +1513,7 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
 
   const listeningPort = server.port;
   if (listeningPort === undefined) throw new Error("mock engine did not bind a TCP port");
+  engine.baseUrl = `http://127.0.0.1:${listeningPort}`;
   return {
     port: listeningPort,
     stop: () => {

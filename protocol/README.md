@@ -51,7 +51,7 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `history.undo` / `history.redo` | `photoId` | as `stack.get` | Cursor over snapshots, never a pop |
 | `view.open` | `photoId`, `width`, `height` | `viewId` | One canvas, one proxy size |
 | `view.close` | `viewId` | — | |
-| `view.render` | `viewId`, `width?`, `height?` | `seq`, size, `contentRect?`, `renderMs`, `readbackMs`, `revision` | Sends one `LFRM` frame first |
+| `view.render` | `viewId`, `width?`, `height?`, `geometry?`, `viewport?` | `seq`, size, `contentRect?`, `imageTransform?`, `viewport?`, `renderMs`, `readbackMs`, `revision` | Sends one `LFRM` frame first. `geometry: "full"` renders the uncropped image for the crop tool; `viewport` is zoom and pan |
 | `python.run` | `code`, `photoId?`, `timeoutMs?` | `ok`, `stdout`, `stderr`, `durationMs`, `value?`, `runId?` | `timeoutMs` default 30000 |
 | `catalog.import` | `paths`, `recursive?` | `jobId`, `thumbnailJobId?` | `recursive` default **true**; progress via `job.progress` |
 | `catalog.list` | filters below | `photos`, `total` | |
@@ -65,9 +65,98 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `catalog.thumbnails` | `photoIds`, `size?` | `requested`, `sent`, `missing[]` | One `LTHM` frame per photo, then the result |
 | `catalog.remove` | `photoIds` | `removed` | Rows only — never the files |
 | `job.cancel` | `jobId` | `cancelled` | Stops a running job at its next safe point |
-| `mask.preview` | `photoId`, `opId`, `componentId?`, `viewId?` | `width`, `height`, `contentRect?`, `coverage` | One `LMSK` frame (r8) first, then the result. Combined mask, or one component's raster |
+| `merge.hdr` | `photoIds`, `deghost?`, `autoAlign?`, `outputPath?` | `jobId` | 2–7 exposures → one linear 16-bit TIFF, catalogued. Progress as `job.progress` kind `merge` |
+| `merge.panorama` | `photoIds`, `projection?`, `boundaryWarp?`, `autoCrop?`, `outputPath?` | `jobId` | 2–12 overlapping frames in shooting order |
+| `merge.hdrPanorama` | `photoIds`, plus both option sets | `jobId` | Bracket sets found from the exposure pattern, HDR each, then stitch |
+| `merge.preview` | `kind`, `photoIds`, the same options, `longEdge?` | `jobId` | The same merge from the embedded JPEGs; the last tick names a PNG |
+| `mask.preview` | `photoId`, `opId`, `componentId?`, `viewId?` | `width`, `height`, `contentRect?`, `imageTransform?`, `coverage` | One `LMSK` frame (r8) first, then the result. Combined mask, or one component's raster |
 | `mask.detect` | `photoId`, `opId`, `componentId`, `hint?` | `jobId` | Starts the AI rasterisation of an AI-kind component; component goes `pending` → `ready`/`failed` via `stack.changed`, job ticks `job.progress` kind `mask` |
 | `mask.stroke` | `photoId`, `opId`, `componentId`, `points`, `erase?`, `size?`, `flow?`, `transient?` | as `stack.get` | Appends a brush segment; the engine owns strokes and rasters. One pointer-down = transient segments + one committed call = one undo step |
+
+### Mask coordinates
+
+Every mask component's coordinates — a gradient's two points, a radial's centre and radii, a
+brush's stroke points and its diameter, an object's box and points — are normalised **0..1
+over the image**: the uncropped, unrotated, untransformed photo at the size `photo.open`
+reports, camera orientation already applied by the decode. They are *not* over the content
+rect. A mask painted on the subject therefore stays on the subject when a crop, a straighten,
+a rotate, a flip or the Transform sliders move afterwards, which is what Lightroom does. Use
+`imageTransform` to put one on a canvas and its inverse to turn a pointer into one.
+
+`Mask.space` names the convention. `image` is the above and the only thing the engine writes.
+`content` is the pre-2026-09-16 convention, 0..1 over the content rect of whatever view drew
+it; only a sidecar written before the change holds one, and the engine converts it through
+that stack's own geometry the first time it opens the photo and writes `image` back. Points
+convert exactly; a radial's radii and angle and a brush's diameter are scaled by the map's
+local factor, which is exact for a crop and best effort for a straighten. An absent `space`
+means `image` — a client that does not send the field is a client that never applied geometry
+either, and the two spaces coincide for an uncropped photo.
+
+`mask.preview` keeps answering a **view-space** raster: it is what the overlay blits onto the
+frame, letterboxed and cropped exactly like the frame it lies over. Its `contentRect` and
+`imageTransform` say where the photo is inside it.
+
+`mask.detect` renders its input with the geometry stage bypassed and only the ops *below* the
+masked op applied, so a detector's boxes and points come back in image coordinates and line
+up with the mask that stores them.
+| `generative.run` | `photoId`, `opId` | `jobId` | Runs one generative op through its backend; progress via `job.progress` kind `generative`, result via `stack.changed`. The only thing that ever starts a run |
+| `generative.status` | — | `backend`, `ready`, `comfy`, `models?`, `workflows` | Whether a run can succeed: is `comfy` installed, is its server up, which graphs have their weights |
+| `export.run` | `photoIds`, `format`, `colorSpace`, `outputDir`, `quality?`, `resize?`, `sharpen?`, `fileNameTemplate?` | `jobId`, `total` | Starts a batch export; progress via `job.progress` kind `export`, whose `message` is the file being written |
+
+### `export.run`
+
+Full resolution, the same passes as the preview, encoded in the engine (PROMPT.md §3.6).
+The call returns as soon as the job is queued; `total` is `photoIds.length`, so a progress
+bar can size itself before the first tick.
+
+- **`format`** — `jpeg` (8-bit, ICC in APP2), `tiff16` and `png` (16 bits per channel),
+  `avif` (10-bit AV1). `quality` (1–100, default 90) is read by `jpeg` and `avif` only.
+  A build without libavif answers `-32602` for `avif`.
+- **`colorSpace`** — `srgb`, `displayP3`, `adobeRGB`, `rec2020`, `proPhoto`. The last GPU
+  pass applies the matrix and the encoding curve, and lcms2 generates the ICC that is
+  embedded from the same primaries and curve, so the file never disagrees with itself.
+- **`resize`** — absent means native: the crop rect at sensor resolution. `longEdge` wins
+  over `width`/`height`; both of those together are a box the image is fitted inside.
+  `dpi` is metadata only (JFIF density, PNG `pHYs`, TIFF resolution) and moves no pixels.
+  Resampling is a box filter in linear light, before the output curve.
+- **`sharpen`** — `{ target: screen | matte | glossy, amount?: low | standard | high }`,
+  Lightroom's output sharpening. It is the last pass before the colour transform. Absent
+  means none.
+- **`fileNameTemplate`** — `{name}` (the source file's stem), `{index}` (1-based position
+  in this run), `{ext}`. Default `{name}`. It names a **file**, not a path: separators are
+  stripped, so a template can never write outside `outputDir`. Two photos whose names
+  collide inside one run get `-2`, `-3` … appended; an existing file on disk is
+  overwritten, because re-exporting the same edit to the same folder is the normal case.
+
+A photo that is not open is decoded for the export, rendered from its `.latent` sidecar —
+cached AI mask rasters included — and dropped again; an open photo is exported from its
+live stack. One photo that fails does not take the batch down: the job keeps going, warns
+through `engine.log`, and its last `job.progress` carries `state: "error"` with the first
+failure in `error`. `job.cancel` stops it between photos and keeps the files already
+written, exactly like `catalog.import`.
+
+Each file is written through a `.part` temporary and renamed, so a cancelled or crashed
+export never leaves a half-written image where a whole one is expected.
+
+### Generative ops
+
+`generative_fill` and `remove` are cached rasters, not formulas (PROMPT.md §3.5). Three
+engine-owned fields ride along on `Op`:
+
+- `result` — the PNG the last run produced, relative to `<photo>.latent.d/`.
+- `resultRect` — `[x0, y0, x1, y1]` of that PNG inside the content rect, 0..1. The crop's
+  bounding box after it was snapped to a multiple of eight pixels.
+- `inputHash` — sha256 over the ops that produced the crop, the op's mask and the op's
+  params.
+
+A client round-trips all three untouched, exactly as it does a mask component's `raster`.
+`stale` is the fourth and is **derived**: the engine adds it to every `stack.get` and
+`stack.changed` when `inputHash` no longer matches, and never writes it to the sidecar. A
+stale op keeps rendering its last result; only `generative.run` replaces it.
+
+`generative.status` blocks on a subprocess (`comfy` is a Python CLI), so the engine answers
+it from its worker thread. Call it once on connect and when a generative panel opens, not
+per frame.
 
 ### `ops.describe`
 
@@ -88,10 +177,48 @@ no gradient simply omits `tint`.
 `contentRect` is `[x, y, width, height]` of the image inside the frame, in proxy pixels.
 The frame is the view's full size and the image is letterboxed inside it, so the two only
 agree when the aspects do; crop, rotate and the Transform sliders change the content rect
-without changing the frame. Mask component coordinates are normalised over this rect, and
-so is `mask.preview`'s raster — an overlay draws into it and nowhere else. It is optional
-and additive: a client talking to an engine that does not send it falls back to fitting the
-frame's own aspect into its canvas, which is what the rect says whenever nothing is cropped.
+without changing the frame, and a zoomed viewport makes it *larger* than the frame with a
+negative origin. Read it as signed numbers. It is optional and additive: a client talking
+to an engine that does not send it falls back to fitting the frame's own aspect into its
+canvas, which is what the rect says whenever nothing is cropped.
+
+`imageTransform` is the geometry stage as nine numbers: **image-normalised to view pixel**,
+a row-major 3x3 applied to `(x, y, 1)` with a homogeneous divide.
+
+```
+px = (m0*x + m1*y + m2) / w
+py = (m3*x + m4*y + m5) / w
+w  =  m6*x + m7*y + m8
+```
+
+Projective and not affine, because the Transform sliders' keystone is. It carries crop,
+straighten, rotate, flip, Transform and the viewport's zoom and pan together, so its inverse
+turns a pointer into a mask coordinate and the matrix itself turns a mask coordinate into a
+canvas pixel. **Lens distortion is not in it**: the radial term has no closed-form inverse,
+so the matrix is exact wherever `lens_correction.distortion` is 0 (its default) and off by
+that term otherwise; the shader applies the term separately, in the forward direction, where
+it is exact. `mask.preview` answers with the same matrix for its own raster grid. Optional
+and additive — without it a client falls back to `contentRect`, which says the same thing
+whenever nothing is cropped.
+
+`viewport` asks for zoom and pan and is **sticky per view**: send it when it changes, leave
+it out and the view stays where it was. `scale` 1 is fit-to-view — the behaviour of every
+render before the field existed — and 2 is twice that; a client computes 1:1 as
+`imageWidth / (contentRect width at scale 1)`, or by reading the image's on-screen width off
+`imageTransform`. `centerX`/`centerY` are the **image-normalised** point the view is centred
+on; sending neither, or a scale of 1, means fit. The engine clamps the pan so a zoomed frame
+is never part letterbox and echoes what it used in the result's `viewport`, so a client shows
+what it got rather than what it asked for. Zoom changes which source texels the proxy's
+sampling pass reads — the frame is always the view's size and is never read back at full
+resolution. None of it is edit state: it never reaches the stack or the sidecar.
+
+`geometry` picks how much of the geometry stage the frame applies. `stack` is the default
+and the whole stack. `full` renders the **uncropped** image: the `crop` op's rect and its
+`angle` are bypassed for that frame, so `contentRect` covers the whole image and the user
+can see what is being cropped away. `rotate`, `flip` and `transform` move the whole image
+and still apply. The stack is not touched — the flag is per render, and the next `stack`
+render is the cropped picture again. This is what the crop tool asks for while it is open;
+every other client leaves the field out.
 
 The result's `revision` is the stack revision the frame was rendered from, the same counter
 `stack.get` and `stack.changed` report. A client that coalesces slider drags compares it
@@ -142,6 +269,46 @@ can cancel the thumbnails before the import that feeds them is done. The thumbna
 `parentJobId`. It always reports, even when the import found nothing or was cancelled —
 then over zero photos. Nest the child bar under its parent rather than showing two
 unrelated ones.
+
+`result` is optional and additive, and present **only on a job's last notification**: it is
+what the job produced, for the jobs whose output is not the catalog itself. A merge answers
+`{ photoId, path, width, height, durationMs }`; a merge preview answers
+`{ previewPath, previewUrl, width, height, durationMs }` and no `photoId`. An import and a
+thumbnail rebuild have no `result` — their output is the rows a `catalog.changed` already
+announced.
+
+### Photo Merge
+
+`merge.hdr`, `merge.panorama` and `merge.hdrPanorama` take catalog ids, not open photos,
+and answer `{ jobId }` at once — a full-resolution merge is tens of seconds. The work runs
+on the engine's worker thread: decode every source, align, merge, write.
+
+The output is a **new source image**, not an edit: a 16-bit TIFF of linear, already
+demosaiced, already white-balanced RGB, plus a sidecar `<file>.latent-source.json` carrying
+the flag, the camera, the as-shot multipliers and the radiance `scale`. `photo.open` opens
+it like a raw — there is no linearise or camera-matrix stage to skip, because the pixels are
+already in the working space — and the whole op-stack applies on top. The engine registers
+it in the catalog and names the row in the job's last `job.progress` `result.photoId`,
+alongside a `catalog.changed { reason: "import" }`.
+
+Naming follows Lightroom: `<first source>-HDR.tif`, `-Pano.tif`, `-HDRPano.tif`, next to
+the sources, stepping a counter rather than overwriting. `outputPath` overrides it.
+
+16 bits have to hold the whole merged range, so an HDR merge divides by its own peak and
+records the divisor as `scale` in the sidecar: stored value × `scale` = radiance relative to
+the brightest bracket's white level. A 6 EV bracket therefore leaves 10 bits below a single
+frame's white. Float and DNG output are Phase 3 (PROMPT.md §7).
+
+`merge.preview` runs the same merge over the raws' **embedded JPEG previews** instead of a
+full decode — about a second instead of a minute — and writes a PNG. Its last
+`job.progress` carries `result.previewUrl`, an absolute
+`http://127.0.0.1:<engine port>/preview/<name>.png` served by the daemon's own listener.
+That is the one HTTP route the engine has, it only ever serves files inside its preview
+directory, and it exists because a renderer loaded over `http://` cannot read `file://`.
+A renderer's CSP needs `img-src http://127.0.0.1:*` for it (`apps/editor/index.html`).
+The preview is approximate by construction: an embedded JPEG is display-referred and
+carries the camera's own tone curve, which undoing the sRGB transfer does not undo.
+Nothing is written to the catalog.
 
 ### `python.run`
 

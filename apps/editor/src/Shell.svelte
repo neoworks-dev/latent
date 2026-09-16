@@ -5,11 +5,14 @@
   import { kernelContext, paneModes, panesForMode, provideKernelContext } from "@latent/contracts";
   import type { Context } from "@neoworks/extension-system";
   import { Button, SectionHeader, Tooltip } from "@neoworks-dev/ui";
+  import CropIcon from "phosphor-svelte/lib/CropIcon";
   import InfoIcon from "phosphor-svelte/lib/InfoIcon";
   import SelectionBackgroundIcon from "phosphor-svelte/lib/SelectionBackgroundIcon";
   import SlidersHorizontalIcon from "phosphor-svelte/lib/SlidersHorizontalIcon";
+  import SparkleIcon from "phosphor-svelte/lib/SparkleIcon";
   import SquaresFourIcon from "phosphor-svelte/lib/SquaresFourIcon";
   import StackSimpleIcon from "phosphor-svelte/lib/StackSimpleIcon";
+  import UploadSimpleIcon from "phosphor-svelte/lib/UploadSimpleIcon";
   import { untrack } from "svelte";
   import { nextChrome, shellShortcut, showsRegion, type ShellChrome } from "./shell";
 
@@ -36,15 +39,21 @@
   ]);
   const railIcons: Record<string, typeof InfoIcon> = {
     edit: SlidersHorizontalIcon,
+    crop: CropIcon,
     masks: SelectionBackgroundIcon,
+    generative: SparkleIcon,
     layers: StackSimpleIcon,
     info: InfoIcon,
+    export: UploadSimpleIcon,
   };
   const railLabels: Record<string, string> = {
     edit: "Edit",
+    crop: "Crop",
     masks: "Masks",
+    generative: "Generative",
     layers: "Layers",
     info: "Info",
+    export: "Export",
   };
 
   const showsLeft = $derived(left.length > 0 && showsRegion(chrome, "left"));

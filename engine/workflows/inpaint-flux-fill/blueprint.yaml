@@ -1,0 +1,10 @@
+output_prefix: outputs/latent-inpaint-flux-fill
+pipeline:
+  - fragment: inpaint-flux-fill
+    alias: fill
+    inputs:
+      inpaintmodelconditioning_pixels: inputs/crop.png
+      inpaintmodelconditioning_mask: inputs/mask.png
+    params:
+      clip_text_encode_positive_prompt_text: "a photograph"
+      ksampler_seed: 0

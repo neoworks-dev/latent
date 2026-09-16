@@ -1,0 +1,12 @@
+output_prefix: outputs/latent-remove
+pipeline:
+  - fragment: inpaint-sdxl
+    alias: remove
+    inputs:
+      inpaintmodelconditioning_pixels: inputs/crop.png
+      inpaintmodelconditioning_mask: inputs/mask.png
+    params:
+      cliptextencode_text: "empty background, seamless continuation of the surrounding scene, nothing there"
+      cliptextencode_text_2: "object, subject, person, text, watermark, blurry, low quality, artifacts"
+      ksampler_cfg: 5.0
+      ksampler_seed: 0

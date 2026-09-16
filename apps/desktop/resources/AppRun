@@ -1,0 +1,10 @@
+#!/bin/sh
+# AppImage entry point. Everything latentd needs at runtime is relocated under $APPDIR and
+# named through the environment; the compiled-in build-tree paths are the fallback only.
+# Chromium's sandbox needs unprivileged user namespaces; on a kernel without them pass
+# --no-sandbox.
+HERE="$(dirname "$(readlink -f "$0")")"
+export LATENT_ENGINE="$HERE/usr/bin/latentd"
+export LATENT_PYTHON_HOME="$HERE/usr/lib/latent-python"
+export LATENT_PYTHON_PACKAGE_DIR="$HERE/usr/share/latent/python/latent"
+exec "$HERE/usr/lib/latent/electron" "$@"

@@ -86,9 +86,16 @@
         "catalog.thumbnails",
         "catalog.remove",
         "job.cancel",
+        "merge.hdr",
+        "merge.panorama",
+        "merge.hdrPanorama",
+        "merge.preview",
         "mask.preview",
         "mask.detect",
+        "generative.run",
+        "generative.status",
         "mask.stroke",
+        "export.run",
         "stack.changed",
         "engine.log",
         "catalog.changed",
@@ -154,6 +161,25 @@
         },
         "enabled": {
           "type": "boolean"
+        },
+        "result": {
+          "type": "string",
+          "description": "Generative ops only (PROMPT.md 3.5): the cached raster this op produced, as a PNG path relative to `<photo>.latent.d/` — `generative/<opId>.png`. Absent until a generative.run has landed; the op renders as if it were not there until then. A client round-trips it untouched."
+        },
+        "inputHash": {
+          "type": "string",
+          "description": "Generative ops only: sha256 over the ops that produced `result`'s input, the op's mask and its params. Engine-owned; a client round-trips it untouched."
+        },
+        "resultRect": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" },
+          "description": "Generative ops only: `[x0, y0, x1, y1]` of `result` inside the content rect, normalised 0..1 — where the crop was cut from and where the composite puts it back. Engine-owned."
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "Engine-derived, never stored: `inputHash` no longer matches the stack, so `result` was made from other pixels. A stale op still renders its last result — re-running is always explicit (generative.run)."
         }
       }
     },
@@ -166,6 +192,11 @@
         "components": {
           "type": "array",
           "items": { "$ref": "#/definitions/MaskComponent" }
+        },
+        "space": {
+          "type": "string",
+          "enum": ["image", "content"],
+          "description": "Which space every component's coordinates are normalised over. `image` is 0..1 across the uncropped, unrotated, untransformed photo — the size photo.open reports, camera orientation already applied — and is what the engine writes and renders: a mask painted on the subject stays on it when crop, straighten, rotate, flip or the Transform sliders move afterwards. `content` is the pre-2026-09-16 convention, 0..1 over the content rect of whatever view drew it; only a sidecar written before this change holds one, and the engine converts it through the stack's own geometry the first time it opens the photo and writes `image` back. Absent means `image`: a client that does not send the field is a client that never applied geometry either. The two spaces coincide for an uncropped photo."
         }
       }
     },
@@ -212,7 +243,7 @@
         "params": {
           "type": "object",
           "additionalProperties": true,
-          "description": "Kind-specific, all coordinates normalised 0..1 over the content rect — the image as the view shows it after crop/rotate/transform (Phase 2 moves this to image space so a mask survives a later crop). linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched."
+          "description": "Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched."
         },
         "state": {
           "type": "string",
@@ -250,7 +281,14 @@
           "minItems": 4,
           "maxItems": 4,
           "items": { "type": "number" },
-          "description": "[x, y, width, height] of the image inside the proxy, in proxy pixels. Mask component coordinates are normalised over this rect."
+          "description": "[x, y, width, height] of the image inside the proxy, in proxy pixels. Where the raster's photo pixels are; zoomed in it runs outside the frame, so x and y can be negative and the rect can be wider than the frame."
+        },
+        "imageTransform": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "items": { "type": "number" },
+          "description": "Same matrix as ViewRenderResult.imageTransform, for the raster's own pixel grid: image-normalised → raster pixel."
         },
         "coverage": {
           "type": "number",
@@ -279,6 +317,75 @@
       "type": "object",
       "required": ["jobId"],
       "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "GenerativeRunParams": {
+      "type": "object",
+      "required": ["photoId", "opId"],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "opId": { "$ref": "#/definitions/OpId" }
+      },
+      "description": "Runs one generative op (PROMPT.md 3.5). The engine renders the ops below it, crops the op's mask bounding box plus padding to at most 1536 px on the long edge, hands the crop and the mask to the backend, and stores the result as `Op.result`. Ticks job.progress with kind \"generative\" and publishes stack.changed when it lands. Nothing else ever starts a run: an op whose `stale` is true keeps rendering its last result until this is called again. An op that is not generative, or has no mask, is a -32602 error."
+    },
+    "GenerativeRunResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "GenerativeStatusParams": { "type": "object", "additionalProperties": false, "properties": {} },
+    "GenerativeStatusResult": {
+      "type": "object",
+      "required": ["backend", "ready", "comfy", "workflows"],
+      "description": "Whether a generative run can succeed right now, and why not. A UI shows `message`/`hint` instead of letting a run fail silently.",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "description": "What the ops' `backend: \"auto\"` resolves to on this daemon."
+        },
+        "backends": { "type": "array", "items": { "type": "string" } },
+        "stub": {
+          "type": "boolean",
+          "description": "LATENT_GENERATIVE_STUB=1: runs answer with a blurred stand-in and never touch ComfyUI."
+        },
+        "ready": { "type": "boolean" },
+        "message": { "type": "string" },
+        "hint": { "type": "string" },
+        "comfy": {
+          "type": "object",
+          "required": ["installed", "serverRunning"],
+          "properties": {
+            "installed": { "type": "boolean" },
+            "path": { "type": "string" },
+            "serverRunning": { "type": "boolean" },
+            "workspace": { "type": "string" },
+            "error": { "type": "string" },
+            "message": { "type": "string" }
+          }
+        },
+        "models": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Weight files under the ComfyUI workspace's models/{checkpoints,unet,diffusion_models}. What an op's `model` param may name."
+        },
+        "workflows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "task", "ready"],
+            "properties": {
+              "name": { "type": "string" },
+              "task": { "type": "string", "enum": ["fill", "remove"] },
+              "label": { "type": "string" },
+              "ready": {
+                "type": "boolean",
+                "description": "Every weight file the graph loads is installed."
+              },
+              "requires": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
     },
     "MaskStrokeParams": {
       "type": "object",
@@ -312,6 +419,70 @@
     "MaskStrokeResult": {
       "$ref": "#/definitions/StackGetResult"
     },
+    "ExportFormat": {
+      "type": "string",
+      "enum": ["jpeg", "tiff16", "png", "avif"],
+      "description": "jpeg is 8-bit with the ICC in APP2; tiff16 and png are 16 bits per channel; avif is 10-bit AV1. The UI builds its format menu from this enum."
+    },
+    "ExportColorSpace": {
+      "type": "string",
+      "enum": ["srgb", "displayP3", "adobeRGB", "rec2020", "proPhoto"],
+      "description": "The output profile. The engine converts from its linear working space in the last GPU pass and embeds the matching ICC, generated by lcms2 from the same primaries and curve."
+    },
+    "ExportResize": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "longEdge": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Fit the long side to this many pixels. Wins over width/height." },
+        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "dpi": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Metadata only — JFIF density, PNG pHYs, TIFF resolution. It never changes the pixel count." }
+      },
+      "description": "Absent or empty means native resolution: the crop rect at sensor pixels. width and height together are a box the image is fitted inside, aspect kept. Resampling happens on the GPU in linear light, before the output curve."
+    },
+    "ExportSharpen": {
+      "type": "object",
+      "required": ["target"],
+      "additionalProperties": false,
+      "properties": {
+        "target": { "type": "string", "enum": ["screen", "matte", "glossy"] },
+        "amount": { "type": "string", "enum": ["low", "standard", "high"], "description": "Absent = standard." }
+      },
+      "description": "Output sharpening, Lightroom's three targets. It is the last pass before the colour transform and is not part of the develop; absent means none."
+    },
+    "ExportRunParams": {
+      "type": "object",
+      "required": ["photoIds", "format", "colorSpace", "outputDir"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "Catalog rows. A photo that is not open is decoded for the export and dropped again; an open one keeps its texture."
+        },
+        "format": { "$ref": "#/definitions/ExportFormat" },
+        "quality": { "type": "integer", "minimum": 1, "maximum": 100, "description": "JPEG and AVIF only; ignored by the lossless formats. Default 90." },
+        "colorSpace": { "$ref": "#/definitions/ExportColorSpace" },
+        "resize": { "$ref": "#/definitions/ExportResize" },
+        "sharpen": { "$ref": "#/definitions/ExportSharpen" },
+        "outputDir": { "type": "string", "description": "Created if it does not exist." },
+        "fileNameTemplate": {
+          "type": "string",
+          "description": "`{name}` is the source file's stem, `{index}` its 1-based position in this run, `{ext}` the format's extension. Default `{name}`. Path separators are stripped — a template names a file, never a path — and the extension is forced."
+        }
+      },
+      "description": "Starts a batch export and returns immediately. Progress arrives as job.progress kind `export`, whose `message` is the file currently being written; job.cancel stops it between photos."
+    },
+    "ExportRunResult": {
+      "type": "object",
+      "required": ["jobId", "total"],
+      "additionalProperties": false,
+      "properties": {
+        "jobId": { "$ref": "#/definitions/JobId" },
+        "total": { "type": "integer", "description": "How many files the job will write — photoIds.length, so a bar can size itself before the first progress arrives." }
+      }
+    },
     "Stack": {
       "type": "array",
       "items": {
@@ -341,7 +512,8 @@
             "integer",
             "boolean",
             "enum",
-            "curve"
+            "curve",
+            "string"
           ]
         },
         "min": {
@@ -378,13 +550,14 @@
       "properties": {
         "kind": {
           "type": "string",
-          "description": "`slider` is the default control. `kelvin` is a white-balance temperature slider, `curve` a tone-curve editor, `hsl` an eight-band colour mixer, `toggle` a checkbox.",
+          "description": "`slider` is the default control. `kelvin` is a white-balance temperature slider, `curve` a tone-curve editor, `hsl` an eight-band colour mixer, `toggle` a checkbox, `text` a free-text field — a generative prompt or a model name, drawn by a hand-built panel.",
           "enum": [
             "slider",
             "kelvin",
             "curve",
             "hsl",
-            "toggle"
+            "toggle",
+            "text"
           ]
         },
         "tint": {
@@ -421,7 +594,8 @@
             "Effects",
             "Detail",
             "Optics",
-            "Geometry"
+            "Geometry",
+            "Generative"
           ]
         },
         "order": {
@@ -866,6 +1040,30 @@
         },
         "height": {
           "type": "integer"
+        },
+        "geometry": {
+          "description": "How much of the geometry stage this frame applies. `stack` is the whole stack, the default. `full` renders the uncropped image: the crop op's rect and its straighten angle are bypassed so the crop tool can show what is being cropped away, while rotate, flip and Transform still apply because they move the whole image.",
+          "type": "string",
+          "enum": ["stack", "full"]
+        },
+        "viewport": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scale"],
+          "description": "Zoom and pan. Sticky per view: send it when it changes, leave it out otherwise and the view stays where it was. It is not edit state — nothing about it reaches the stack or the sidecar.",
+          "properties": {
+            "scale": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 32,
+              "description": "1 is fit-to-view, the behaviour of every render before this field existed; 2 is twice that. A client computes 1:1 as imageWidth / (contentRect width at scale 1)."
+            },
+            "centerX": {
+              "type": "number",
+              "description": "The image-normalised point the view is centred on. Sending neither centre, or a scale of 1, means fit: the image is centred the way it always was. The engine clamps the pan so a zoomed view never shows a bar it could fill with photo, and echoes what it used in the result."
+            },
+            "centerY": { "type": "number" }
+          }
         }
       }
     },
@@ -899,7 +1097,25 @@
           "minItems": 4,
           "maxItems": 4,
           "items": { "type": "number" },
-          "description": "[x, y, width, height] of the image inside the proxy, in proxy pixels. Mask component coordinates are normalised over this rect."
+          "description": "[x, y, width, height] of the image inside the proxy, in proxy pixels. Zoomed in it is larger than the frame and x/y go negative, so read it as signed numbers and not as a letterbox."
+        },
+        "imageTransform": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "items": { "type": "number" },
+          "description": "image-normalised → view pixel: a row-major 3×3 applied to (x, y, 1) with a homogeneous divide, so [m0 m1 m2 m3 m4 m5 m6 m7 m8] means px = (m0·x + m1·y + m2)/w, py = (m3·x + m4·y + m5)/w, w = m6·x + m7·y + m8. Projective and not affine, because the Transform sliders' keystone is. It carries crop, straighten, rotate, flip, Transform and the viewport's zoom and pan, so it converts a pointer to a mask coordinate (through its inverse) and a mask coordinate to a canvas pixel. Lens distortion is deliberately not in it: the radial term has no closed-form inverse, so the matrix is exact wherever lens_correction.distortion is 0, which is its default, and off by that term otherwise. Optional and additive: a client without it falls back to contentRect, which is the same thing whenever nothing is cropped."
+        },
+        "viewport": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The viewport this frame was rendered with, after clamping. Echoed so a client that asked for an out-of-range zoom or a pan past the edge shows what it got rather than what it wanted.",
+          "properties": {
+            "scale": { "type": "number" },
+            "centerX": { "type": "number" },
+            "centerY": { "type": "number" },
+            "fit": { "type": "boolean" }
+          }
         },
         "renderMs": {
           "type": "number"
@@ -1337,7 +1553,10 @@
           "$ref": "#/definitions/JobId",
           "description": "The job that queued this one — set on the thumbnail job an import spawns, absent on a job nobody spawned. A progress UI nests the child under its parent instead of showing two unrelated bars."
         },
-        "kind": { "type": "string", "enum": ["import", "thumbnails", "export", "mask"] },
+        "kind": {
+          "type": "string",
+          "enum": ["import", "thumbnails", "export", "mask", "merge", "generative"]
+        },
         "done": { "type": "integer" },
         "total": { "type": "integer" },
         "finished": { "type": "boolean" },
@@ -1347,8 +1566,140 @@
           "description": "How the job stands. `running` while `finished` is false; one of the other three on the last notification. Absent means `running` until finished, then `done` — so a client written before this field keeps working."
         },
         "message": { "type": "string" },
-        "error": { "type": "string" }
+        "error": { "type": "string" },
+        "result": { "$ref": "#/definitions/JobResult" }
       }
+    },
+    "JobResult": {
+      "description": "What the job produced, on its last job.progress only — absent while it runs, and absent from a job whose output is the catalog itself (import, thumbnails). Every field is optional: a merge answers `photoId` and `path`, a merge preview answers `previewUrl` and `previewPath` and no photoId.",
+      "type": "object",
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId",
+          "description": "The catalog row the job created — the merged image. Open it like any other photo."
+        },
+        "path": { "type": "string", "description": "The file the job wrote." },
+        "previewUrl": {
+          "type": "string",
+          "description": "http://127.0.0.1:<engine port>/preview/<name>.png — the engine serves the file it just wrote over its own listener, so a renderer can put it in an <img> without a file:// read."
+        },
+        "previewPath": { "type": "string", "description": "The same preview on disk." },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "durationMs": { "type": "number" }
+      }
+    },
+    "MergeDeghost": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high"],
+      "description": "Lightroom's Deghost Amount. The reference is the middle exposure; a pixel whose radiance differs from it by more than the level's threshold (low 1.0 EV, medium 0.5 EV, high 0.25 EV) drops that frame's contribution."
+    },
+    "MergeProjection": {
+      "type": "string",
+      "enum": ["spherical", "cylindrical", "perspective"],
+      "description": "Lightroom's Layout projection. `perspective` composes on a flat canvas; `cylindrical` and `spherical` pre-warp each frame around the focal length read from EXIF before composing."
+    },
+    "MergeKind": { "type": "string", "enum": ["hdr", "panorama", "hdrPanorama"] },
+    "MergeHdrParams": {
+      "description": "Merges 2..7 exposure-bracketed photos into one linear 16-bit TIFF, registers it in the catalog and answers its photoId on the job's last job.progress. Tone is the user's job: no auto settings are applied.",
+      "type": "object",
+      "required": ["photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "2 to 7 exposures of one scene, in any order. Fewer or more is a -32602."
+        },
+        "deghost": { "$ref": "#/definitions/MergeDeghost", "default": "none" },
+        "autoAlign": { "type": "boolean", "default": true },
+        "outputPath": {
+          "type": "string",
+          "description": "Absolute path of the TIFF to write. Default: `<first source without extension>-HDR.tif` next to the sources."
+        }
+      }
+    },
+    "MergeHdrResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "MergePanoramaParams": {
+      "description": "Stitches 2..12 overlapping photos into one linear 16-bit TIFF and registers it in the catalog.",
+      "type": "object",
+      "required": ["photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "2 to 12 overlapping frames, in shooting order. Fewer or more is a -32602; the cap is memory, not the algorithm."
+        },
+        "projection": { "$ref": "#/definitions/MergeProjection", "default": "cylindrical" },
+        "boundaryWarp": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 0,
+          "description": "Warps the mosaic toward the crop rectangle instead of throwing the edges away. 0 = no warp, 100 = the valid content is stretched to fill the rectangle."
+        },
+        "autoCrop": { "type": "boolean", "default": true },
+        "outputPath": { "type": "string" }
+      }
+    },
+    "MergePanoramaResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "MergeHdrPanoramaParams": {
+      "description": "Detects the bracket groups by their exposure pattern, merges each to HDR, then stitches the results. Every group must hold the same number of frames and the same EV offsets.",
+      "type": "object",
+      "required": ["photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "Every frame of every bracket, in shooting order. 4 to 48; the groups are found from the exposure pattern, not from the order alone."
+        },
+        "deghost": { "$ref": "#/definitions/MergeDeghost", "default": "none" },
+        "autoAlign": { "type": "boolean", "default": true },
+        "projection": { "$ref": "#/definitions/MergeProjection", "default": "cylindrical" },
+        "boundaryWarp": { "type": "integer", "minimum": 0, "maximum": 100, "default": 0 },
+        "autoCrop": { "type": "boolean", "default": true },
+        "outputPath": { "type": "string" }
+      }
+    },
+    "MergeHdrPanoramaResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "MergePreviewParams": {
+      "description": "The same merge at preview size, from the raws' embedded JPEGs instead of a full decode — seconds instead of minutes. Writes a PNG and names it in the job's last job.progress `result`; nothing is written to the catalog.",
+      "type": "object",
+      "required": ["kind", "photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "$ref": "#/definitions/MergeKind" },
+        "photoIds": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "The same ids the full merge would get."
+        },
+        "deghost": { "$ref": "#/definitions/MergeDeghost", "default": "none" },
+        "autoAlign": { "type": "boolean", "default": true },
+        "projection": { "$ref": "#/definitions/MergeProjection", "default": "cylindrical" },
+        "boundaryWarp": { "type": "integer", "minimum": 0, "maximum": 100, "default": 0 },
+        "autoCrop": { "type": "boolean", "default": true },
+        "longEdge": { "type": "integer", "minimum": 128, "maximum": 4096, "default": 1024 }
+      }
+    },
+    "MergePreviewResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
     }
   }
 }

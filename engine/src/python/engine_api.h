@@ -71,6 +71,23 @@ class EngineApi {
                                                const std::string& component_id,
                                                uint32_t max_size) = 0;
 
+  // `latent.export(...)`: validates export.run's params, queues the job and answers
+  // `{ jobId, total, files }`. The files are not written yet when this returns — the job
+  // reports through job.progress like every other one.
+  virtual nlohmann::json start_export(const nlohmann::json& params) = 0;
+
+  // `op.run()`: starts one generative op's job and returns its jobId. The op is untouched
+  // until the job lands, and nothing here ever re-runs on its own (PROMPT.md 3.5).
+  virtual int64_t run_generative(int64_t photo_id, const std::string& op_id) = 0;
+  // `latent.generative.status()`: which backend is selected, whether ComfyUI is installed
+  // and running, and which of the shipped graphs have their weights.
+  virtual nlohmann::json generative_state() = 0;
+
+  // `latent.merge.hdr(...)`: validates one merge.* call's params — `kind` picks which —
+  // queues the job and answers `{ jobId }`. The merged photo's id arrives on the job's
+  // last job.progress, not here, because the merge takes minutes.
+  virtual nlohmann::json start_merge(const nlohmann::json& params) = 0;
+
   // Reaches the UI as engine.log, carrying photoId when the message is about one photo.
   virtual void warn(const std::string& message, int64_t photo_id) = 0;
 };

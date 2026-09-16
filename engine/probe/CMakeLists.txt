@@ -21,6 +21,10 @@ add_executable(probe_onnx probe_onnx.cpp)
 target_link_libraries(probe_onnx PRIVATE onnxruntime)
 set_target_properties(probe_onnx PROPERTIES BUILD_RPATH "${ORT_LIB_DIR}")
 
+add_executable(probe_florence probe_florence.cpp)
+target_link_libraries(probe_florence PRIVATE latent_ai latent_catalog)
+set_target_properties(probe_florence PROPERTIES BUILD_RPATH "${ORT_LIB_DIR}")
+
 add_executable(probe_frame probe_frame.cpp raw_decode.cpp)
 target_link_libraries(probe_frame PRIVATE probe_gpu_common PkgConfig::LIBRAW PNG::PNG
   nlohmann_json::nlohmann_json unofficial::uwebsockets::uwebsockets)

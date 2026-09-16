@@ -12,7 +12,11 @@
 
 #include "ai/mask_detect.h"
 #include "catalog/catalog.h"
+#include "export/export_job.h"
+#include "generative/backend.h"
 #include "jobs/worker.h"
+#include "merge/merge.h"
+#include "merge/source_image.h"
 #include "ops/history.h"
 #include "ops/mask.h"
 #include "ops/op.h"
@@ -87,6 +91,10 @@ class Server : public EngineApi {
                       const std::string& component_id) override;
   std::vector<uint8_t> render_mask_png(int64_t photo_id, const std::string& op_id,
                                        const std::string& component_id, uint32_t max_size) override;
+  nlohmann::json start_export(const nlohmann::json& params) override;
+  nlohmann::json start_merge(const nlohmann::json& params) override;
+  int64_t run_generative(int64_t photo_id, const std::string& op_id) override;
+  nlohmann::json generative_state() override;
   void warn(const std::string& message, int64_t photo_id) override;
 
  private:
@@ -160,9 +168,37 @@ class Server : public EngineApi {
                                                           const Responder& responder);
   nlohmann::json handle_catalog_remove(const nlohmann::json& params);
   nlohmann::json handle_job_cancel(const nlohmann::json& params);
+  // merge.hdr / merge.panorama / merge.hdrPanorama / merge.preview. All four validate here
+  // and answer a jobId; the decode and the merge itself run on the worker.
+  nlohmann::json handle_merge(MergeKind kind, const nlohmann::json& params, bool preview);
+  static MergeKind merge_kind_from_params(const nlohmann::json& params);
   nlohmann::json handle_mask_preview(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_mask_detect(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_mask_stroke(const nlohmann::json& params, Peer* peer);
+  nlohmann::json handle_export_run(const nlohmann::json& params);
+  nlohmann::json handle_generative_run(const nlohmann::json& params);
+  // Answers from the worker: `comfy` is a Python CLI, so even "connection refused" costs a
+  // process start and must not happen on the loop thread.
+  std::optional<nlohmann::json> handle_generative_status(const Responder& responder);
+
+  // One generative.run (PROMPT.md 3.5). The crop and the mask are rendered here, on the
+  // thread that owns the device; the backend runs on the worker for as long as it takes;
+  // the result lands back here as a stack.changed. Never automatic — only this call.
+  int64_t start_generative(PhotoState& photo, const std::string& op_id);
+  void finish_generative(int64_t photo_id, const std::string& op_id, int64_t job_id,
+                         const std::string& input_hash, const std::vector<double>& rect,
+                         const GenerativeResult& result);
+  // Uploads the PNG cache of every generative op a freshly opened sidecar carries. An op
+  // whose result is missing from disk composites nothing rather than failing the open.
+  void load_generative_results(const PhotoState& photo);
+
+  // The job body, on the worker: one render per photo (hopped to the server thread, which
+  // owns the device) and one encode plus one write per photo, on this thread.
+  void export_job(int64_t job_id, const ExportOptions& options,
+                  const std::vector<ExportTarget>& targets);
+  // One photo's full-res render. An open photo uses its live stack and its uploaded
+  // texture; anything else is decoded here, rendered under a scratch id and dropped again.
+  Rgb16Image render_one_export(const ExportTarget& target, const ExportRenderOptions& options);
 
   // One mask.detect run: renders the input on the server thread, detects on the worker,
   // and lands the raster back on the server thread as a stack.changed.
@@ -178,7 +214,8 @@ class Server : public EngineApi {
   // result has to name the rect the component coordinates are normalised over.
   MaskReadout send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view_id,
                               const std::string& op_id, const std::string& component_id,
-                              std::vector<uint8_t>& frame, ViewGeometry& geometry);
+                              std::vector<uint8_t>& frame, ViewGeometry& geometry,
+                              GeometryMap& map);
   // The op `params.opId` names, or -32602 when it is unknown or carries no mask.
   static Op& require_masked_op(Stack& stack, const nlohmann::json& params);
   // Reloads the PNG cache of every AI component a freshly opened sidecar carries.
@@ -196,6 +233,23 @@ class Server : public EngineApi {
   void publish_progress(int64_t job_id, int64_t parent_job_id, std::string_view kind, int64_t done,
                         int64_t total, std::string_view state, const std::string& message,
                         const std::string& error = {});
+
+  // One merge job, on the worker: decode every source, merge, write the TIFF, and hop back
+  // to the server thread to register the result and publish the last progress.
+  void merge_job(int64_t job_id, MergeRequest request);
+  // Catalogs the file a merge wrote and answers the job's last progress with its photoId.
+  void finish_merge(int64_t job_id, const std::string& path, const SourceMetadata& metadata,
+                    uint32_t width, uint32_t height, double duration_ms);
+  // job.progress kind `merge`. Separate from publish_progress because only a merge carries
+  // a `result` object, and only on its last notification.
+  void publish_merge_progress(int64_t job_id, int64_t done, int64_t total, std::string_view state,
+                              const std::string& message,
+                              const nlohmann::json& result = nlohmann::json(),
+                              const std::string& error = {});
+  // GET /preview/<name>: the PNG a merge.preview job wrote, and nothing else on disk.
+  void serve_preview(uWS::HttpResponse<false>* response, std::string_view name);
+  // $XDG_CACHE_HOME/latent/merge-previews, created on demand.
+  static std::string preview_directory();
   // Cache key for one row's thumbnails: the content hash when we have it, else the id.
   static std::string thumbnail_key(const CatalogPhoto& row);
 
@@ -212,6 +266,10 @@ class Server : public EngineApi {
               std::string_view client = {});
   void save_sidecar(PhotoState& photo);
   OffscreenFrame render_offscreen(int64_t photo_id, uint32_t max_size);
+  // The same, over a stack the caller chose rather than the photo's current one: what
+  // mask.detect hands a model, which is the sub-stack below the masked op with the
+  // geometry ops removed, so the raster it answers with is already in image space.
+  OffscreenFrame render_offscreen(int64_t photo_id, uint32_t max_size, const Stack& stack);
 
   // Sends `source` to the peer that caused the change and `external` to the others; a
   // change no socket caused (a script, an agent) keeps its own source everywhere. `client`
@@ -237,6 +295,8 @@ class Server : public EngineApi {
   // engine.hello's mcpUrl; empty with --no-mcp or when the SDK failed to load.
   std::string mcp_url_;
   us_listen_socket_t* listen_socket_ = nullptr;
+  // The port run() actually bound, so a merge preview can answer with an absolute URL.
+  int bound_port_ = 0;
   std::atomic<uWS::Loop*> loop_{nullptr};
   std::atomic<std::thread::id> server_thread_{};
   std::atomic<bool> stop_requested_{false};

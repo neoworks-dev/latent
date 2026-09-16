@@ -2,7 +2,12 @@
   // The Masks column, and the tools it draws on the viewer's overlay. The column is only
   // mounted while the rail is on "masks", so attaching the overlay and the shortcuts here —
   // with their inverses — is also what arms and disarms the tools.
-  import { kernelContext, type OverlayPointer, type OverlayRect } from "@latent/contracts";
+  import {
+    kernelContext,
+    type OverlayMap,
+    type OverlayPointer,
+    type OverlayRect,
+  } from "@latent/contracts";
   import { GeneratedPanel, ValueField } from "@latent/plugin-panels";
   import type { MaskComponentKind } from "@latent/protocol";
   import { Button, Select, Tooltip } from "@neoworks-dev/ui";
@@ -23,11 +28,13 @@
   import Toolbar from "./Toolbar.svelte";
   import {
     boxFromDrag,
+    boxPoints,
     brushSizeAfterStep,
     brushSizeAfterWheel,
-    ellipseBox,
+    ellipsePoints,
     linearFromDrag,
     radialFromDrag,
+    strokeImagePath,
     type Point,
   } from "./tools";
 
@@ -75,10 +82,16 @@
     if (component) await masks.detect(component.id, { prompt: masks.textPrompt });
   }
 
-  function drawOverlay(context: CanvasRenderingContext2D, rect: OverlayRect): void {
+  // Shapes are stored in image space and drawn through `map`, so a crop, a straighten or a
+  // zoom moves the handles with the picture instead of leaving them behind.
+  function drawOverlay(
+    context: CanvasRenderingContext2D,
+    rect: OverlayRect,
+    map: OverlayMap,
+  ): void {
     if (rect.width <= 0 || rect.height <= 0) return;
     if (masks.overlayVisible) drawTint(context, rect);
-    drawTools(context, rect);
+    drawTools(context, map);
   }
 
   function drawTint(context: CanvasRenderingContext2D, rect: OverlayRect): void {
@@ -114,107 +127,86 @@
     );
   }
 
-  function drawTools(context: CanvasRenderingContext2D, rect: OverlayRect): void {
+  function drawTools(context: CanvasRenderingContext2D, map: OverlayMap): void {
     context.save();
     context.lineWidth = 1.5;
     context.strokeStyle = "rgba(255, 255, 255, 0.9)";
     context.setLineDash([4, 3]);
-    if (drag && masks.tool === "radial") strokeEllipse(context, rect, drag.start, drag.current);
-    if (drag && masks.tool === "linear") strokeLine(context, rect, drag.start, drag.current);
-    if (drag && masks.tool === "box") strokeBox(context, rect, drag.start, drag.current);
-    if (!drag) strokeSelected(context, rect);
-    if (masks.tool === "brush" && hover) strokeBrush(context, rect, hover);
+    if (drag && masks.tool === "radial") strokeEllipse(context, map, drag.start, drag.current);
+    if (drag && masks.tool === "linear") strokeLine(context, map, drag.start, drag.current);
+    if (drag && masks.tool === "box") strokeBox(context, map, drag.start, drag.current);
+    if (!drag) strokeSelected(context, map);
+    if (masks.tool === "brush" && hover) strokeBrush(context, map, hover);
     context.restore();
   }
 
   /** The selected gradient's own handles, so it can be re-dragged without re-creating it. */
-  function strokeSelected(context: CanvasRenderingContext2D, rect: OverlayRect): void {
+  function strokeSelected(context: CanvasRenderingContext2D, map: OverlayMap): void {
     const component = masks.selectedComponent;
     if (!component) return;
     const params = component.params ?? {};
     if (component.kind === "radial") {
       const center = (params.center ?? [0.5, 0.5]) as Point;
       const radius = (params.radius ?? [0.25, 0.25]) as Point;
-      const box = ellipseBox(center, radius, rect);
-      context.beginPath();
-      context.ellipse(box.cx, box.cy, box.rx, box.ry, 0, 0, Math.PI * 2);
-      context.stroke();
-      handle(context, box.cx, box.cy);
-      handle(context, box.cx + box.rx, box.cy);
-      handle(context, box.cx, box.cy + box.ry);
+      const angle = typeof params.angle === "number" ? params.angle : 0;
+      strokeImagePath(context, map, ellipsePoints(center, radius, angle));
+      for (const at of [
+        center,
+        [center[0] + radius[0], center[1]],
+        [center[0], center[1] + radius[1]],
+      ] as Point[]) {
+        const canvas = map.toCanvas(at[0], at[1]);
+        handle(context, canvas.x, canvas.y);
+      }
     }
     if (component.kind === "linear") {
       const start = (params.start ?? [0.5, 0.25]) as Point;
       const end = (params.end ?? [0.5, 0.75]) as Point;
-      strokeLine(context, rect, start, end);
+      strokeLine(context, map, start, end);
     }
   }
 
   function strokeEllipse(
     context: CanvasRenderingContext2D,
-    rect: OverlayRect,
+    map: OverlayMap,
     start: Point,
     current: Point,
   ): void {
-    const rx = Math.abs(current[0] - start[0]) * rect.width;
-    const ry = Math.abs(current[1] - start[1]) * rect.height;
-    context.beginPath();
-    context.ellipse(
-      rect.x + start[0] * rect.width,
-      rect.y + start[1] * rect.height,
-      Math.max(1, rx),
-      Math.max(1, ry),
-      0,
-      0,
-      Math.PI * 2,
-    );
-    context.stroke();
+    const rx = Math.max(1e-4, Math.abs(current[0] - start[0]));
+    const ry = Math.max(1e-4, Math.abs(current[1] - start[1]));
+    strokeImagePath(context, map, ellipsePoints(start, [rx, ry]));
   }
 
   function strokeLine(
     context: CanvasRenderingContext2D,
-    rect: OverlayRect,
+    map: OverlayMap,
     start: Point,
     end: Point,
   ): void {
-    const x0 = rect.x + start[0] * rect.width;
-    const y0 = rect.y + start[1] * rect.height;
-    const x1 = rect.x + end[0] * rect.width;
-    const y1 = rect.y + end[1] * rect.height;
-    context.beginPath();
-    context.moveTo(x0, y0);
-    context.lineTo(x1, y1);
-    context.stroke();
-    handle(context, x0, y0);
-    handle(context, x1, y1);
+    strokeImagePath(context, map, [start, end], false);
+    const from = map.toCanvas(start[0], start[1]);
+    const to = map.toCanvas(end[0], end[1]);
+    handle(context, from.x, from.y);
+    handle(context, to.x, to.y);
   }
 
   function strokeBox(
     context: CanvasRenderingContext2D,
-    rect: OverlayRect,
+    map: OverlayMap,
     start: Point,
     current: Point,
   ): void {
-    const [x0, y0, x1, y1] = boxFromDrag(start, current);
-    context.strokeRect(
-      rect.x + x0 * rect.width,
-      rect.y + y0 * rect.height,
-      (x1 - x0) * rect.width,
-      (y1 - y0) * rect.height,
-    );
+    strokeImagePath(context, map, boxPoints(boxFromDrag(start, current)));
   }
 
-  function strokeBrush(context: CanvasRenderingContext2D, rect: OverlayRect, point: Point): void {
-    const radius = (masks.brushSize * Math.max(rect.width, rect.height)) / 2;
+  function strokeBrush(context: CanvasRenderingContext2D, map: OverlayMap, point: Point): void {
+    // The diameter is a fraction of the image's long edge, so the cursor grows with a crop
+    // or a zoom exactly as the painted stroke does.
+    const radius = (masks.brushSize * map.scale) / 2;
+    const at = map.toCanvas(point[0], point[1]);
     context.setLineDash([]);
     context.beginPath();
-    context.arc(
-      rect.x + point[0] * rect.width,
-      rect.y + point[1] * rect.height,
-      Math.max(2, radius),
-      0,
-      Math.PI * 2,
-    );
+    context.arc(at.x, at.y, Math.max(2, radius), 0, Math.PI * 2);
     context.stroke();
   }
 
@@ -230,7 +222,8 @@
 
   function onPointer(event: OverlayPointer): boolean {
     if (event.kind === "wheel") return onWheel(event);
-    const point: Point = [event.x, event.y];
+    // Image space, not the drawn rect: a mask component's coordinates outlive the crop.
+    const point: Point = [event.imageX, event.imageY];
     hover = point;
     viewer.overlay.redraw();
     const tool = masks.tool;

@@ -1,0 +1,148 @@
+# Packaging. https://taskfile.dev — the Arch package installs the binary as `go-task`.
+#
+#   go-task appimage          # dist/Latent-x86_64.AppImage
+#   go-task appimage:run      # launch it
+#
+# What goes in: a Release `latentd` (engine/build/release), the vcpkg CPython it embeds
+# (stdlib + site-packages with the MCP SDK), onnxruntime with its CUDA provider, the
+# pure-Python `latent` package, the Electron runtime from node_modules and the built
+# editor + main. Models are not bundled: `scripts/models/fetch.py` puts them in
+# ~/.local/share/latent/models (see scripts/models/README.md). The CUDA provider needs the
+# host's CUDA 13 + cuDNN; without them ORT falls back to CPU.
+#
+# AppRun (apps/desktop/resources/AppRun) relocates the engine through LATENT_ENGINE,
+# LATENT_PYTHON_HOME and LATENT_PYTHON_PACKAGE_DIR; the binary keeps the build-tree paths
+# as fallback so an unpackaged latentd still works.
+version: "3"
+
+vars:
+  DIST: "{{.ROOT_DIR}}/dist"
+  APPDIR: "{{.DIST}}/AppDir"
+  ENGINE_DIR: "{{.ROOT_DIR}}/engine"
+  ENGINE_BUILD: "{{.ENGINE_DIR}}/build/release"
+  VCPKG_PREFIX: "{{.ENGINE_BUILD}}/vcpkg_installed/x64-linux"
+  ORT_LIB: "{{.ENGINE_DIR}}/third_party/onnxruntime/lib"
+  ELECTRON_DIST: "{{.ROOT_DIR}}/node_modules/electron/dist"
+  RESOURCES: "{{.ROOT_DIR}}/apps/desktop/resources"
+  APPIMAGETOOL: "{{.DIST}}/tools/appimagetool-x86_64.AppImage"
+  APPIMAGETOOL_URL: "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+  APPIMAGE: "{{.DIST}}/Latent-x86_64.AppImage"
+  VCPKG_ROOT:
+    sh: echo "${VCPKG_ROOT:-$HOME/.local/share/vcpkg}"
+
+env:
+  VCPKG_ROOT: "{{.VCPKG_ROOT}}"
+  ARCH: x86_64
+
+tasks:
+  default:
+    cmds:
+      - go-task --list
+
+  engine:release:
+    desc: Configure and build latentd in Release mode (engine/build/release)
+    dir: "{{.ENGINE_DIR}}"
+    cmds:
+      - cmake --preset release
+      - cmake --build --preset release --target latentd latent_python_deps
+    sources:
+      - src/**/*
+      - shaders/**/*
+      - cmake/**/*
+      - CMakeLists.txt
+      - vcpkg.json
+    generates:
+      - build/release/latentd
+
+  ui:build:
+    desc: Build the editor renderer and the Electron main/preload bundles
+    cmds:
+      - bun --filter @latent/editor build
+      - bun --filter @latent/desktop build
+    sources:
+      - apps/**/*.ts
+      - apps/**/*.svelte
+      - apps/**/*.html
+      - plugins/**/*.ts
+      - plugins/**/*.svelte
+      - packages/**/*.ts
+    generates:
+      - apps/editor/dist/index.html
+      - apps/desktop/out/main/index.js
+      - apps/desktop/out/preload/index.cjs
+
+  appimagetool:
+    desc: Fetch appimagetool into dist/tools
+    cmds:
+      - mkdir -p "{{.DIST}}/tools"
+      - curl -fsSL -o "{{.APPIMAGETOOL}}" "{{.APPIMAGETOOL_URL}}"
+      - chmod +x "{{.APPIMAGETOOL}}"
+    status:
+      - test -x "{{.APPIMAGETOOL}}"
+
+  appdir:
+    desc: Assemble dist/AppDir from the release engine and the built UI
+    deps: [engine:release, ui:build]
+    cmds:
+      - rm -rf "{{.APPDIR}}"
+      - mkdir -p "{{.APPDIR}}/usr/bin" "{{.APPDIR}}/usr/lib/latent" "{{.APPDIR}}/usr/lib/latent-python/lib" "{{.APPDIR}}/usr/share/latent/python"
+      # Engine. The RPATH points into third_party/ at build time; the bundled copy looks
+      # beside itself instead. ORT dlopens its providers from libonnxruntime.so's directory.
+      - cp "{{.ENGINE_BUILD}}/latentd" "{{.APPDIR}}/usr/bin/latentd"
+      - patchelf --set-rpath '$ORIGIN/../lib' "{{.APPDIR}}/usr/bin/latentd"
+      - cp "{{.ORT_LIB}}/libonnxruntime.so.1" "{{.ORT_LIB}}/libonnxruntime_providers_shared.so" "{{.ORT_LIB}}/libonnxruntime_providers_cuda.so" "{{.APPDIR}}/usr/lib/"
+      # Embedded Python: CPython's `home` wants <home>/lib/python3.12 with lib-dynload and
+      # site-packages inside it, which is exactly the vcpkg prefix's layout.
+      - rsync -a --exclude '__pycache__' --exclude 'test/' --exclude 'idlelib/' --exclude 'tkinter/' "{{.VCPKG_PREFIX}}/lib/python3.12" "{{.APPDIR}}/usr/lib/latent-python/lib/"
+      - cp -r "{{.ENGINE_DIR}}/python/latent" "{{.APPDIR}}/usr/share/latent/python/"
+      - find "{{.APPDIR}}/usr/share/latent/python" -name '__pycache__' -type d -exec rm -rf {} +
+      # Electron runtime plus our app in resources/app (Electron loads that directory by
+      # itself). Main resolves the editor at ../../../editor/dist from out/main, so the
+      # renderer build lands in resources/editor/dist.
+      - cp -r "{{.ELECTRON_DIST}}/." "{{.APPDIR}}/usr/lib/latent/"
+      - rm -f "{{.APPDIR}}/usr/lib/latent/resources/default_app.asar"
+      - mkdir -p "{{.APPDIR}}/usr/lib/latent/resources/app" "{{.APPDIR}}/usr/lib/latent/resources/editor"
+      - cp -r "{{.ROOT_DIR}}/apps/desktop/out" "{{.APPDIR}}/usr/lib/latent/resources/app/"
+      - cp "{{.ROOT_DIR}}/apps/desktop/package.json" "{{.APPDIR}}/usr/lib/latent/resources/app/"
+      - cp -r "{{.ROOT_DIR}}/apps/editor/dist" "{{.APPDIR}}/usr/lib/latent/resources/editor/"
+      # AppImage metadata.
+      - cp "{{.RESOURCES}}/AppRun" "{{.APPDIR}}/AppRun"
+      - chmod +x "{{.APPDIR}}/AppRun"
+      - cp "{{.RESOURCES}}/latent.desktop" "{{.APPDIR}}/latent.desktop"
+      - cp "{{.RESOURCES}}/icon.png" "{{.APPDIR}}/latent.png"
+      - mkdir -p "{{.APPDIR}}/usr/share/applications" "{{.APPDIR}}/usr/share/icons/hicolor/256x256/apps"
+      - cp "{{.RESOURCES}}/latent.desktop" "{{.APPDIR}}/usr/share/applications/"
+      - cp "{{.RESOURCES}}/icon.png" "{{.APPDIR}}/usr/share/icons/hicolor/256x256/apps/latent.png"
+      - du -sh "{{.APPDIR}}"
+
+  appimage:
+    desc: Build dist/Latent-x86_64.AppImage
+    deps: [appimagetool, appdir]
+    cmds:
+      # --appimage-extract-and-run: appimagetool is itself an AppImage and FUSE may be absent.
+      - '{{.APPIMAGETOOL}} --appimage-extract-and-run --comp zstd "{{.APPDIR}}" "{{.APPIMAGE}}"'
+      - ls -lh "{{.APPIMAGE}}"
+
+  appimage:run:
+    desc: Launch the built AppImage (pass extra args after --)
+    cmds:
+      - "{{.APPIMAGE}} --appimage-extract-and-run {{.CLI_ARGS}}"
+
+  appdir:run:
+    desc: Launch the assembled AppDir without packing it (fast iteration)
+    cmds:
+      - "{{.APPDIR}}/AppRun {{.CLI_ARGS}}"
+
+  models:
+    desc: Fetch the mask models into ~/.local/share/latent/models (needs scripts/models/.venv)
+    dir: "{{.ROOT_DIR}}/scripts/models"
+    preconditions:
+      - sh: test -x .venv/bin/python
+        msg: "scripts/models/.venv missing; see scripts/models/README.md"
+    cmds:
+      - LD_LIBRARY_PATH=/opt/cuda/lib64 .venv/bin/python fetch.py --verify
+
+  clean:
+    desc: Remove dist/ (keeps engine/build and node_modules)
+    cmds:
+      - rm -rf "{{.DIST}}"

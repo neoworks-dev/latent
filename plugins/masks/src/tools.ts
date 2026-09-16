@@ -1,6 +1,10 @@
 // The tools' arithmetic: what a drag means, how a brush batches its points, how the
-// bracket keys and the wheel move the size. All image-normalised (0..1) and all pure, so
-// the overlay component is left with drawing and the state object with calling the engine.
+// bracket keys and the wheel move the size. All image-normalised (0..1) over the
+// *uncropped* photo — the space a mask is stored in (protocol Mask.space) — and all pure,
+// so the overlay component is left with drawing and the state object with calling the
+// engine. Nothing here knows about the crop, the straighten or the zoom; the overlay's
+// `map` is what turns one of these points into a pixel.
+import type { OverlayMap } from "@latent/contracts";
 
 export type Point = [number, number];
 
@@ -112,16 +116,58 @@ export interface DragState {
   current: Point;
 }
 
-/** An ellipse's on-screen box from its normalised params, for drawing and hit-testing. */
-export function ellipseBox(
-  center: Point,
-  radius: Point,
-  rect: { x: number; y: number; width: number; height: number },
-): { cx: number; cy: number; rx: number; ry: number } {
-  return {
-    cx: rect.x + center[0] * rect.width,
-    cy: rect.y + center[1] * rect.height,
-    rx: radius[0] * rect.width,
-    ry: radius[1] * rect.height,
-  };
+/** How many segments an image-space curve is drawn with. A crop can magnify it a lot. */
+const ELLIPSE_SEGMENTS = 64;
+
+/**
+ * An ellipse in image space, as points. Drawn as a polygon rather than with `ctx.ellipse`
+ * because the map from image to canvas carries a crop, a straighten, a rotate and a
+ * keystone: only a straight scale would let a canvas ellipse land on the right pixels.
+ *
+ * `angle` is applied in image-normalised space. The shader applies it in aspect-corrected
+ * space, so the two agree exactly at the 0 every tool writes today and drift for a rotated
+ * ellipse on a non-square photo; the engine's own tint is the authority either way.
+ */
+export function ellipsePoints(center: Point, radius: Point, angle = 0): Point[] {
+  const radians = (angle * Math.PI) / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  const points: Point[] = [];
+  for (let step = 0; step < ELLIPSE_SEGMENTS; step++) {
+    const t = (step / ELLIPSE_SEGMENTS) * Math.PI * 2;
+    const x = radius[0] * Math.cos(t);
+    const y = radius[1] * Math.sin(t);
+    points.push([center[0] + x * cos - y * sin, center[1] + x * sin + y * cos]);
+  }
+  return points;
+}
+
+/** The four corners of an image-space box, in order, for the same reason. */
+export function boxPoints(box: [number, number, number, number]): Point[] {
+  return [
+    [box[0], box[1]],
+    [box[2], box[1]],
+    [box[2], box[3]],
+    [box[0], box[3]],
+  ];
+}
+
+/** Strokes a closed image-space polygon on the canvas. */
+export function strokeImagePath(
+  context: CanvasRenderingContext2D,
+  map: OverlayMap,
+  points: Point[],
+  closed = true,
+): void {
+  const [first, ...rest] = points;
+  if (!first) return;
+  const start = map.toCanvas(first[0], first[1]);
+  context.beginPath();
+  context.moveTo(start.x, start.y);
+  for (const point of rest) {
+    const at = map.toCanvas(point[0], point[1]);
+    context.lineTo(at.x, at.y);
+  }
+  if (closed) context.closePath();
+  context.stroke();
 }

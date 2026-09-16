@@ -11,6 +11,9 @@
     "libjpeg-turbo",
     "sqlite3",
     "catch2",
-    "pybind11"
+    "pybind11",
+    "tiff",
+    "lcms",
+    { "name": "libavif", "features": ["aom"] }
   ]
 }
