@@ -91,9 +91,27 @@
       context.fillRect(rect.x, rect.y, rect.width, rect.height);
     }
     // The raster is the engine's proxy size, not the canvas': one scaled blit, no resample
-    // in JS. Smoothing keeps a 512-px mask from looking like a checkerboard.
+    // in JS. Smoothing keeps a 512-px mask from looking like a checkerboard. The source is
+    // the photo's rect inside the raster — the raster is letterboxed like the frame, and
+    // `rect` is already the drawn photo, so blitting all of it would stretch the mask.
+    const [sourceX, sourceY, sourceWidth, sourceHeight] = masks.rasterRect ?? [
+      0,
+      0,
+      raster.width,
+      raster.height,
+    ];
     context.imageSmoothingEnabled = true;
-    context.drawImage(raster, rect.x, rect.y, rect.width, rect.height);
+    context.drawImage(
+      raster,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      rect.x,
+      rect.y,
+      rect.width,
+      rect.height,
+    );
   }
 
   function drawTools(context: CanvasRenderingContext2D, rect: OverlayRect): void {

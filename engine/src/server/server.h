@@ -173,10 +173,12 @@ class Server : public EngineApi {
                           const std::string& component_id, int64_t job_id,
                           const MaskDetectResult& result);
   // Renders `op_id`'s mask into a view sized like `view_id`'s proxy (or a throwaway view
-  // when it is 0) and sends the LMSK frame that precedes mask.preview's result.
+  // when it is 0) and sends the LMSK frame that precedes mask.preview's result. `geometry`
+  // comes back out because the raster is letterboxed like the frame it lies over, and the
+  // result has to name the rect the component coordinates are normalised over.
   MaskReadout send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view_id,
                               const std::string& op_id, const std::string& component_id,
-                              std::vector<uint8_t>& frame);
+                              std::vector<uint8_t>& frame, ViewGeometry& geometry);
   // The op `params.opId` names, or -32602 when it is unknown or carries no mask.
   static Op& require_masked_op(Stack& stack, const nlohmann::json& params);
   // Reloads the PNG cache of every AI component a freshly opened sidecar carries.

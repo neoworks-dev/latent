@@ -2,7 +2,7 @@
 // showing, and the one preview raster it keeps. Nothing here is edit state — every
 // component edit is a stack write and comes back from the engine; the raster comes back as
 // an LMSK frame and is never built in the UI.
-import type { EngineClient, ViewerService } from "@latent/contracts";
+import type { ContentRect, EngineClient, ViewerService } from "@latent/contracts";
 import type {
   Mask,
   MaskComponent,
@@ -53,6 +53,7 @@ export class MasksState {
 
   /** The tinted raster, drawn on the overlay. A canvas, not reactive state: it is pixels. */
   private raster: HTMLCanvasElement | null = null;
+  private rasterContentRect: ContentRect | null = null;
   private readonly queue: MaskPreviewQueue;
   private readonly unsubscribeJobs: () => void;
   private previewSignature = "";
@@ -276,6 +277,15 @@ export class MasksState {
   }
 
   /**
+   * The part of `rasterCanvas` that is photo, in raster pixels. The raster is letterboxed
+   * like the frame it lies over, so blitting all of it onto the overlay's rect would
+   * stretch the mask off the image. Null when the engine sent no rect: then it is all photo.
+   */
+  get rasterRect(): ContentRect | null {
+    return this.rasterContentRect;
+  }
+
+  /**
    * Re-asks for the preview when the selected op's mask changed, and not otherwise. Reads
    * reactive state on purpose: the pane calls it from an `$effect`.
    */
@@ -286,6 +296,7 @@ export class MasksState {
     this.previewSignature = signature;
     if (!op?.mask || op.mask.components.length === 0) {
       this.raster = null;
+      this.rasterContentRect = null;
       this.coverage = 0;
       this.viewer.overlay.redraw();
       return;
@@ -320,6 +331,7 @@ export class MasksState {
       .then((preview) => {
         if (!preview) return;
         this.coverage = preview.fraction;
+        this.rasterContentRect = preview.contentRect;
         this.putRaster(preview.width, preview.height, preview.coverage);
       })
       .catch((error: Error) => {

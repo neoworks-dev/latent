@@ -13,6 +13,7 @@ export type { LatentDesktopBridge } from "./desktop";
 export type { PaneDefinition, PaneRegistry } from "./panes";
 export { paneModes, panesForMode } from "./panes";
 export type {
+  ContentRect,
   FrameDrawMarks,
   FrameSink,
   OverlayDraw,

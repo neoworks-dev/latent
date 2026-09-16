@@ -6,12 +6,23 @@
   // With `opId` it is one op instead of the column: the Masks pane draws the selected
   // layer's own sliders under its component list, writing to that stack entry.
   import { kernelContext } from "@latent/contracts";
+  import type { OpDefinition } from "@latent/protocol";
   import { Button, Tooltip } from "@neoworks-dev/ui";
   import ArrowCounterClockwiseIcon from "phosphor-svelte/lib/ArrowCounterClockwiseIcon";
   import CaretDownIcon from "phosphor-svelte/lib/CaretDownIcon";
   import CaretRightIcon from "phosphor-svelte/lib/CaretRightIcon";
   import SelectionBackgroundIcon from "phosphor-svelte/lib/SelectionBackgroundIcon";
-  import { defaultParams, groupEdited, layerBadge, type PanelGroup } from "./panels";
+  import CurveEditor from "./CurveEditor.svelte";
+  import MixerEditor from "./MixerEditor.svelte";
+  import {
+    curveParams,
+    defaultParams,
+    generatedParams,
+    groupEdited,
+    layerBadge,
+    mixerParams,
+    type PanelGroup,
+  } from "./panels";
   import ParamControl from "./ParamControl.svelte";
 
   const {
@@ -53,12 +64,30 @@
   }
 </script>
 
+<!--
+  One op's controls. Two ops are drawn by a hand-built editor instead of by a row per
+  parameter, because Lightroom shows them as one control: the tone curve is one graph with
+  a tab per channel rather than four arrays in a row, and the colour mixer is eight rows
+  with a tab per channel rather than twenty-four sliders. Each editor takes its whole op.
+-->
+{#snippet controls(definition: OpDefinition, entryId: string | null)}
+  {@const curve = curveParams(definition)}
+  {@const mixer = mixerParams(definition)}
+  {#if curve}
+    <CurveEditor op={definition} {curve} opId={entryId} />
+  {/if}
+  {#if mixer}
+    <MixerEditor op={definition} {mixer} opId={entryId} />
+  {/if}
+  {#each generatedParams(definition) as spec (spec.name)}
+    <ParamControl op={definition} {spec} opId={entryId} />
+  {/each}
+{/snippet}
+
 {#if opId}
   <div class="flex flex-col py-1" data-pane="op-panel" data-op-panel={opId}>
     {#if single && singleDefinition}
-      {#each singleDefinition.params as spec (spec.name)}
-        <ParamControl op={singleDefinition} {spec} {opId} />
-      {/each}
+      {@render controls(singleDefinition, opId)}
     {:else}
       <p class="px-3 py-2 text-xs text-faint">This op has no generated controls.</p>
     {/if}
@@ -132,9 +161,7 @@
                   </button>
                 </div>
               {/if}
-              {#each op.params as spec (spec.name)}
-                <ParamControl {op} {spec} />
-              {/each}
+              {@render controls(op, null)}
             {/each}
           </div>
         {/if}

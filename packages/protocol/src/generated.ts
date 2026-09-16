@@ -274,6 +274,13 @@ export interface MaskPreviewResult {
   width: number;
   height: number;
   /**
+   * [x, y, width, height] of the image inside the proxy, in proxy pixels. Mask component coordinates are normalised over this rect.
+   *
+   * @minItems 4
+   * @maxItems 4
+   */
+  contentRect?: [number, number, number, number];
+  /**
    * Fraction 0..1 of pixels above 50 %, so a client can tell an empty mask from a failed one.
    */
   coverage?: number;
@@ -566,6 +573,13 @@ export interface ViewRenderResult {
    */
   width: number;
   height: number;
+  /**
+   * [x, y, width, height] of the image inside the proxy, in proxy pixels. Mask component coordinates are normalised over this rect.
+   *
+   * @minItems 4
+   * @maxItems 4
+   */
+  contentRect?: [number, number, number, number];
   renderMs: number;
   readbackMs: number;
 }

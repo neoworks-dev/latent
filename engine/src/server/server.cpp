@@ -134,6 +134,15 @@ std::vector<int64_t> id_array(const nlohmann::json& params, const char* key) {
   return ids;
 }
 
+// [x, y, width, height] of the image inside the proxy, in proxy pixels — what both
+// ViewRenderResult and MaskPreviewResult answer with. Mask component coordinates are
+// normalised over this rect, so a client that assumed it was the whole frame draws its
+// overlay in the wrong place as soon as crop or rotate changes the aspect.
+nlohmann::json content_rect(const ViewGeometry& geometry) {
+  return nlohmann::json::array(
+      {geometry.content_x, geometry.content_y, geometry.content_width, geometry.content_height});
+}
+
 // The frame's target field is a u32: an id that does not fit could only go out mislabelled.
 void require_thumbnailable(int64_t photo_id) {
   if (photo_id <= kMaxThumbnailPhotoId) return;
@@ -714,10 +723,13 @@ nlohmann::json Server::handle_view_render(const nlohmann::json& params, Peer* pe
   peer->send(std::string_view(reinterpret_cast<const char*>(view.frame.data()), view.frame.size()),
              uWS::OpCode::BINARY);
   // The revision the pixels came from, so a client that coalesced drags can tell whether
-  // the frame it holds is the newest state or one render behind.
+  // the frame it holds is the newest state or one render behind. `contentRect` is where
+  // the image sits inside that frame: crop and rotate change its aspect, so the letterbox
+  // is not something the client can derive from the photo's own size.
   return {{"seq", view.seq},
           {"width", geometry.width},
           {"height", geometry.height},
+          {"contentRect", content_rect(geometry)},
           {"renderMs", timing.render_ms},
           {"readbackMs", timing.readback_ms},
           {"revision", found->second.history.revision()}};
@@ -1066,13 +1078,18 @@ nlohmann::json Server::handle_mask_preview(const nlohmann::json& params, Peer* p
   }
 
   std::vector<uint8_t> frame;
-  const MaskReadout readout = send_mask_frame(peer, photo, view_id, op_id, component_id, frame);
-  return {{"width", readout.width}, {"height", readout.height}, {"coverage", readout.coverage}};
+  ViewGeometry geometry;
+  const MaskReadout readout =
+      send_mask_frame(peer, photo, view_id, op_id, component_id, frame, geometry);
+  return {{"width", readout.width},
+          {"height", readout.height},
+          {"contentRect", content_rect(geometry)},
+          {"coverage", readout.coverage}};
 }
 
 MaskReadout Server::send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view_id,
                                     const std::string& op_id, const std::string& component_id,
-                                    std::vector<uint8_t>& frame) {
+                                    std::vector<uint8_t>& frame, ViewGeometry& geometry) {
   uint32_t target = view_id;
   const bool temporary = target == 0;
   if (temporary) {
@@ -1090,7 +1107,7 @@ MaskReadout Server::send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view
 
   MaskReadout readout;
   try {
-    const ViewGeometry geometry = renderer_.view_geometry(target);
+    geometry = renderer_.view_geometry(target);
     frame.assign(kFrameHeaderBytes + (static_cast<size_t>(geometry.width) * geometry.height), 0);
     readout = renderer_.read_mask(target, photo.history.current(), op_id, component_id, frame,
                                   kFrameHeaderBytes);

@@ -245,6 +245,13 @@
       "properties": {
         "width": { "type": "integer" },
         "height": { "type": "integer" },
+        "contentRect": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" },
+          "description": "[x, y, width, height] of the image inside the proxy, in proxy pixels. Mask component coordinates are normalised over this rect."
+        },
         "coverage": {
           "type": "number",
           "description": "Fraction 0..1 of pixels above 50 %, so a client can tell an empty mask from a failed one."
@@ -886,6 +893,13 @@
         },
         "height": {
           "type": "integer"
+        },
+        "contentRect": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" },
+          "description": "[x, y, width, height] of the image inside the proxy, in proxy pixels. Mask component coordinates are normalised over this rect."
         },
         "renderMs": {
           "type": "number"

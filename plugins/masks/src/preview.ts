@@ -2,7 +2,7 @@
 // that asked for it, and several previews can be in flight for one view — so the only way
 // to pair a frame with its result is to have exactly one request open at a time. Every
 // caller goes through a queue; the engine still renders the newest state it has.
-import type { EngineClient } from "@latent/contracts";
+import type { ContentRect, EngineClient } from "@latent/contracts";
 import type { MaskPreviewParams } from "@latent/protocol";
 
 export interface MaskPreview {
@@ -12,11 +12,20 @@ export interface MaskPreview {
   coverage: Uint8Array;
   /** Fraction of the frame above 50 %, straight from the result. */
   fraction: number;
+  /**
+   * Where the photo is inside the raster, in raster pixels — the sub-rectangle an overlay
+   * blits, because the raster is letterboxed exactly like the frame it lies over. Null
+   * from an engine that does not send it; the whole raster is the fallback.
+   */
+  contentRect: ContentRect | null;
 }
+
+/** What the LMSK frame alone carries; the rest of `MaskPreview` comes from the result. */
+type RasterFrame = Omit<MaskPreview, "fraction" | "contentRect">;
 
 export class MaskPreviewQueue {
   private chain: Promise<unknown> = Promise.resolve();
-  private receive: ((preview: Omit<MaskPreview, "fraction">) => void) | null = null;
+  private receive: ((preview: RasterFrame) => void) | null = null;
   private readonly unsubscribe: () => void;
 
   constructor(private readonly engine: EngineClient) {
@@ -48,7 +57,7 @@ export class MaskPreviewQueue {
   }
 
   private async send(params: MaskPreviewParams): Promise<MaskPreview | null> {
-    let frame: Omit<MaskPreview, "fraction"> | null = null;
+    let frame: RasterFrame | null = null;
     this.receive = (preview) => {
       frame = preview;
     };
@@ -56,7 +65,11 @@ export class MaskPreviewQueue {
       // The frame is sent before the result on the same socket, so it has landed by now.
       const result = await this.engine.call("mask.preview", params);
       if (!frame) return null;
-      return { ...(frame as Omit<MaskPreview, "fraction">), fraction: result.coverage ?? 0 };
+      return {
+        ...(frame as RasterFrame),
+        fraction: result.coverage ?? 0,
+        contentRect: result.contentRect ?? null,
+      };
     } finally {
       this.receive = null;
     }

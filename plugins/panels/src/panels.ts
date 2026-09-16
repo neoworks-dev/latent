@@ -2,6 +2,7 @@
 // calls, no DOM: `ops.describe` in, groups, control kinds, readout text and slider
 // arithmetic out. Everything a slider does to a number lives here so it can be tested.
 import type { Op, OpDefinition, OpParamDisplay, OpParamSpec } from "@latent/protocol";
+import { curveJson, curvePoints, type SplitName } from "./curve";
 
 /** Lightroom's Edit-panel headings, top to bottom. Sections the engine invents sort after. */
 export const sectionOrder = ["Light", "Color", "Effects", "Detail", "Optics", "Geometry"] as const;
@@ -68,26 +69,162 @@ export type ControlKind = "slider" | "checkbox" | "select" | "pending" | "unsupp
 
 /**
  * `display.kind` decides the control when the engine sends one; `type` is the fallback for
- * an engine that does not. `pending` is a curve or colour-mixer parameter — it gets a note
- * rather than a generated control, because the real editor is a hand-built plugin and a
- * slider over those values would be a lie.
+ * an engine that does not. A colour-mixer parameter is an ordinary bipolar slider — `hsl`
+ * says the mixer groups it into a band, not that it needs a different control — and the
+ * mixer draws it with the same `Slider` as the rest of the column.
+ *
+ * `pending` is the note left for a parameter no control can hold. Curve parameters never
+ * reach here in practice: `curveParams` takes them out of the generated list and the
+ * hand-built editor draws them.
  */
 export function controlKind(spec: OpParamSpec): ControlKind {
   const kind = spec.display?.kind;
-  if (kind === "curve" || kind === "hsl") return "pending";
   if (kind === "toggle") return "checkbox";
-  if (kind === "slider" || kind === "kelvin") return "slider";
+  if (kind === "slider" || kind === "kelvin" || kind === "hsl") return "slider";
+  if (kind === "curve" || spec.type === "curve") return "pending";
   if (spec.type === "number" || spec.type === "integer") return "slider";
   if (spec.type === "boolean") return "checkbox";
   if (spec.type === "enum" && spec.values && spec.values.length > 0) return "select";
-  if (spec.type === "curve") return "pending";
   return "unsupported";
 }
 
-/** What the placeholder row says in place of a control that is not built yet. */
-export function pendingNote(spec: OpParamSpec): string {
-  if (spec.display?.kind === "hsl") return "Color mixer — coming";
-  return "Curve editor — coming";
+/** What the placeholder row says in place of a control no generated widget can hold. */
+export const pendingNote = "Drawn by the curve editor";
+
+/** A point curve, whichever way the engine labelled it. */
+function isCurveSpec(spec: OpParamSpec): boolean {
+  return spec.display?.kind === "curve" || spec.type === "curve";
+}
+
+/**
+ * The engine describes a split point as an ordinary 0..100 slider — `display.kind` has no
+ * value for one — so the three are matched by name. Renaming them in
+ * engine/src/ops/registry.cpp needs the same change here.
+ */
+const splitNames: SplitName[] = ["shadowSplit", "midtoneSplit", "highlightSplit"];
+
+/** One split point: its engine name, typed, beside the spec the handle reads its range from. */
+export interface CurveSplit {
+  name: SplitName;
+  spec: OpParamSpec;
+}
+
+export interface CurveParams {
+  /** The point curves, one per channel, drawn as one graph with a tab each. */
+  points: OpParamSpec[];
+  /** The parametric region amounts, Lightroom's four sliders under the graph. */
+  regions: OpParamSpec[];
+  /** The three split points, drawn as handles on the graph's x axis. */
+  splits: CurveSplit[];
+}
+
+/**
+ * What the hand-built curve editor draws, or null for an op without a point curve.
+ *
+ * An op that has any point curve is the editor's whole op: `tone_curve`'s parametric
+ * regions and splits share the same graph, and generating sliders for them beside the
+ * editor would draw the same curve twice.
+ */
+export function curveParams(op: OpDefinition): CurveParams | null {
+  const points = op.params.filter(isCurveSpec);
+  if (points.length === 0) return null;
+  const rest = op.params.filter((spec) => !isCurveSpec(spec));
+  const splits: CurveSplit[] = [];
+  for (const name of splitNames) {
+    const spec = rest.find((candidate) => candidate.name === name);
+    if (spec) splits.push({ name, spec });
+  }
+  return {
+    points,
+    regions: rest.filter((spec) => !splitNames.some((name) => name === spec.name)),
+    splits,
+  };
+}
+
+/** Lightroom's Color Mixer tabs: one per channel, then the grid of all of them. */
+export const mixerChannels = ["Hue", "Saturation", "Luminance"] as const;
+export type MixerChannel = (typeof mixerChannels)[number];
+
+/** One band's slider for one channel. */
+export interface MixerSlider {
+  channel: MixerChannel;
+  spec: OpParamSpec;
+}
+
+/** One of Lightroom's eight colour bands, with whichever channels the engine describes. */
+export interface MixerBand {
+  /** The engine's band name, `red` … `magenta`. */
+  name: string;
+  label: string;
+  sliders: MixerSlider[];
+}
+
+export interface MixerParams {
+  bands: MixerBand[];
+}
+
+/**
+ * The engine names a mixer slider `<band><Channel>` and marks it `display.kind: "hsl"`.
+ * The kind says it belongs to the mixer but not to which band or which of the three, so
+ * the name is split here; renaming them in engine/src/ops/registry.cpp needs the same
+ * change. A parameter whose name carries no channel is not the mixer's.
+ */
+function mixerSlot(spec: OpParamSpec): { band: string; channel: MixerChannel } | null {
+  if (spec.display?.kind !== "hsl") return null;
+  for (const channel of mixerChannels) {
+    if (!spec.name.endsWith(channel)) continue;
+    const band = spec.name.slice(0, -channel.length);
+    if (band.length === 0) return null;
+    return { band, channel };
+  }
+  return null;
+}
+
+/**
+ * What the hand-built colour mixer draws, or null for an op with no mixer band. An op that
+ * has any is entirely the mixer's, the same rule the curve editor follows.
+ */
+export function mixerParams(op: OpDefinition): MixerParams | null {
+  const bands: MixerBand[] = [];
+  for (const spec of op.params) {
+    const slot = mixerSlot(spec);
+    if (!slot) continue;
+    const existing = bands.find((band) => band.name === slot.band);
+    if (existing) {
+      existing.sliders.push({ channel: slot.channel, spec });
+      continue;
+    }
+    bands.push({
+      name: slot.band,
+      label: titleCase(slot.band),
+      sliders: [{ channel: slot.channel, spec }],
+    });
+  }
+  if (bands.length === 0) return null;
+  return { bands };
+}
+
+/** The parameters `ParamControl` draws: everything the hand-built editors did not take. */
+export function generatedParams(op: OpDefinition): OpParamSpec[] {
+  if (curveParams(op) || mixerParams(op)) return [];
+  return op.params;
+}
+
+const curveStrokes: Record<string, string> = {
+  parametric: "var(--color-default)",
+  rgb: "var(--color-default)",
+  red: "var(--ctx-red)",
+  green: "var(--ctx-green)",
+  blue: "var(--ctx-blue)",
+};
+
+/**
+ * The colour a curve is stroked in — the channel it steers, in context tokens, so the
+ * graph follows the theme the way the tinted slider tracks do. A channel the engine
+ * invents is stroked like the RGB one rather than going invisible.
+ */
+export function curveStroke(tab: string): string {
+  return curveStrokes[tab] ?? "var(--color-default)";
 }
 
 export interface SliderRange {
@@ -105,10 +242,15 @@ export function sliderRange(spec: OpParamSpec): SliderRange {
   return { min, max, step: (max - min) / 200 };
 }
 
+/** An engine name as a heading: separators to spaces, first letter up. */
+function titleCase(name: string): string {
+  const spaced = name.replace(/[_-]+/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
 export function paramLabel(spec: OpParamSpec): string {
   if (spec.label) return spec.label;
-  const spaced = spec.name.replace(/[_-]+/g, " ");
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+  return titleCase(spec.name);
 }
 
 /**
@@ -304,6 +446,9 @@ export function paramValue(
 
 /** Numbers compare within half a step; the engine may round a float on the way back. */
 function isDefaultValue(value: unknown, spec: OpParamSpec): boolean {
+  // A curve is an array, so it is never the same object as the described default; the
+  // untouched curve is the one with no points, and a bare pair of endpoints is that curve.
+  if (isCurveSpec(spec)) return curveJson(curvePoints(value)).length === 0;
   if (typeof value !== "number" || typeof spec.default !== "number") {
     return value === spec.default;
   }
