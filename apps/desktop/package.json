@@ -1,0 +1,21 @@
+{
+  "name": "@latent/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "bun scripts/dev.ts",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p scripts/tsconfig.json"
+  },
+  "dependencies": {
+    "@latent/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "electron": "^43.4.1",
+    "electron-vite": "^5.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6"
+  }
+}
