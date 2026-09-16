@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "latent-engine",
+  "version-string": "0.0.0",
+  "description": "Latent raw photo engine daemon",
+  "dependencies": [
+    "libraw",
+    "nlohmann-json",
+    "uwebsockets",
+    "libpng",
+    "catch2",
+    "pybind11"
+  ]
+}

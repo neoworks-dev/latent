@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Electron main and preload: no DOM. The renderer is apps/editor, the dev scripts
+    // have their own project (tsconfig.scripts.json) because they drive a page.
+    "lib": ["ES2022"],
+    "types": ["bun"],
+    "declaration": false
+  },
+  "include": ["src/**/*.ts", "electron.vite.config.ts"]
+}

@@ -1,0 +1,25 @@
+@import "tailwindcss";
+@import "@neoworks-dev/ui/styles";
+
+@source "../node_modules/@neoworks-dev/ui/src";
+@source "../../../packages";
+@source "../../../plugins";
+
+/* The design system defines the z scale as `--z-*`; Tailwind builds `z-…` utilities
+   from the `--z-index-*` namespace, so the tokens are republished under it. */
+@theme inline {
+  --z-index-raised: var(--z-raised);
+  --z-index-overlay: var(--z-overlay);
+  --z-index-modal: var(--z-modal);
+  --z-index-toast: var(--z-toast);
+  --z-index-nav: var(--z-nav);
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  user-select: none;
+}

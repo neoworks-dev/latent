@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+build/
+.svelte-kit/
+*.node
+*.log
+.DS_Store
+engine/build/
+engine/third_party/
+engine/build-vcpkg.log
+engine/vcpkg_installed/

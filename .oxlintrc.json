@@ -1,0 +1,47 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/require-await": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "no-unused-vars": "error",
+    "no-param-reassign": "error",
+    "no-nested-ternary": "error",
+    "prefer-template": "error",
+    "no-console": "warn",
+    "oxc/no-barrel-file": "error",
+    "local/no-empty-ternary-branch": "error",
+    "local/no-chained-nullish-coalescing": "error",
+    "typescript/explicit-function-return-type": [
+      "error",
+      {
+        "allowExpressions": true
+      }
+    ],
+    "local/no-call-result-cast": "error"
+  },
+  "overrides": [
+    {
+      "files": ["tools/**", "**/scripts/**"],
+      "rules": {
+        "no-console": "off"
+      }
+    }
+  ],
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/.svelte-kit/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/out/**",
+    "engine/**",
+    "packages/protocol/src/generated.ts"
+  ],
+  "jsPlugins": ["./tools/oxlint-local-plugin.ts"]
+}

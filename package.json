@@ -1,0 +1,47 @@
+{
+  "name": "latent",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "plugins/*",
+    "tools"
+  ],
+  "scripts": {
+    "dev": "bun --filter @latent/desktop dev",
+    "build": "bun --filter '*' build",
+    "typecheck": "bun --filter '*' typecheck",
+    "lint": "oxlint --type-aware; a=$?; eslint .; b=$?; exit $((a | b))",
+    "lint:fix": "oxlint --type-aware --fix; eslint . --fix",
+    "lint:ts": "oxlint --type-aware",
+    "lint:svelte": "eslint .",
+    "format": "prettier --check . && cmake --build engine/build/dev --target format-check",
+    "format:fix": "prettier --write . && cmake --build engine/build/dev --target format",
+    "check:svelte": "bun --filter @latent/editor typecheck",
+    "test": "bun test",
+    "engine:configure": "cmake -S engine --preset dev",
+    "engine:build": "cmake --build --preset dev",
+    "engine:test": "ctest --preset dev",
+    "probe:frame": "bun engine/probe/frame-client/run.ts",
+    "mock-engine": "bun tools/mock-engine.ts",
+    "screenshot": "node apps/desktop/scripts/screenshot.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "electron": "^43.4.1",
+    "eslint": "^10.9.1",
+    "eslint-plugin-svelte": "^3.23.0",
+    "oxlint": "^1.80.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "playwright": "^1.63.0",
+    "prettier": "^3.9.6",
+    "prettier-plugin-svelte": "^4.1.1",
+    "svelte-eslint-parser": "^1.8.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0"
+  },
+  "trustedDependencies": [
+    "electron"
+  ]
+}

@@ -1,0 +1,703 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "$id": "https://latent.local/protocol/messages.schema.json",
+  "title": "LatentProtocol",
+  "description": "JSON-RPC 2.0 methods between the Latent engine and its UI. Each method has <Method>Params and <Method>Result. Phase 0 surface only.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "_root": {
+      "$ref": "#/definitions/Envelope"
+    }
+  },
+  "definitions": {
+    "Envelope": {
+      "description": "JSON-RPC 2.0 envelope. `id` absent on notifications.",
+      "type": "object",
+      "required": [
+        "jsonrpc"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "method": {
+          "$ref": "#/definitions/MethodName"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "result": {},
+        "error": {
+          "$ref": "#/definitions/RpcError"
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        },
+        "data": {}
+      }
+    },
+    "MethodName": {
+      "type": "string",
+      "enum": [
+        "engine.hello",
+        "ops.describe",
+        "photo.open",
+        "photo.close",
+        "stack.get",
+        "stack.set",
+        "op.add",
+        "op.update",
+        "op.remove",
+        "history.undo",
+        "history.redo",
+        "view.open",
+        "view.close",
+        "view.render",
+        "python.run",
+        "stack.changed",
+        "engine.log"
+      ]
+    },
+    "PhotoId": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ViewId": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "OpId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "Op": {
+      "description": "One entry of the op-stack. `op` names a definition from ops.describe; `params` validates against that definition's schema.",
+      "type": "object",
+      "required": [
+        "id",
+        "op",
+        "params",
+        "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/OpId"
+        },
+        "op": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "mask": {
+          "$ref": "#/definitions/MaskRef"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "MaskRef": {
+      "description": "Phase 1. Reserved so Op's shape does not change when masks arrive.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string"
+        }
+      }
+    },
+    "Stack": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Op"
+      }
+    },
+    "OpParamSpec": {
+      "description": "One slider/control of an op, in Lightroom terms.",
+      "type": "object",
+      "required": [
+        "name",
+        "type",
+        "default"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "number",
+            "integer",
+            "boolean",
+            "enum",
+            "curve"
+          ]
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "step": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "default": {},
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "OpDefinition": {
+      "type": "object",
+      "required": [
+        "name",
+        "panel",
+        "label",
+        "params"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "panel": {
+          "type": "string",
+          "enum": [
+            "light",
+            "color",
+            "effects",
+            "detail",
+            "optics",
+            "geometry",
+            "generative"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpParamSpec"
+          }
+        }
+      }
+    },
+    "Histogram": {
+      "type": "object",
+      "required": [
+        "bins",
+        "r",
+        "g",
+        "b",
+        "clippedShadowsPct",
+        "clippedHighlightsPct"
+      ],
+      "properties": {
+        "bins": {
+          "type": "integer"
+        },
+        "r": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "g": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "b": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "clippedShadowsPct": {
+          "type": "number"
+        },
+        "clippedHighlightsPct": {
+          "type": "number"
+        }
+      }
+    },
+    "EngineHelloParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "client": {
+          "type": "string"
+        }
+      }
+    },
+    "EngineHelloResult": {
+      "type": "object",
+      "required": [
+        "engineVersion",
+        "protocolVersion",
+        "gpu"
+      ],
+      "properties": {
+        "engineVersion": {
+          "type": "string"
+        },
+        "protocolVersion": {
+          "type": "integer"
+        },
+        "gpu": {
+          "type": "object",
+          "required": [
+            "adapter",
+            "maxTextureDimension2D",
+            "shaderF16"
+          ],
+          "properties": {
+            "adapter": {
+              "type": "string"
+            },
+            "maxTextureDimension2D": {
+              "type": "integer"
+            },
+            "shaderF16": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "OpsDescribeParams": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "OpsDescribeResult": {
+      "type": "object",
+      "required": [
+        "ops"
+      ],
+      "properties": {
+        "ops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpDefinition"
+          }
+        }
+      }
+    },
+    "PhotoOpenParams": {
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "PhotoOpenResult": {
+      "type": "object",
+      "required": [
+        "photoId",
+        "width",
+        "height",
+        "camera"
+      ],
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "camera": {
+          "type": "string"
+        }
+      }
+    },
+    "PhotoCloseParams": {
+      "type": "object",
+      "required": [
+        "photoId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        }
+      }
+    },
+    "PhotoCloseResult": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "StackGetParams": {
+      "type": "object",
+      "required": [
+        "photoId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        }
+      }
+    },
+    "StackGetResult": {
+      "type": "object",
+      "required": [
+        "stack",
+        "revision",
+        "canUndo",
+        "canRedo"
+      ],
+      "properties": {
+        "stack": {
+          "$ref": "#/definitions/Stack"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "canUndo": {
+          "type": "boolean"
+        },
+        "canRedo": {
+          "type": "boolean"
+        },
+        "histogram": {
+          "$ref": "#/definitions/Histogram"
+        }
+      }
+    },
+    "StackSetParams": {
+      "type": "object",
+      "required": [
+        "photoId",
+        "stack"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "stack": {
+          "$ref": "#/definitions/Stack"
+        }
+      }
+    },
+    "StackSetResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "OpAddParams": {
+      "type": "object",
+      "required": [
+        "photoId",
+        "op",
+        "params"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "op": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "index": {
+          "type": "integer",
+          "description": "Insert position; end of stack when omitted."
+        }
+      }
+    },
+    "OpAddResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "OpUpdateParams": {
+      "type": "object",
+      "required": [
+        "photoId",
+        "opId",
+        "params"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "opId": {
+          "$ref": "#/definitions/OpId"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Partial; merged into the op's params."
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "transient": {
+          "type": "boolean",
+          "description": "True while a slider is being dragged: no history snapshot, no sidecar write. The first non-transient update after a drag snapshots."
+        }
+      }
+    },
+    "OpUpdateResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "OpRemoveParams": {
+      "type": "object",
+      "required": [
+        "photoId",
+        "opId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "opId": {
+          "$ref": "#/definitions/OpId"
+        }
+      }
+    },
+    "OpRemoveResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "HistoryUndoParams": {
+      "$ref": "#/definitions/StackGetParams"
+    },
+    "HistoryUndoResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "HistoryRedoParams": {
+      "$ref": "#/definitions/StackGetParams"
+    },
+    "HistoryRedoResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "ViewOpenParams": {
+      "description": "A view is one canvas showing one photo at one proxy size. Frames for it arrive as LFRM binary frames tagged with viewId.",
+      "type": "object",
+      "required": [
+        "photoId",
+        "width",
+        "height"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "ViewOpenResult": {
+      "type": "object",
+      "required": [
+        "viewId"
+      ],
+      "properties": {
+        "viewId": {
+          "$ref": "#/definitions/ViewId"
+        }
+      }
+    },
+    "ViewCloseParams": {
+      "type": "object",
+      "required": [
+        "viewId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "viewId": {
+          "$ref": "#/definitions/ViewId"
+        }
+      }
+    },
+    "ViewCloseResult": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ViewRenderParams": {
+      "description": "Ask for a frame of the view's current state. Resizing happens here too.",
+      "type": "object",
+      "required": [
+        "viewId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "viewId": {
+          "$ref": "#/definitions/ViewId"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        }
+      }
+    },
+    "ViewRenderResult": {
+      "type": "object",
+      "required": [
+        "seq",
+        "renderMs",
+        "readbackMs"
+      ],
+      "properties": {
+        "seq": {
+          "type": "integer"
+        },
+        "renderMs": {
+          "type": "number"
+        },
+        "readbackMs": {
+          "type": "number"
+        }
+      }
+    },
+    "PythonRunParams": {
+      "type": "object",
+      "required": [
+        "code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "photoId": {
+          "$ref": "#/definitions/PhotoId",
+          "description": "Bound to `latent.photo` for the run."
+        }
+      }
+    },
+    "PythonRunResult": {
+      "type": "object",
+      "required": [
+        "ok",
+        "stdout",
+        "stderr"
+      ],
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "value": {
+          "description": "repr() of the script's last expression, if any.",
+          "type": "string"
+        }
+      }
+    },
+    "StackChangedParams": {
+      "description": "Notification: the stack of a photo changed by any writer (UI, script, MCP). Carries the new state so the UI never re-fetches.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/StackGetResult"
+        },
+        {
+          "type": "object",
+          "required": [
+            "photoId",
+            "source"
+          ],
+          "properties": {
+            "photoId": {
+              "$ref": "#/definitions/PhotoId"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "ui",
+                "python",
+                "mcp",
+                "history",
+                "load"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "EngineLogParams": {
+      "type": "object",
+      "required": [
+        "level",
+        "message"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

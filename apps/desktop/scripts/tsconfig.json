@@ -1,0 +1,12 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    // The dev scripts drive a browser page, so they get the DOM lib that Electron main
+    // and preload must not have. Living next to the sources also keeps oxlint's
+    // type-aware pass on the right project.
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["bun"],
+    "declaration": false
+  },
+  "include": ["**/*.ts"]
+}

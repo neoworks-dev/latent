@@ -1,0 +1,7 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["bun"] },
+  // The two lint plugins are deliberately outside: oxlint and ESLint load them directly
+  // and they import nothing, so a project would only get in the way.
+  "include": ["mock-engine.ts", "tests/**/*.ts"]
+}

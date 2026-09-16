@@ -1,0 +1,23 @@
+node_modules
+.svelte-kit
+build
+dist
+out
+bun.lock
+
+# The C++ side and its config: clang-format owns those, `bun run format` calls it.
+engine
+.clang-format
+
+# The wire contract is the engine's to edit; reformatting it here would show up as a
+# diff on a file this half of the repo must not touch.
+protocol
+
+# Authored and vendored content, not project source: the brief, the agent rules, the
+# scraped Adobe docs that are the op spec, and the skill copies (COMPONENTS.md is
+# generated in its own repo). A formatter that rewrites them would edit prose on every
+# `bun run format`.
+PROMPT.md
+CLAUDE.md
+reference
+.claude

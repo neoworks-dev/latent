@@ -1,0 +1,29 @@
+{
+  "name": "@latent/editor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --bun vite dev",
+    "build": "bun --bun vite build",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@latent/contracts": "workspace:*",
+    "@latent/plugin-panels": "workspace:*",
+    "@latent/protocol": "workspace:*",
+    "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+    "@neoworks/extension-system": "link:@neoworks/extension-system",
+    "phosphor-svelte": "^3.1.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
+    "@tailwindcss/vite": "^4.2.2",
+    "svelte": "^5.56.4",
+    "svelte-check": "^4.4.1",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6"
+  }
+}

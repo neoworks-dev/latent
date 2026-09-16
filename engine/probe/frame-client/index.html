@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>latent frame probe</title>
+    <style>
+      html, body { margin: 0; background: #141416; color: #ddd; font: 13px monospace; }
+      #stats { position: fixed; top: 8px; left: 8px; white-space: pre; background: rgba(0,0,0,.6); padding: 6px 8px; }
+      canvas { display: block; width: 100vw; height: 100vh; object-fit: contain; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="stats">connecting…</div>
+    <script>
+      const TICKS = 100;
+      const canvas = document.getElementById("view");
+      const stats = document.getElementById("stats");
+      const context = canvas.getContext("2d");
+      const socket = new WebSocket("ws://127.0.0.1:7788");
+      socket.binaryType = "arraybuffer";
+
+      const roundTrips = [];
+      const engine = { render: [], readback: [] };
+      let sentAt = 0;
+      let tick = 0;
+      let imageData = null;
+
+      function drawFrame(buffer) {
+        const view = new DataView(buffer);
+        const width = view.getUint32(4, true);
+        const height = view.getUint32(8, true);
+        if (!imageData || canvas.width !== width) {
+          canvas.width = width;
+          canvas.height = height;
+          imageData = context.createImageData(width, height);
+        }
+        imageData.data.set(new Uint8ClampedArray(buffer, 16, width * height * 4));
+        context.putImageData(imageData, 0, 0);
+      }
+
+      function sendTick() {
+        // Sweep exposure -2..+2 so every frame is visibly different.
+        const exposure = -2 + 4 * (tick / TICKS);
+        sentAt = performance.now();
+        socket.send(JSON.stringify({ exposure }));
+      }
+
+      function percentile(values, p) {
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+      }
+
+      function finish() {
+        const mean = roundTrips.reduce((a, b) => a + b, 0) / roundTrips.length;
+        const report = {
+          ticks: roundTrips.length,
+          proxy: `${canvas.width}x${canvas.height}`,
+          roundtrip_ms: { mean: +mean.toFixed(2), p50: +percentile(roundTrips, 0.5).toFixed(2), p95: +percentile(roundTrips, 0.95).toFixed(2), max: +Math.max(...roundTrips).toFixed(2) },
+          engine_render_ms: +(engine.render.reduce((a, b) => a + b, 0) / engine.render.length).toFixed(2),
+          engine_readback_ms: +(engine.readback.reduce((a, b) => a + b, 0) / engine.readback.length).toFixed(2),
+          ok: percentile(roundTrips, 0.95) < 30,
+        };
+        stats.textContent = JSON.stringify(report, null, 2);
+        // Let the last frame paint before the screenshot.
+        requestAnimationFrame(() => requestAnimationFrame(() => window.probe.report(report)));
+      }
+
+      socket.addEventListener("open", () => {
+        window.probe.log("ws open");
+        sendTick();
+      });
+      socket.addEventListener("message", (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          drawFrame(event.data);
+          const rtt = performance.now() - sentAt;
+          roundTrips.push(rtt);
+          stats.textContent = `tick ${tick + 1}/${TICKS}  rtt ${rtt.toFixed(1)} ms`;
+          return;
+        }
+        const timing = JSON.parse(event.data);
+        engine.render.push(timing.render_ms);
+        engine.readback.push(timing.readback_ms);
+        tick += 1;
+        if (tick < TICKS) sendTick();
+        else finish();
+      });
+      socket.addEventListener("error", () => {
+        stats.textContent = "websocket error — is probe_frame running?";
+        window.probe.report({ ok: false, error: "websocket" });
+      });
+    </script>
+  </body>
+</html>
