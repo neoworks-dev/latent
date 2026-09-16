@@ -22,6 +22,11 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(unofficial-uwebsockets CONFIG REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libjpeg-turbo CONFIG REQUIRED)
+find_package(TIFF REQUIRED)
+find_package(lcms2 CONFIG REQUIRED)
+# AVIF is the one export format whose encoder (aom) is a long build. The engine ships
+# JPEG/TIFF16/PNG without it and says so at runtime (src/export/encoder.cpp).
+find_package(libavif CONFIG QUIET)
 find_package(Catch2 3 CONFIG REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed)
 find_package(pybind11 CONFIG REQUIRED)

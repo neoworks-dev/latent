@@ -50,24 +50,56 @@ async function waitFor(what: string, predicate: () => boolean, budgetMs = 60000)
 const ui = await connect(endpoint);
 
 const hello = await timed("engine.hello", () => ui.call("engine.hello", { client: "smoke" }));
-console.log(`  engine ${hello.engineVersion}, protocol ${hello.protocolVersion}, gpu ${hello.gpu.adapter}`);
+console.log(
+  `  engine ${hello.engineVersion}, protocol ${hello.protocolVersion}, gpu ${hello.gpu.adapter}`,
+);
 console.log(`  catalog ${hello.catalogPath}, mcp ${hello.mcpUrl}`);
 assert(hello.protocolVersion === 1, "protocolVersion must be 1");
 assert(hello.gpu.maxTextureDimension2D >= 16384, "maxTextureDimension2D too small");
-assert(hello.catalogPath === catalogPath, `engine.hello must name the catalog it opened, got ${hello.catalogPath}`);
-assert(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(hello.mcpUrl ?? ""), `engine.hello must carry the MCP url, got ${hello.mcpUrl}`);
+assert(
+  hello.catalogPath === catalogPath,
+  `engine.hello must name the catalog it opened, got ${hello.catalogPath}`,
+);
+assert(
+  /^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(hello.mcpUrl ?? ""),
+  `engine.hello must carry the MCP url, got ${hello.mcpUrl}`,
+);
 
 const described = await timed("ops.describe", () => ui.call("ops.describe"));
 const names = described.ops.map((op: { name: string }) => op.name);
 console.log(`  ${names.length} ops: ${names.join(", ")}`);
 // Lightroom's global develop controls, panel by panel.
 const expectedOps = [
-  "exposure", "contrast", "highlights", "shadows", "whites", "blacks", "tone_curve",
-  "white_balance", "vibrance", "saturation", "color_mixer", "color_grading",
-  "texture", "clarity", "dehaze", "vignette", "grain",
-  "sharpening", "noise_reduction", "color_noise_reduction",
-  "chromatic_aberration", "lens_correction", "defringe",
-  "crop", "rotate", "flip", "transform",
+  "exposure",
+  "contrast",
+  "highlights",
+  "shadows",
+  "whites",
+  "blacks",
+  "tone_curve",
+  "white_balance",
+  "vibrance",
+  "saturation",
+  "color_mixer",
+  "color_grading",
+  "texture",
+  "clarity",
+  "dehaze",
+  "vignette",
+  "grain",
+  // Generative sits beside Effects: PROMPT.md §3.5's cached rasters, not Lightroom panels.
+  "generative_fill",
+  "remove",
+  "sharpening",
+  "noise_reduction",
+  "color_noise_reduction",
+  "chromatic_aberration",
+  "lens_correction",
+  "defringe",
+  "crop",
+  "rotate",
+  "flip",
+  "transform",
 ];
 for (const expected of expectedOps) {
   assert(names.includes(expected), `ops.describe is missing ${expected}`);
@@ -84,28 +116,64 @@ for (const op of described.ops) {
   if (sectionsSeen.at(-1) !== op.section) sectionsSeen.push(op.section);
   for (const param of op.params) {
     if (param.type === "enum") {
-      assert(Array.isArray(param.values) && param.values.length > 0, `${op.name}.${param.name} has no values`);
+      assert(
+        Array.isArray(param.values) && param.values.length > 0,
+        `${op.name}.${param.name} has no values`,
+      );
       continue;
     }
-    assert(param.display && typeof param.display.kind === "string", `${op.name}.${param.name} has no display hint`);
+    assert(
+      param.display && typeof param.display.kind === "string",
+      `${op.name}.${param.name} has no display hint`,
+    );
   }
 }
 assert(
-  sectionsSeen.join(",") === "Light,Color,Effects,Detail,Optics,Geometry",
+  sectionsSeen.join(",") === "Light,Color,Effects,Generative,Detail,Optics,Geometry",
   `ops.describe must arrive in Lightroom's panel order, got ${sectionsSeen}`,
 );
 
 const whiteBalance = described.ops.find((op: any) => op.name === "white_balance");
-console.log(`  white_balance ${whiteBalance.section} #${whiteBalance.order}: ${whiteBalance.params.map((p: any) => `${p.name} ${p.type}`).join(", ")}`);
-assert(whiteBalance.section === "Color" && whiteBalance.order === 1, "white balance sits first in Color");
-assert(whiteBalance.params[0].name === "mode" && whiteBalance.params[0].default === "relative", "white balance defaults to the relative mode older sidecars use");
-assert(whiteBalance.params[2].display.kind === "kelvin" && whiteBalance.params[2].unit === "K", "the absolute temperature is a Kelvin slider");
-assert(whiteBalance.params[2].min === 2000 && whiteBalance.params[2].max === 50000, "Kelvin runs 2000..50000");
+console.log(
+  `  white_balance ${whiteBalance.section} #${whiteBalance.order}: ${whiteBalance.params.map((p: any) => `${p.name} ${p.type}`).join(", ")}`,
+);
+assert(
+  whiteBalance.section === "Color" && whiteBalance.order === 1,
+  "white balance sits first in Color",
+);
+assert(
+  whiteBalance.params[0].name === "mode" && whiteBalance.params[0].default === "relative",
+  "white balance defaults to the relative mode older sidecars use",
+);
+assert(
+  whiteBalance.params[2].display.kind === "kelvin" && whiteBalance.params[2].unit === "K",
+  "the absolute temperature is a Kelvin slider",
+);
+assert(
+  whiteBalance.params[2].min === 2000 && whiteBalance.params[2].max === 50000,
+  "Kelvin runs 2000..50000",
+);
 assert(whiteBalance.params[3].display.tint === "tint", "the tint slider carries the tint gradient");
-assert(described.ops.find((op: any) => op.name === "exposure").params[0].display.tint === undefined, "an untinted slider must not invent a tint");
-assert(described.ops.find((op: any) => op.name === "tone_curve").params.some((p: any) => p.display.kind === "curve"), "the tone curve must ask for a curve editor");
-assert(described.ops.find((op: any) => op.name === "color_mixer").params.length === 24, "the colour mixer is eight bands of hue, saturation and luminance");
-assert(described.ops.find((op: any) => op.name === "color_mixer").params.every((p: any) => p.display.kind === "hsl"), "the colour mixer asks for the hand-built control");
+assert(
+  described.ops.find((op: any) => op.name === "exposure").params[0].display.tint === undefined,
+  "an untinted slider must not invent a tint",
+);
+assert(
+  described.ops
+    .find((op: any) => op.name === "tone_curve")
+    .params.some((p: any) => p.display.kind === "curve"),
+  "the tone curve must ask for a curve editor",
+);
+assert(
+  described.ops.find((op: any) => op.name === "color_mixer").params.length === 24,
+  "the colour mixer is eight bands of hue, saturation and luminance",
+);
+assert(
+  described.ops
+    .find((op: any) => op.name === "color_mixer")
+    .params.every((p: any) => p.display.kind === "hsl"),
+  "the colour mixer asks for the hand-built control",
+);
 
 const sidecarPath = `${samplePath}.latent`;
 if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
@@ -114,13 +182,24 @@ if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
 rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 
 const photo = await timed("photo.open", () => ui.call("photo.open", { path: samplePath }));
-console.log(`  photo ${photo.photoId}: ${photo.camera} ${photo.width}x${photo.height} hash ${photo.hash.slice(0, 12)}…`);
+console.log(
+  `  photo ${photo.photoId}: ${photo.camera} ${photo.width}x${photo.height} hash ${photo.hash.slice(0, 12)}…`,
+);
 let photoId: number = photo.photoId;
 assert(/^[0-9a-f]{64}$/.test(photo.hash), "photo.open must return a sha-256 hex hash");
 assert(photo.sidecarLoaded === false, "there is no sidecar yet, so nothing can have been loaded");
-assert(photo.catalog && photo.catalog.photoId === photo.photoId, "photo.open must carry the catalog row");
-assert(photo.catalog.filename === "DSC00120.ARW" && photo.catalog.camera.includes("Sony"), "the catalog row is wrong");
-assert(photo.catalog.hash === photo.hash, "the catalog row must carry the same hash photo.open returns");
+assert(
+  photo.catalog && photo.catalog.photoId === photo.photoId,
+  "photo.open must carry the catalog row",
+);
+assert(
+  photo.catalog.filename === "DSC00120.ARW" && photo.catalog.camera.includes("Sony"),
+  "the catalog row is wrong",
+);
+assert(
+  photo.catalog.hash === photo.hash,
+  "the catalog row must carry the same hash photo.open returns",
+);
 
 // The decode runs on a worker: another client must keep being answered while it happens.
 const busy = connect(endpoint).then(async (second) => {
@@ -130,7 +209,9 @@ const busy = connect(endpoint).then(async (second) => {
 });
 assert((await busy).protocolVersion === 1, "the engine must answer other sockets during a decode");
 
-const view = await timed("view.open", () => ui.call("view.open", { photoId, width: 1280, height: 720 }));
+const view = await timed("view.open", () =>
+  ui.call("view.open", { photoId, width: 1280, height: 720 }),
+);
 let viewId: number = view.viewId;
 
 await timed("view.render (neutral)", () => ui.call("view.render", { viewId }));
@@ -138,8 +219,13 @@ const neutral = ui.frame;
 assert(neutral, "no frame for the neutral render");
 
 // op.add without params is legal: the registry defaults fill it in.
-const defaulted = await timed("op.add (defaults)", () => ui.call("op.add", { photoId, op: "contrast" }));
-assert(defaulted.stack.length === 1 && defaulted.stack[0].params.value === 0, "op.add without params should use the defaults");
+const defaulted = await timed("op.add (defaults)", () =>
+  ui.call("op.add", { photoId, op: "contrast" }),
+);
+assert(
+  defaulted.stack.length === 1 && defaulted.stack[0].params.value === 0,
+  "op.add without params should use the defaults",
+);
 await ui.call("op.remove", { photoId, opId: defaulted.stack[0].id });
 
 const added = await timed("op.add exposure +1", () =>
@@ -147,21 +233,34 @@ const added = await timed("op.add exposure +1", () =>
 );
 const opId: string = added.stack[0].id;
 assert(added.stack.length === 1, "stack should hold one op");
-assert(added.stack[0].op === "exposure" && added.stack[0].params.value === 1, "op.add stored the wrong op");
+assert(
+  added.stack[0].op === "exposure" && added.stack[0].params.value === 1,
+  "op.add stored the wrong op",
+);
 assert(added.canUndo === true, "canUndo should be true after op.add");
 
 const render = await timed("view.render (+1 EV)", () => ui.call("view.render", { viewId }));
-console.log(`  render ${render.renderMs.toFixed(2)} ms, readback ${render.readbackMs.toFixed(2)} ms, seq ${render.seq}`);
+console.log(
+  `  render ${render.renderMs.toFixed(2)} ms, readback ${render.readbackMs.toFixed(2)} ms, seq ${render.seq}`,
+);
 assert(ui.frame && ui.frame.seq === render.seq, "frame seq does not match the result");
 assert(ui.frame.target === viewId, "frame viewId does not match");
 assert(ui.frame.width === 1280 && ui.frame.height === 720, "frame is the wrong size");
 assert(render.width === 1280 && render.height === 720, "view.render must report the frame size");
-assert(render.revision === added.revision, `view.render must report the revision it rendered: ${render.revision} vs ${added.revision}`);
+assert(
+  render.revision === added.revision,
+  `view.render must report the revision it rendered: ${render.revision} vs ${added.revision}`,
+);
 
 // The sample is portrait and the view is 16:9, so the frame is mostly letterbox. Nothing in
 // the frame says where the photo is inside it — contentRect does, and mask coordinates are
 // normalised over it (protocol/README.md, view.render).
-function letterboxRect(imageWidth: number, imageHeight: number, viewWidth: number, viewHeight: number) {
+function letterboxRect(
+  imageWidth: number,
+  imageHeight: number,
+  viewWidth: number,
+  viewHeight: number,
+) {
   const aspect = imageWidth / imageHeight;
   let width = viewWidth;
   let height = Math.max(1, Math.round(viewWidth / aspect));
@@ -170,11 +269,18 @@ function letterboxRect(imageWidth: number, imageHeight: number, viewWidth: numbe
     width = Math.max(1, Math.round(viewHeight * aspect));
   }
   width = Math.min(width, viewWidth);
-  return [Math.floor((viewWidth - width) / 2), Math.floor((viewHeight - height) / 2), width, height];
+  return [
+    Math.floor((viewWidth - width) / 2),
+    Math.floor((viewHeight - height) / 2),
+    width,
+    height,
+  ];
 }
 
 const expectedRect = letterboxRect(photo.width, photo.height, 1280, 720);
-console.log(`  contentRect ${JSON.stringify(render.contentRect)} inside ${render.width}x${render.height}`);
+console.log(
+  `  contentRect ${JSON.stringify(render.contentRect)} inside ${render.width}x${render.height}`,
+);
 assert(
   JSON.stringify(render.contentRect) === JSON.stringify(expectedRect),
   `view.render must report the letterboxed image rect: ${JSON.stringify(render.contentRect)} vs ${JSON.stringify(expectedRect)}`,
@@ -197,9 +303,14 @@ console.log(`--- ${sidecarPath}\n${await Bun.file(sidecarPath).text()}---`);
 const resized = await timed("view.render (resize)", () =>
   ui.call("view.render", { viewId, width: 640, height: 480 }),
 );
-assert(ui.frame && ui.frame.width === 640 && ui.frame.height === 480, "view.render did not resize the target");
+assert(
+  ui.frame && ui.frame.width === 640 && ui.frame.height === 480,
+  "view.render did not resize the target",
+);
 assert(resized.seq > render.seq, "seq must increase per frame");
-await timed("view.render (restore)", () => ui.call("view.render", { viewId, width: 1280, height: 720 }));
+await timed("view.render (restore)", () =>
+  ui.call("view.render", { viewId, width: 1280, height: 720 }),
+);
 
 // ---- the whole op set -------------------------------------------------------------------
 // One op at a time, over the wire, on the real photo. engine/tests/render_test.cpp proves
@@ -215,10 +326,14 @@ const base = (await renderOnly("", {})).frame;
 const baseMean = mean(base.pixels);
 const baseDetail = detailEnergy(base.pixels);
 const baseBars = letterboxShare(base.pixels);
-console.log(`  neutral: mean ${baseMean.toFixed(1)}, detail ${baseDetail.toFixed(2)}, bars ${(baseBars * 100).toFixed(1)}%`);
+console.log(
+  `  neutral: mean ${baseMean.toFixed(1)}, detail ${baseDetail.toFixed(2)}, bars ${(baseBars * 100).toFixed(1)}%`,
+);
 
 const dehazed = (await renderOnly("dehaze", { value: 80 })).frame;
-console.log(`  dehaze +80: mean ${mean(dehazed.pixels).toFixed(1)}, detail ${detailEnergy(dehazed.pixels).toFixed(2)}`);
+console.log(
+  `  dehaze +80: mean ${mean(dehazed.pixels).toFixed(1)}, detail ${detailEnergy(dehazed.pixels).toFixed(2)}`,
+);
 assert(mean(dehazed.pixels) < baseMean - 2, "dehaze should pull the haze out and darken the frame");
 assert(detailEnergy(dehazed.pixels) > baseDetail, "dehaze should raise contrast, not lower it");
 
@@ -228,27 +343,53 @@ assert(mean(vignetted.pixels) < baseMean - 5, "a negative vignette must darken t
 
 const sharpened = (await renderOnly("sharpening", { amount: 150, radius: 1, detail: 60 })).frame;
 console.log(`  sharpening 150: detail ${detailEnergy(sharpened.pixels).toFixed(2)}`);
-assert(detailEnergy(sharpened.pixels) > baseDetail * 1.1, "sharpening must add high-frequency detail");
+assert(
+  detailEnergy(sharpened.pixels) > baseDetail * 1.1,
+  "sharpening must add high-frequency detail",
+);
 
 const denoised = (await renderOnly("noise_reduction", { luminance: 100, detail: 0 })).frame;
 assert(detailEnergy(denoised.pixels) < baseDetail, "noise reduction must take detail away");
 
 const curved = (await renderOnly("tone_curve", { shadows: 100, darks: 60 })).frame;
 console.log(`  tone_curve shadows +100: mean ${mean(curved.pixels).toFixed(1)}`);
-assert(mean(curved.pixels) > baseMean + 5, "lifting the curve's shadow region must brighten the frame");
-const contrasty = (await renderOnly("tone_curve", { rgb: [{ x: 0, y: 0 }, { x: 0.25, y: 0.1 }, { x: 0.75, y: 0.9 }, { x: 1, y: 1 }] })).frame;
+assert(
+  mean(curved.pixels) > baseMean + 5,
+  "lifting the curve's shadow region must brighten the frame",
+);
+const contrasty = (
+  await renderOnly("tone_curve", {
+    rgb: [
+      { x: 0, y: 0 },
+      { x: 0.25, y: 0.1 },
+      { x: 0.75, y: 0.9 },
+      { x: 1, y: 1 },
+    ],
+  })
+).frame;
 assert(detailEnergy(contrasty.pixels) > baseDetail, "an S point curve must add contrast");
 
 // Crop and rotate change the shape of the image inside the view, so the letterbox bars
 // grow: the frame stays 1280x720 and the picture inside it does not.
 const cropped = await renderOnly("crop", { left: 0.3, top: 0.2, right: 0.7, bottom: 0.5 });
-console.log(`  crop: ${cropped.timing.width}x${cropped.timing.height}, bars ${(letterboxShare(cropped.frame.pixels) * 100).toFixed(1)}%`);
-assert(cropped.timing.width === 1280 && cropped.timing.height === 720, "the view size does not change with the crop");
+console.log(
+  `  crop: ${cropped.timing.width}x${cropped.timing.height}, bars ${(letterboxShare(cropped.frame.pixels) * 100).toFixed(1)}%`,
+);
+assert(
+  cropped.timing.width === 1280 && cropped.timing.height === 720,
+  "the view size does not change with the crop",
+);
 // The sample is a portrait frame in a landscape view, so it is already heavily barred;
 // a crop that is proportionally wider than the photo fills more of the view, not less.
-assert(letterboxShare(cropped.frame.pixels) < baseBars - 0.05, "the crop did not change the image rect inside the view");
+assert(
+  letterboxShare(cropped.frame.pixels) < baseBars - 0.05,
+  "the crop did not change the image rect inside the view",
+);
 const turned = (await renderOnly("rotate", { value: 90 })).frame;
-assert(Math.abs(letterboxShare(turned.pixels) - baseBars) > 0.05, "rotating 90 degrees must change the image rect");
+assert(
+  Math.abs(letterboxShare(turned.pixels) - baseBars) > 0.05,
+  "rotating 90 degrees must change the image rect",
+);
 
 // Kelvin white balance warms the frame: more red, less blue than the as-shot neutral.
 const warm = (await renderOnly("white_balance", { mode: "kelvin", kelvin: 9000 })).frame;
@@ -268,14 +409,26 @@ const strongValues: Record<string, Record<string, unknown>> = {
   vibrance: { value: 90 },
   saturation: { value: -90 },
   color_mixer: { blueSaturation: -100, redHue: 60 },
-  color_grading: { shadowHue: 220, shadowSaturation: 90, highlightHue: 45, highlightSaturation: 70 },
+  color_grading: {
+    shadowHue: 220,
+    shadowSaturation: 90,
+    highlightHue: 45,
+    highlightSaturation: 70,
+  },
   texture: { value: 100 },
   clarity: { value: 100 },
   grain: { amount: 100 },
   color_noise_reduction: { amount: 100 },
   chromatic_aberration: { enabled: true },
   lens_correction: { distortion: 60, vignetting: 70 },
-  defringe: { purpleAmount: 100, purpleHueLow: 0, purpleHueHigh: 100, greenAmount: 100, greenHueLow: 0, greenHueHigh: 100 },
+  defringe: {
+    purpleAmount: 100,
+    purpleHueLow: 0,
+    purpleHueHigh: 100,
+    greenAmount: 100,
+    greenHueLow: 0,
+    greenHueHigh: 100,
+  },
   flip: { horizontal: true },
   transform: { vertical: 50, scale: 120 },
 };
@@ -294,7 +447,12 @@ everything.find((entry) => entry.op === "noise_reduction")!.params = { luminance
 everything.find((entry) => entry.op === "tone_curve")!.params = { shadows: 40, highlights: -40 };
 everything.find((entry) => entry.op === "white_balance")!.params = { mode: "kelvin", kelvin: 7000 };
 everything.find((entry) => entry.op === "vignette")!.params = { amount: -60 };
-everything.find((entry) => entry.op === "crop")!.params = { left: 0.05, top: 0.05, right: 0.95, bottom: 0.95 };
+everything.find((entry) => entry.op === "crop")!.params = {
+  left: 0.05,
+  top: 0.05,
+  right: 0.95,
+  bottom: 0.95,
+};
 everything.find((entry) => entry.op === "rotate")!.params = { value: 0 };
 await ui.call("stack.set", { photoId, stack: everything });
 let worst = { renderMs: 0, readbackMs: 0 };
@@ -303,8 +461,13 @@ for (let i = 0; i < 20; i++) {
   if (timing.renderMs > worst.renderMs) worst = timing;
 }
 const full = await ui.call("view.render", { viewId });
-console.log(`  all ${everything.length} ops at 1280x720: render ${full.renderMs.toFixed(2)} ms, readback ${full.readbackMs.toFixed(2)} ms (worst render ${worst.renderMs.toFixed(2)} ms)`);
-assert(full.renderMs + full.readbackMs < 16, `the whole op set must stay inside the 16 ms frame budget, took ${(full.renderMs + full.readbackMs).toFixed(2)} ms`);
+console.log(
+  `  all ${everything.length} ops at 1280x720: render ${full.renderMs.toFixed(2)} ms, readback ${full.readbackMs.toFixed(2)} ms (worst render ${worst.renderMs.toFixed(2)} ms)`,
+);
+assert(
+  full.renderMs + full.readbackMs < 16,
+  `the whole op set must stay inside the 16 ms frame budget, took ${(full.renderMs + full.readbackMs).toFixed(2)} ms`,
+);
 
 // ---- masks and layer opacity ------------------------------------------------------------
 // A mask is per op, and a layer is one op of the stack with a mask and an opacity
@@ -355,7 +518,9 @@ const maskedExposure = {
 await ui.call("stack.set", { photoId, stack: [] });
 await ui.call("view.render", { viewId });
 const unmaskedFrame = new Uint8Array(ui.frame!.pixels);
-await timed("stack.set (masked +2 EV)", () => ui.call("stack.set", { photoId, stack: [maskedExposure] }));
+await timed("stack.set (masked +2 EV)", () =>
+  ui.call("stack.set", { photoId, stack: [maskedExposure] }),
+);
 const maskRender = await timed("view.render (masked)", () => ui.call("view.render", { viewId }));
 const maskedFrame = new Uint8Array(ui.frame!.pixels);
 
@@ -370,7 +535,10 @@ console.log(
 );
 assert(raster.width === 1280 && raster.height === 720, "the raster must be the view's proxy size");
 assert(raster.target === viewId, "the LMSK frame must name the view it was sized for");
-assert(radialPreview.width === raster.width && radialPreview.height === raster.height, "result and frame disagree");
+assert(
+  radialPreview.width === raster.width && radialPreview.height === raster.height,
+  "result and frame disagree",
+);
 // The raster is letterboxed exactly like the frame it lies over, so both calls must name
 // the same rect — an overlay blits that sub-rectangle and nothing outside it.
 assert(
@@ -391,8 +559,14 @@ console.log(
   `  inside the mask ${insideBefore.toFixed(1)} -> ${insideAfter.toFixed(1)}, outside ${outsideBefore.toFixed(1)} -> ${outsideAfter.toFixed(1)}`,
 );
 assert(insideAfter > insideBefore + 20, "+2 EV inside the mask did not brighten those pixels");
-assert(Math.abs(outsideAfter - outsideBefore) < 0.01, "a masked op must not touch a pixel outside its mask");
-assert(maskRender.renderMs < 16, `a masked render must stay in budget, took ${maskRender.renderMs}`);
+assert(
+  Math.abs(outsideAfter - outsideBefore) < 0.01,
+  "a masked op must not touch a pixel outside its mask",
+);
+assert(
+  maskRender.renderMs < 16,
+  `a masked render must stay in budget, took ${maskRender.renderMs}`,
+);
 
 // opacity is the same mix over the whole mask: half the strength is halfway in linear light.
 await timed("op.update (opacity 50)", () =>
@@ -404,8 +578,13 @@ await ui.call("view.render", { viewId });
 const halfFrame = new Uint8Array(ui.frame!.pixels);
 const insideHalf = meanWhere(halfFrame, raster.pixels, (m) => m > 200);
 const halfway = (toLinear(insideBefore) + toLinear(insideAfter)) / 2;
-console.log(`  opacity 50 lands at ${insideHalf.toFixed(1)} between ${insideBefore.toFixed(1)} and ${insideAfter.toFixed(1)}`);
-assert(insideHalf > insideBefore + 5 && insideHalf < insideAfter - 5, "opacity 50 did not halve the effect");
+console.log(
+  `  opacity 50 lands at ${insideHalf.toFixed(1)} between ${insideBefore.toFixed(1)} and ${insideAfter.toFixed(1)}`,
+);
+assert(
+  insideHalf > insideBefore + 5 && insideHalf < insideAfter - 5,
+  "opacity 50 did not halve the effect",
+);
 assert(
   Math.abs(toLinear(insideHalf) - halfway) / halfway < 0.03,
   "opacity 50 must be the midpoint in linear light",
@@ -434,9 +613,18 @@ assert(
 );
 // One pointer-down: transient segments, then the committed one that snapshots.
 const strokeSegments = [
-  [[0.2, 0.15], [0.2, 0.35]],
-  [[0.2, 0.35], [0.2, 0.55]],
-  [[0.2, 0.55], [0.2, 0.85]],
+  [
+    [0.2, 0.15],
+    [0.2, 0.35],
+  ],
+  [
+    [0.2, 0.35],
+    [0.2, 0.55],
+  ],
+  [
+    [0.2, 0.55],
+    [0.2, 0.85],
+  ],
 ];
 for (const [index, points] of strokeSegments.entries()) {
   await ui.call("mask.stroke", {
@@ -450,8 +638,13 @@ for (const [index, points] of strokeSegments.entries()) {
 const painted = await timed("mask.preview (brushed)", () =>
   ui.call("mask.preview", { photoId, opId: "mask0001", viewId }),
 );
-console.log(`  brush raised coverage ${(emptyBrush.coverage * 100).toFixed(1)}% -> ${(painted.coverage * 100).toFixed(1)}%`);
-assert(painted.coverage > emptyBrush.coverage + 0.01, "brush strokes must raise the mask's coverage");
+console.log(
+  `  brush raised coverage ${(emptyBrush.coverage * 100).toFixed(1)}% -> ${(painted.coverage * 100).toFixed(1)}%`,
+);
+assert(
+  painted.coverage > emptyBrush.coverage + 0.01,
+  "brush strokes must raise the mask's coverage",
+);
 
 const strokeState = await ui.call("stack.get", { photoId });
 const brushParams = strokeState.stack[0].mask.components[1].params;
@@ -488,13 +681,18 @@ const aiMask = {
 };
 await ui.call("stack.set", { photoId, stack: [brushed, aiMask] });
 const fresh = await ui.call("stack.get", { photoId });
-assert(fresh.stack[1].mask.components[0].state === "pending", "an unrun AI component starts pending");
+assert(
+  fresh.stack[1].mask.components[0].state === "pending",
+  "an unrun AI component starts pending",
+);
 const detect = await timed("mask.detect (depth)", () =>
   ui.call("mask.detect", { photoId, opId: "mask0002", componentId: "ai01" }),
 );
 assert(detect.jobId >= 1, "mask.detect must return a jobId");
 await waitFor("the mask job to finish", () =>
-  ui.notifications.some((n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished),
+  ui.notifications.some(
+    (n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished,
+  ),
 );
 const maskJob = ui.notifications.find(
   (n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished,
@@ -506,12 +704,23 @@ assert(maskJob.params.state === "error", "a detect with no model must end in err
 assert(maskJob.params.error === notImplemented, `wrong failure: ${maskJob.params.error}`);
 const failed = await ui.call("stack.get", { photoId });
 assert(failed.stack[1].mask.components[0].state === "failed", "the component must be failed");
-assert(failed.stack[1].mask.components[0].params.error === notImplemented, "the reason belongs on the component");
+assert(
+  failed.stack[1].mask.components[0].params.error === notImplemented,
+  "the reason belongs on the component",
+);
 // A pending or failed component contributes nothing, so its op does nothing at all.
 const pendingPreview = await ui.call("mask.preview", { photoId, opId: "mask0002", viewId });
 assert(pendingPreview.coverage === 0, "a failed component must contribute nothing");
-const refusedComponent = await ui.fail("mask.preview", { photoId, opId: "mask0002", componentId: "ai01", viewId });
-assert(refusedComponent.startsWith("-32602"), `a failed component has no raster: ${refusedComponent}`);
+const refusedComponent = await ui.fail("mask.preview", {
+  photoId,
+  opId: "mask0002",
+  componentId: "ai01",
+  viewId,
+});
+assert(
+  refusedComponent.startsWith("-32602"),
+  `a failed component has no raster: ${refusedComponent}`,
+);
 
 // ---- mask errors ------------------------------------------------------------------------
 assert(
@@ -519,26 +728,66 @@ assert(
   "mask.preview on an unknown op must be -32602",
 );
 assert(
-  (await ui.fail("mask.stroke", { photoId, opId: "mask0001", componentId: "radial01", points: [[0.1, 0.1]] })).startsWith("-32602"),
+  (
+    await ui.fail("mask.stroke", {
+      photoId,
+      opId: "mask0001",
+      componentId: "radial01",
+      points: [[0.1, 0.1]],
+    })
+  ).startsWith("-32602"),
   "only a brush component takes strokes",
 );
 assert(
-  (await ui.fail("mask.detect", { photoId, opId: "mask0001", componentId: "radial01" })).startsWith("-32602"),
+  (await ui.fail("mask.detect", { photoId, opId: "mask0001", componentId: "radial01" })).startsWith(
+    "-32602",
+  ),
   "a radial rasterises inline, not through mask.detect",
 );
 const badMask = await ui.fail("stack.set", {
   photoId,
-  stack: [{ op: "exposure", params: { value: 1 }, enabled: true, mask: { components: [{ id: "a", kind: "sorcery", mode: "add" }] } }],
+  stack: [
+    {
+      op: "exposure",
+      params: { value: 1 },
+      enabled: true,
+      mask: { components: [{ id: "a", kind: "sorcery", mode: "add" }] },
+    },
+  ],
 });
 assert(badMask.startsWith("-32602"), `an unknown component kind must be -32602, got ${badMask}`);
 const duplicateIds = await ui.fail("stack.set", {
   photoId,
-  stack: [{ op: "exposure", params: { value: 1 }, enabled: true, mask: { components: [{ id: "a", kind: "radial", mode: "add" }, { id: "a", kind: "brush", mode: "add" }] } }],
+  stack: [
+    {
+      op: "exposure",
+      params: { value: 1 },
+      enabled: true,
+      mask: {
+        components: [
+          { id: "a", kind: "radial", mode: "add" },
+          { id: "a", kind: "brush", mode: "add" },
+        ],
+      },
+    },
+  ],
 });
-assert(duplicateIds.startsWith("-32602"), `duplicate component ids must be -32602, got ${duplicateIds}`);
+assert(
+  duplicateIds.startsWith("-32602"),
+  `duplicate component ids must be -32602, got ${duplicateIds}`,
+);
 const pixelCoords = await ui.fail("stack.set", {
   photoId,
-  stack: [{ op: "exposure", params: { value: 1 }, enabled: true, mask: { components: [{ id: "a", kind: "radial", mode: "add", params: { center: [640, 360] } }] } }],
+  stack: [
+    {
+      op: "exposure",
+      params: { value: 1 },
+      enabled: true,
+      mask: {
+        components: [{ id: "a", kind: "radial", mode: "add", params: { center: [640, 360] } }],
+      },
+    },
+  ],
 });
 assert(pixelCoords.startsWith("-32602"), `mask coordinates are normalised: ${pixelCoords}`);
 
@@ -546,7 +795,9 @@ assert(pixelCoords.startsWith("-32602"), `mask coordinates are normalised: ${pix
 const logsBefore = ui.notifications.filter((n) => n.method === "engine.log").length;
 const geometryMasked = await ui.call("stack.set", {
   photoId,
-  stack: [{ op: "crop", params: { left: 0.1 }, enabled: true, mask: { components: [radialComponent] } }],
+  stack: [
+    { op: "crop", params: { left: 0.1 }, enabled: true, mask: { components: [radialComponent] } },
+  ],
 });
 assert(geometryMasked.stack[0].mask === undefined, "a geometry op must not keep a mask");
 assert(
@@ -595,7 +846,10 @@ assert(maskValues[4] > 100, "photo.masks.preview should return a PNG");
 const removed = await ui.call("python.run", {
   code: "op = latent.photo.stack[0]\nop.mask.remove(op.mask[0]['id'])\nprint(len(latent.photo.stack[0].mask))",
 });
-assert(removed.stdout.trim() === "0", `op.mask.remove did not remove the component: ${removed.stdout}`);
+assert(
+  removed.stdout.trim() === "0",
+  `op.mask.remove did not remove the component: ${removed.stdout}`,
+);
 await ui.call("stack.set", { photoId, stack: [] });
 
 // A drag that starts by creating the op: op.add is transient too, so the add and every
@@ -605,21 +859,38 @@ const dragAdd = await timed("op.add transient", () =>
   ui.call("op.add", { photoId, op: "clarity", params: { value: 10 }, transient: true }),
 );
 const dragId: string = dragAdd.stack.at(-1).id;
-assert(dragAdd.stack.length === beforeDrag.stack.length + 1, "a transient add still puts the op in the stack");
+assert(
+  dragAdd.stack.length === beforeDrag.stack.length + 1,
+  "a transient add still puts the op in the stack",
+);
 for (const value of [25, 40, 60]) {
   await ui.call("op.update", { photoId, opId: dragId, params: { value }, transient: true });
 }
 const dragEnd = await ui.call("op.update", { photoId, opId: dragId, params: { value: 75 } });
 assert(dragEnd.stack.at(-1).params.value === 75, "the drag should end at the last value");
-const afterDragUndo = await timed("history.undo (drag)", () => ui.call("history.undo", { photoId }));
-assert(afterDragUndo.stack.length === beforeDrag.stack.length, "one undo must drop the whole drag, the op with it");
-assert(!afterDragUndo.stack.some((op: any) => op.id === dragId), "undo left the transiently added op behind");
-const afterDragRedo = await timed("history.redo (drag)", () => ui.call("history.redo", { photoId }));
-assert(afterDragRedo.stack.at(-1).params.value === 75, "redo must bring the op back at the value the drag ended on");
+const afterDragUndo = await timed("history.undo (drag)", () =>
+  ui.call("history.undo", { photoId }),
+);
+assert(
+  afterDragUndo.stack.length === beforeDrag.stack.length,
+  "one undo must drop the whole drag, the op with it",
+);
+assert(
+  !afterDragUndo.stack.some((op: any) => op.id === dragId),
+  "undo left the transiently added op behind",
+);
+const afterDragRedo = await timed("history.redo (drag)", () =>
+  ui.call("history.redo", { photoId }),
+);
+assert(
+  afterDragRedo.stack.at(-1).params.value === 75,
+  "redo must bring the op back at the value the drag ended on",
+);
 
 // Everything above rewrote the stack; hand the rest of the file back the history it had
 // before this section — every snapshot undone, then the one exposure op, at its own id.
-while ((await ui.call("stack.get", { photoId })).canUndo) await ui.call("history.undo", { photoId });
+while ((await ui.call("stack.get", { photoId })).canUndo)
+  await ui.call("history.undo", { photoId });
 await ui.call("stack.set", {
   photoId,
   stack: [{ id: opId, op: "exposure", params: { value: 1 }, enabled: true }],
@@ -634,12 +905,17 @@ const clamped = await timed("op.update clamp", () =>
   ui.call("op.update", { photoId, opId, params: { value: 99 } }),
 );
 assert(clamped.stack[0].params.value === 5, "out-of-range exposure should clamp to 5");
-const clampLog = ui.notifications.find((n) => n.method === "engine.log" && String(n.params.message).includes("clamped"));
+const clampLog = ui.notifications.find(
+  (n) => n.method === "engine.log" && String(n.params.message).includes("clamped"),
+);
 assert(clampLog, "expected an engine.log warning about the clamp");
 assert(clampLog.params.photoId === photoId, "engine.log about one photo must carry its photoId");
 
 const undone = await timed("history.undo", () => ui.call("history.undo", { photoId }));
-assert(undone.stack.length === 1 && undone.stack[0].params.value === 1, "undo should drop the clamped value");
+assert(
+  undone.stack.length === 1 && undone.stack[0].params.value === 1,
+  "undo should drop the clamped value",
+);
 const empty = await timed("history.undo", () => ui.call("history.undo", { photoId }));
 assert(empty.stack.length === 0, "the stack should be empty again");
 
@@ -663,14 +939,24 @@ assert(
 
 // A second socket sees someone else's edit as `external`, never as its own `ui`.
 const observer = await connect(endpoint);
-await timed("op.add (two clients)", () => ui.call("op.add", { photoId, op: "vibrance", params: { value: 10 } }));
-await waitFor("the observer's stack.changed", () => observer.notifications.some((n) => n.method === "stack.changed"));
+await timed("op.add (two clients)", () =>
+  ui.call("op.add", { photoId, op: "vibrance", params: { value: 10 } }),
+);
+await waitFor("the observer's stack.changed", () =>
+  observer.notifications.some((n) => n.method === "stack.changed"),
+);
 const ownEdit = ui.notifications.filter((n) => n.method === "stack.changed").at(-1);
 const seenEdit = observer.notifications.filter((n) => n.method === "stack.changed").at(-1);
 assert(ownEdit!.params.source === "ui", "the client that made the change must see source ui");
 assert(seenEdit!.params.source === "external", "another client must see source external");
-assert(seenEdit!.params.revision === ownEdit!.params.revision, "both clients must see the same revision");
-assert(ownEdit!.params.client === "ui" && seenEdit!.params.client === "external", "client follows source for a UI edit");
+assert(
+  seenEdit!.params.revision === ownEdit!.params.revision,
+  "both clients must see the same revision",
+);
+assert(
+  ownEdit!.params.client === "ui" && seenEdit!.params.client === "external",
+  "client follows source for a UI edit",
+);
 await ui.call("history.undo", { photoId });
 
 // ---- embedded Python ------------------------------------------------------------------
@@ -681,15 +967,26 @@ const script = await ui.call("python.run", {
 const pythonMs = performance.now() - pythonStarted;
 console.log(`python.run                ${pythonMs.toFixed(1)} ms -> ${JSON.stringify(script)}`);
 assert(script.ok === true, `python.run failed: ${script.stderr}`);
-assert(script.stdout === "ops 1\n", `python.run did not capture stdout: ${JSON.stringify(script.stdout)}`);
+assert(
+  script.stdout === "ops 1\n",
+  `python.run did not capture stdout: ${JSON.stringify(script.stdout)}`,
+);
 assert(script.value === "1.0", "python.run should return the repr of the last expression");
 
-assert(typeof script.durationMs === "number" && script.durationMs > 0, `python.run must report durationMs, got ${script.durationMs}`);
+assert(
+  typeof script.durationMs === "number" && script.durationMs > 0,
+  `python.run must report durationMs, got ${script.durationMs}`,
+);
 
-const fromPython = ui.notifications.filter((n) => n.method === "stack.changed" && n.params.source === "python");
+const fromPython = ui.notifications.filter(
+  (n) => n.method === "stack.changed" && n.params.source === "python",
+);
 assert(fromPython.length > 0, "a script's edit must notify with source python");
 assert(fromPython.at(-1)!.params.client === "python", "a script's edit is client python");
-assert(fromPython.at(-1)!.params.stack.some((op: any) => op.op === "exposure"), "develop.exposure did not create an exposure op");
+assert(
+  fromPython.at(-1)!.params.stack.some((op: any) => op.op === "exposure"),
+  "develop.exposure did not create an exposure op",
+);
 assert(
   observer.notifications.some((n) => n.method === "stack.changed" && n.params.source === "python"),
   "every client sees a script's edit as python, not external",
@@ -697,7 +994,9 @@ assert(
 
 await timed("view.render (scripted)", () => ui.call("view.render", { viewId }));
 const brightScripted = mean(ui.frame!.pixels);
-console.log(`  mean level ${brightNeutral.toFixed(1)} -> ${brightScripted.toFixed(1)} after the script`);
+console.log(
+  `  mean level ${brightNeutral.toFixed(1)} -> ${brightScripted.toFixed(1)} after the script`,
+);
 assert(brightScripted > brightNeutral + 5, "the scripted exposure did not brighten the frame");
 
 const repeat = await ui.call("python.run", {
@@ -724,7 +1023,10 @@ assert(scripted.ok === true, `stack API script failed: ${scripted.stderr}`);
 console.log(`  stack API -> ${scripted.stdout.trim()}`);
 const scriptedValues = JSON.parse(scripted.stdout);
 assert(scriptedValues[0] === 2 && scriptedValues[1] === "vibrance", "stack.add did not add one op");
-assert(scriptedValues[2] === 30.0 && scriptedValues[3] === false, "op.params/op.enabled writes did not stick");
+assert(
+  scriptedValues[2] === 30.0 && scriptedValues[3] === false,
+  "op.params/op.enabled writes did not stick",
+);
 assert(scriptedValues[4] === 1 && scriptedValues[5] === 256, "preset/histogram came back wrong");
 assert(scriptedValues[6] > 1000, "render.preview should return a real JPEG");
 assert(scriptedValues[7] === true, "indexing the stack should find the op that was just added");
@@ -733,45 +1035,87 @@ assert(scriptedValues[7] === true, "indexing the stack should find the op that w
 const undoneByScript = await ui.call("python.run", {
   code: "latent.undo()\nprint(latent.photo.stack[-1].enabled, len(latent.photo.stack))",
 });
-assert(undoneByScript.stdout.trim() === "True 2", `latent.undo() did not undo the disable: ${undoneByScript.stdout}`);
-const rewound = await ui.call("python.run", { code: "latent.undo()\nlatent.undo()\nprint(len(latent.photo.stack))" });
-assert(rewound.stdout.trim() === "1", `two more undos should drop the vibrance op: ${rewound.stdout}`);
+assert(
+  undoneByScript.stdout.trim() === "True 2",
+  `latent.undo() did not undo the disable: ${undoneByScript.stdout}`,
+);
+const rewound = await ui.call("python.run", {
+  code: "latent.undo()\nlatent.undo()\nprint(len(latent.photo.stack))",
+});
+assert(
+  rewound.stdout.trim() === "1",
+  `two more undos should drop the vibrance op: ${rewound.stdout}`,
+);
 
 // Output streams to the calling socket while the script runs; the result repeats it whole.
 const streamed = await ui.call("python.run", { code: "print('first')\nprint('second')" });
-const chunks = ui.notifications.filter((n) => n.method === "python.output" && n.params.runId === streamed.runId);
+const chunks = ui.notifications.filter(
+  (n) => n.method === "python.output" && n.params.runId === streamed.runId,
+);
 console.log(`  python.output ${chunks.length} chunk(s) for run ${streamed.runId}`);
 assert(typeof streamed.runId === "number", "python.run must report a runId when it streams");
 assert(chunks.length >= 2, "expected one python.output per print");
-assert(chunks.every((n) => n.params.stream === "stdout"), "prints belong on stdout");
-assert(chunks.map((n) => n.params.text).join("") === streamed.stdout, "the stream and the result disagree");
+assert(
+  chunks.every((n) => n.params.stream === "stdout"),
+  "prints belong on stdout",
+);
+assert(
+  chunks.map((n) => n.params.text).join("") === streamed.stdout,
+  "the stream and the result disagree",
+);
 
 // python.finished closes the stream: after the run's last chunk, before the result — it is
 // already in the log now, and nothing of that run follows it.
-const finishedIndex = ui.notifications.findIndex((n) => n.method === "python.finished" && n.params.runId === streamed.runId);
-const lastChunkIndex = ui.notifications.map((n) => n.method === "python.output" && n.params.runId === streamed.runId).lastIndexOf(true);
+const finishedIndex = ui.notifications.findIndex(
+  (n) => n.method === "python.finished" && n.params.runId === streamed.runId,
+);
+const lastChunkIndex = ui.notifications
+  .map((n) => n.method === "python.output" && n.params.runId === streamed.runId)
+  .lastIndexOf(true);
 const finishedRun = ui.notifications[finishedIndex]!;
-console.log(`  python.finished after ${finishedIndex - lastChunkIndex} notification(s): ${JSON.stringify(finishedRun.params)}`);
+console.log(
+  `  python.finished after ${finishedIndex - lastChunkIndex} notification(s): ${JSON.stringify(finishedRun.params)}`,
+);
 assert(finishedIndex > lastChunkIndex, "python.finished must follow the run's last python.output");
 assert(finishedRun.params.ok === true, "a successful run must report ok in python.finished");
-assert(finishedRun.params.durationMs === streamed.durationMs, "python.finished and the result must report the same duration");
+assert(
+  finishedRun.params.durationMs === streamed.durationMs,
+  "python.finished and the result must report the same duration",
+);
 assert(typeof streamed.durationMs === "number", "python.run must report durationMs");
 
 const interrupted = await timed("python.run (timeout)", () =>
   ui.call("python.run", { code: "while True:\n    pass", timeoutMs: 250 }),
 );
 assert(interrupted.ok === false, "a script over its budget must fail");
-assert(interrupted.stderr.includes("KeyboardInterrupt"), `expected a KeyboardInterrupt, got ${interrupted.stderr}`);
-const interruptedEnd = ui.notifications.find((n) => n.method === "python.finished" && n.params.runId === interrupted.runId)!;
-assert(interruptedEnd && interruptedEnd.params.ok === false, "an interrupted run must still announce python.finished, with ok false");
-assert(interruptedEnd.params.durationMs >= 200, `the interrupted run should have burned its budget, got ${interruptedEnd.params.durationMs} ms`);
+assert(
+  interrupted.stderr.includes("KeyboardInterrupt"),
+  `expected a KeyboardInterrupt, got ${interrupted.stderr}`,
+);
+const interruptedEnd = ui.notifications.find(
+  (n) => n.method === "python.finished" && n.params.runId === interrupted.runId,
+)!;
+assert(
+  interruptedEnd && interruptedEnd.params.ok === false,
+  "an interrupted run must still announce python.finished, with ok false",
+);
+assert(
+  interruptedEnd.params.durationMs >= 200,
+  `the interrupted run should have burned its budget, got ${interruptedEnd.params.durationMs} ms`,
+);
 const alive = await ui.call("python.run", { code: "1 + 1" });
-assert(alive.ok === true && alive.value === "2", "the interpreter must survive an interrupted script");
+assert(
+  alive.ok === true && alive.value === "2",
+  "the interpreter must survive an interrupted script",
+);
 
 const enumerated = await ui.call("python.run", {
   code: "print([p.id for p in latent.photos()], [p.id for p in latent.catalog.selected()], latent.photo.filename)",
 });
-assert(enumerated.stdout.trim() === `[${photoId}] [${photoId}] DSC00120.ARW`, `photo enumeration is wrong: ${enumerated.stdout}`);
+assert(
+  enumerated.stdout.trim() === `[${photoId}] [${photoId}] DSC00120.ARW`,
+  `photo enumeration is wrong: ${enumerated.stdout}`,
+);
 
 const broken = await ui.call("python.run", { code: "latent.photo.develop.nonsense = 1" });
 assert(broken.ok === false, "a failing script must report ok: false");
@@ -779,10 +1123,16 @@ assert(broken.stderr.includes("Traceback"), "a failing script must return its tr
 
 // ---- MCP over streamable HTTP ----------------------------------------------------------
 const mcpUrl = await engine.mcpUrl;
-assert(mcpUrl === hello.mcpUrl, `engine.hello's mcpUrl must be the announced one: ${hello.mcpUrl} vs ${mcpUrl}`);
+assert(
+  mcpUrl === hello.mcpUrl,
+  `engine.hello's mcpUrl must be the announced one: ${hello.mcpUrl} vs ${mcpUrl}`,
+);
 const portFile = `${scratch}/config/latent/mcp.port`;
 assert(existsSync(portFile), `the daemon must write its MCP port to ${portFile}`);
-assert(mcpUrl.includes((await Bun.file(portFile).text()).trim()), "mcp.port must match the announced port");
+assert(
+  mcpUrl.includes((await Bun.file(portFile).text()).trim()),
+  "mcp.port must match the announced port",
+);
 
 let mcpSession = "";
 async function mcp(body: unknown): Promise<any> {
@@ -803,16 +1153,38 @@ const initialized = await timed("mcp initialize", () =>
     jsonrpc: "2.0",
     id: 1,
     method: "initialize",
-    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "smoke", version: "1" } },
+    params: {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "smoke", version: "1" },
+    },
   }),
 );
 assert(initialized.result.serverInfo.name === "latent", "the MCP server should identify as latent");
 await mcp({ jsonrpc: "2.0", method: "notifications/initialized" });
 
-const toolList = await timed("mcp tools/list", () => mcp({ jsonrpc: "2.0", id: 2, method: "tools/list" }));
+const toolList = await timed("mcp tools/list", () =>
+  mcp({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+);
 const toolNames = toolList.result.tools.map((tool: { name: string }) => tool.name).sort();
 console.log(`  tools: ${toolNames.join(", ")}`);
-assert(JSON.stringify(toolNames) === JSON.stringify(["get_stack", "list_photos", "render_preview", "run_python"]), "wrong MCP tool set");
+assert(
+  JSON.stringify(toolNames) ===
+    JSON.stringify([
+      "export",
+      "generative_fill",
+      "generative_remove",
+      "generative_status",
+      "get_stack",
+      "list_photos",
+      "merge_hdr",
+      "merge_panorama",
+      "merge_preview",
+      "render_preview",
+      "run_python",
+    ]),
+  "wrong MCP tool set",
+);
 
 const beforeAgent = mean(ui.frame!.pixels);
 const agentRun = await timed("mcp run_python", () =>
@@ -820,38 +1192,78 @@ const agentRun = await timed("mcp run_python", () =>
     jsonrpc: "2.0",
     id: 3,
     method: "tools/call",
-    params: { name: "run_python", arguments: { code: "latent.photo.develop.exposure = 2.5\nlatent.photo.develop.exposure", photo_id: photoId } },
+    params: {
+      name: "run_python",
+      arguments: {
+        code: "latent.photo.develop.exposure = 2.5\nlatent.photo.develop.exposure",
+        photo_id: photoId,
+      },
+    },
   }),
 );
-assert(agentRun.result.structuredContent.ok === true, `agent script failed: ${JSON.stringify(agentRun.result)}`);
+assert(
+  agentRun.result.structuredContent.ok === true,
+  `agent script failed: ${JSON.stringify(agentRun.result)}`,
+);
 assert(agentRun.result.structuredContent.value === "2.5", "agent script returned the wrong value");
 await waitFor("stack.changed from mcp", () =>
   ui.notifications.some((n) => n.method === "stack.changed" && n.params.source === "mcp"),
 );
-const fromAgent = ui.notifications.filter((n) => n.method === "stack.changed" && n.params.source === "mcp").at(-1)!;
-console.log(`  stack.changed source=${fromAgent.params.source} client=${fromAgent.params.client} received by the UI socket`);
-assert(fromAgent.params.client === "mcp:run_python", `an agent's edit must name its tool, got ${fromAgent.params.client}`);
+const fromAgent = ui.notifications
+  .filter((n) => n.method === "stack.changed" && n.params.source === "mcp")
+  .at(-1)!;
+console.log(
+  `  stack.changed source=${fromAgent.params.source} client=${fromAgent.params.client} received by the UI socket`,
+);
+assert(
+  fromAgent.params.client === "mcp:run_python",
+  `an agent's edit must name its tool, got ${fromAgent.params.client}`,
+);
 
 await timed("view.render (agent)", () => ui.call("view.render", { viewId }));
 const brightAgent = mean(ui.frame!.pixels);
-console.log(`  mean level ${beforeAgent.toFixed(1)} -> ${brightAgent.toFixed(1)} after the agent's edit`);
+console.log(
+  `  mean level ${beforeAgent.toFixed(1)} -> ${brightAgent.toFixed(1)} after the agent's edit`,
+);
 assert(brightAgent > beforeAgent + 5, "the agent's exposure did not brighten the frame");
 
 const agentStack = await timed("mcp get_stack", () =>
-  mcp({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_stack", arguments: { photo_id: photoId } } }),
+  mcp({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: { name: "get_stack", arguments: { photo_id: photoId } },
+  }),
 );
 const agentState = agentStack.result.structuredContent;
 assert(agentState.histogram.bins === 256, "get_stack must always carry a histogram");
-assert(typeof agentState.clipping.highlightsPct === "number", "get_stack must carry clipping percentages");
-assert(agentState.stack.some((op: any) => op.op === "exposure"), "get_stack lost the exposure op");
+assert(
+  typeof agentState.clipping.highlightsPct === "number",
+  "get_stack must carry clipping percentages",
+);
+assert(
+  agentState.stack.some((op: any) => op.op === "exposure"),
+  "get_stack lost the exposure op",
+);
 
 const preview = await timed("mcp render_preview", () =>
-  mcp({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "render_preview", arguments: { max_size: 512 } } }),
+  mcp({
+    jsonrpc: "2.0",
+    id: 5,
+    method: "tools/call",
+    params: { name: "render_preview", arguments: { max_size: 512 } },
+  }),
 );
 const image = preview.result.content[0];
-assert(image.type === "image" && image.mimeType === "image/jpeg", "render_preview must return a JPEG image block");
+assert(
+  image.type === "image" && image.mimeType === "image/jpeg",
+  "render_preview must return a JPEG image block",
+);
 const jpeg = Uint8Array.from(atob(image.data), (character) => character.charCodeAt(0));
-assert(jpeg[0] === 0xff && jpeg[1] === 0xd8 && jpeg[2] === 0xff, "render_preview did not return JPEG bytes");
+assert(
+  jpeg[0] === 0xff && jpeg[1] === 0xd8 && jpeg[2] === 0xff,
+  "render_preview did not return JPEG bytes",
+);
 console.log(`  preview ${jpeg.length} bytes of JPEG`);
 
 // render_preview(mask=…) hands back the raster instead of the picture, so an agent can
@@ -872,33 +1284,58 @@ for (const target of [[agentOpId], [agentOpId, agentComponentId]]) {
       jsonrpc: "2.0",
       id: 50 + target.length,
       method: "tools/call",
-      params: { name: "render_preview", arguments: { photo_id: photoId, max_size: 512, mask: target } },
+      params: {
+        name: "render_preview",
+        arguments: { photo_id: photoId, max_size: 512, mask: target },
+      },
     }),
   );
   const block = rendered.result.content[0];
-  assert(block.type === "image" && block.mimeType === "image/png", `render_preview(mask) must return a PNG: ${JSON.stringify(block).slice(0, 200)}`);
+  assert(
+    block.type === "image" && block.mimeType === "image/png",
+    `render_preview(mask) must return a PNG: ${JSON.stringify(block).slice(0, 200)}`,
+  );
   const raster = Uint8Array.from(atob(block.data), (character) => character.charCodeAt(0));
-  assert(raster[0] === 0x89 && raster[1] === 0x50 && raster[2] === 0x4e, "the mask block is not PNG bytes");
+  assert(
+    raster[0] === 0x89 && raster[1] === 0x50 && raster[2] === 0x4e,
+    "the mask block is not PNG bytes",
+  );
   console.log(`  render_preview(mask=${JSON.stringify(target)}) -> ${raster.length} PNG bytes`);
 }
 await ui.call("python.run", { code: `latent.photo.stack[0].mask.clear()` });
 
 const listed = await timed("mcp list_photos", () =>
-  mcp({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "list_photos", arguments: {} } }),
+  mcp({
+    jsonrpc: "2.0",
+    id: 6,
+    method: "tools/call",
+    params: { name: "list_photos", arguments: {} },
+  }),
 );
-assert(JSON.parse(listed.result.content[0].text).photoId === photoId, "list_photos should show the open photo");
+assert(
+  JSON.parse(listed.result.content[0].text).photoId === photoId,
+  "list_photos should show the open photo",
+);
 
 // ---- catalog --------------------------------------------------------------------------
 const importStarted = performance.now();
-const job = await timed("catalog.import", () => ui.call("catalog.import", { paths: ["/home/moritz/Downloads"], recursive: false }));
+const job = await timed("catalog.import", () =>
+  ui.call("catalog.import", { paths: ["/home/moritz/Downloads"], recursive: false }),
+);
 assert(job.jobId >= 1, "catalog.import must return a jobId");
 assert(job.thumbnailJobId > job.jobId, "catalog.import must name the thumbnail job it queues");
 await waitFor("the import job to finish", () =>
-  ui.notifications.some((n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished),
+  ui.notifications.some(
+    (n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished,
+  ),
 );
-const importDone = ui.notifications.find((n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished)!;
+const importDone = ui.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished,
+)!;
 const importMs = performance.now() - importStarted;
-console.log(`  imported ${importDone.params.done}/${importDone.params.total} files in ${importMs.toFixed(0)} ms (${importDone.params.message})`);
+console.log(
+  `  imported ${importDone.params.done}/${importDone.params.total} files in ${importMs.toFixed(0)} ms (${importDone.params.message})`,
+);
 assert(importDone.params.kind === "import", "the job must report kind import");
 assert(importDone.params.parentJobId === undefined, "an import job has no parent");
 assert(
@@ -908,43 +1345,76 @@ assert(
 
 // The thumbnail job the import promised: it reports under its own id and names its parent.
 await waitFor("the thumbnail job to finish", () =>
-  ui.notifications.some((n) => n.method === "job.progress" && n.params.jobId === job.thumbnailJobId && n.params.finished),
+  ui.notifications.some(
+    (n) =>
+      n.method === "job.progress" && n.params.jobId === job.thumbnailJobId && n.params.finished,
+  ),
 );
-const thumbnailsDone = ui.notifications.find((n) => n.method === "job.progress" && n.params.jobId === job.thumbnailJobId && n.params.finished)!;
-console.log(`  thumbnail job ${job.thumbnailJobId} (parent ${thumbnailsDone.params.parentJobId}): ${thumbnailsDone.params.done}/${thumbnailsDone.params.total} ${thumbnailsDone.params.state}`);
+const thumbnailsDone = ui.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === job.thumbnailJobId && n.params.finished,
+)!;
+console.log(
+  `  thumbnail job ${job.thumbnailJobId} (parent ${thumbnailsDone.params.parentJobId}): ${thumbnailsDone.params.done}/${thumbnailsDone.params.total} ${thumbnailsDone.params.state}`,
+);
 assert(thumbnailsDone.params.kind === "thumbnails", "the queued job must report kind thumbnails");
-assert(thumbnailsDone.params.parentJobId === job.jobId, "the thumbnail job must name the import that queued it");
+assert(
+  thumbnailsDone.params.parentJobId === job.jobId,
+  "the thumbnail job must name the import that queued it",
+);
 
-const catalogList = await timed("catalog.list", () => ui.call("catalog.list", { sort: "filename", limit: 50 }));
-console.log(`  catalog holds ${catalogList.total} photo(s): ${catalogList.photos.map((p: any) => p.filename).join(", ")}`);
+const catalogList = await timed("catalog.list", () =>
+  ui.call("catalog.list", { sort: "filename", limit: 50 }),
+);
+console.log(
+  `  catalog holds ${catalogList.total} photo(s): ${catalogList.photos.map((p: any) => p.filename).join(", ")}`,
+);
 assert(catalogList.total >= 1, "the import registered nothing");
 const row = catalogList.photos.find((p: any) => p.path === samplePath);
 assert(row, "the sample raw is not in the catalog");
 assert(row.photoId === photoId, "photo.open and catalog.import must agree on the id");
-assert(row.camera.includes("Sony") && row.width > 0 && row.hasSidecar === true, "catalog metadata is wrong");
+assert(
+  row.camera.includes("Sony") && row.width > 0 && row.hasSidecar === true,
+  "catalog metadata is wrong",
+);
 assert(typeof row.editedAt === "string", "editedAt must be stamped by the edits above");
 
 const folders = await timed("catalog.folders", () => ui.call("catalog.folders"));
-assert(folders.folders.some((f: any) => f.path === "/home/moritz/Downloads" && f.count >= 1), "catalog.folders missed the folder");
+assert(
+  folders.folders.some((f: any) => f.path === "/home/moritz/Downloads" && f.count >= 1),
+  "catalog.folders missed the folder",
+);
 
 const thumbStarted = performance.now();
-const thumb = await timed("catalog.thumbnail", () => ui.call("catalog.thumbnail", { photoId, size: 256 }));
+const thumb = await timed("catalog.thumbnail", () =>
+  ui.call("catalog.thumbnail", { photoId, size: 256 }),
+);
 const thumbMs = performance.now() - thumbStarted;
 await waitFor("the LTHM frame", () => ui.thumbnails.length > 0);
 const thumbnailFrame = ui.thumbnails.at(-1)!;
-console.log(`  thumbnail ${thumb.width}x${thumb.height} in ${thumbMs.toFixed(0)} ms, ${thumbnailFrame.pixels.length} JPEG bytes`);
+console.log(
+  `  thumbnail ${thumb.width}x${thumb.height} in ${thumbMs.toFixed(0)} ms, ${thumbnailFrame.pixels.length} JPEG bytes`,
+);
 assert(thumbnailFrame.target === photoId, "the LTHM frame must be tagged with the photoId");
-assert(Math.max(thumb.width, thumb.height) === 256, "the thumbnail long edge must be the requested size");
 assert(
-  thumbnailFrame.pixels[0] === 0xff && thumbnailFrame.pixels[1] === 0xd8 && thumbnailFrame.pixels[2] === 0xff,
+  Math.max(thumb.width, thumb.height) === 256,
+  "the thumbnail long edge must be the requested size",
+);
+assert(
+  thumbnailFrame.pixels[0] === 0xff &&
+    thumbnailFrame.pixels[1] === 0xd8 &&
+    thumbnailFrame.pixels[2] === 0xff,
   "the LTHM payload is not a JPEG",
 );
 
 // 512 was never queued by the import job, so this one is generated on the worker thread
 // and the frame arrives when it is ready.
 const uncachedStarted = performance.now();
-const bigger = await timed("catalog.thumbnail (miss)", () => ui.call("catalog.thumbnail", { photoId, size: 512 }));
-console.log(`  generated ${bigger.width}x${bigger.height} in ${(performance.now() - uncachedStarted).toFixed(0)} ms`);
+const bigger = await timed("catalog.thumbnail (miss)", () =>
+  ui.call("catalog.thumbnail", { photoId, size: 512 }),
+);
+console.log(
+  `  generated ${bigger.width}x${bigger.height} in ${(performance.now() - uncachedStarted).toFixed(0)} ms`,
+);
 await waitFor("the second LTHM frame", () => ui.thumbnails.length > 1);
 assert(Math.max(bigger.width, bigger.height) === 512, "the generated thumbnail is the wrong size");
 assert(ui.thumbnails.at(-1)!.pixels[0] === 0xff, "the generated thumbnail is not a JPEG");
@@ -952,47 +1422,86 @@ assert(ui.thumbnails.at(-1)!.pixels[0] === 0xff, "the generated thumbnail is not
 // The batch form: one frame per photo, all of them before the result.
 const batchBefore = ui.thumbnails.length;
 const batchIds = [...catalogList.photos.map((p: any) => p.photoId), 99999];
-const batch = await timed("catalog.thumbnails", () => ui.call("catalog.thumbnails", { photoIds: batchIds, size: 320 }));
-console.log(`  batch requested ${batch.requested}, sent ${batch.sent}, missing ${JSON.stringify(batch.missing)}`);
+const batch = await timed("catalog.thumbnails", () =>
+  ui.call("catalog.thumbnails", { photoIds: batchIds, size: 320 }),
+);
+console.log(
+  `  batch requested ${batch.requested}, sent ${batch.sent}, missing ${JSON.stringify(batch.missing)}`,
+);
 assert(batch.requested === batchIds.length, "catalog.thumbnails should count the ids it was given");
 assert(batch.missing.includes(99999), "an unknown id belongs in missing, not in an error");
-assert(ui.thumbnails.length - batchBefore === batch.sent, "every counted thumbnail must have arrived as a frame");
+assert(
+  ui.thumbnails.length - batchBefore === batch.sent,
+  "every counted thumbnail must have arrived as a frame",
+);
 
 const listed2 = await ui.call("catalog.list", { query: "dsc001" });
-assert(listed2.total === 1 && listed2.photos[0].filename === "DSC00120.ARW", "catalog.list query did not match");
+assert(
+  listed2.total === 1 && listed2.photos[0].filename === "DSC00120.ARW",
+  "catalog.list query did not match",
+);
 const byIds = await ui.call("catalog.list", { photoIds: [photoId] });
-assert(byIds.total === 1 && byIds.photos[0].photoId === photoId, "catalog.list photoIds did not filter");
-assert((await ui.call("catalog.list", { photoIds: [] })).total === 0, "an empty photoIds list asks for nothing");
+assert(
+  byIds.total === 1 && byIds.photos[0].photoId === photoId,
+  "catalog.list photoIds did not filter",
+);
+assert(
+  (await ui.call("catalog.list", { photoIds: [] })).total === 0,
+  "an empty photoIds list asks for nothing",
+);
 
-assert((await ui.call("job.cancel", { jobId: job.jobId })).cancelled === false, "a finished job cannot be cancelled");
+assert(
+  (await ui.call("job.cancel", { jobId: job.jobId })).cancelled === false,
+  "a finished job cannot be cancelled",
+);
 
-const rated = await timed("catalog.setRating", () => ui.call("catalog.setRating", { photoId, rating: 4 }));
+const rated = await timed("catalog.setRating", () =>
+  ui.call("catalog.setRating", { photoId, rating: 4 }),
+);
 assert(rated.rating === 4, "catalog.setRating did not stick");
 await waitFor("catalog.changed for the rating", () =>
   ui.notifications.some((n) => n.method === "catalog.changed" && n.params.reason === "rating"),
 );
-const flagged = await timed("catalog.setFlag", () => ui.call("catalog.setFlag", { photoId, flag: "pick" }));
+const flagged = await timed("catalog.setFlag", () =>
+  ui.call("catalog.setFlag", { photoId, flag: "pick" }),
+);
 assert(flagged.flag === "pick", "catalog.setFlag did not stick");
 
-const collections = await timed("catalog.collectionSet", () => ui.call("catalog.collectionSet", { name: "Smoke", add: [photoId] }));
-assert(collections.collections.some((c: any) => c.name === "Smoke" && c.count === 1), "the collection was not created");
+const collections = await timed("catalog.collectionSet", () =>
+  ui.call("catalog.collectionSet", { name: "Smoke", add: [photoId] }),
+);
+assert(
+  collections.collections.some((c: any) => c.name === "Smoke" && c.count === 1),
+  "the collection was not created",
+);
 const collectionId = collections.collections.find((c: any) => c.name === "Smoke").collectionId;
 const inCollection = await ui.call("catalog.list", { collectionId });
 assert(inCollection.total === 1, "catalog.list did not filter by collection");
 await ui.call("catalog.collectionSet", { collectionId, delete: true });
-assert((await ui.call("catalog.collections")).collections.length === 0, "the collection was not deleted");
+assert(
+  (await ui.call("catalog.collections")).collections.length === 0,
+  "the collection was not deleted",
+);
 
 // catalog.remove drops rows, never files.
-const strays = catalogList.photos.filter((p: any) => p.photoId !== photoId).map((p: any) => p.photoId);
-const removal = await timed("catalog.remove", () => ui.call("catalog.remove", { photoIds: [...strays, 99999] }));
+const strays = catalogList.photos
+  .filter((p: any) => p.photoId !== photoId)
+  .map((p: any) => p.photoId);
+const removal = await timed("catalog.remove", () =>
+  ui.call("catalog.remove", { photoIds: [...strays, 99999] }),
+);
 console.log(`  removed ${removal.removed} row(s)`);
 assert(removal.removed === strays.length, "catalog.remove counted the wrong number of rows");
 assert(
-  strays.length === 0 || ui.notifications.some((n) => n.method === "catalog.changed" && n.params.reason === "remove"),
+  strays.length === 0 ||
+    ui.notifications.some((n) => n.method === "catalog.changed" && n.params.reason === "remove"),
   "catalog.remove must publish catalog.changed",
 );
 assert(existsSync(samplePath), "catalog.remove must never touch a file on disk");
-assert((await ui.call("catalog.list", {})).total === catalogList.total - strays.length, "the rows are still listed");
+assert(
+  (await ui.call("catalog.list", {})).total === catalogList.total - strays.length,
+  "the rows are still listed",
+);
 
 // ---- errors ---------------------------------------------------------------------------
 const badOp = await ui.fail("op.add", { photoId, op: "lens_blur", params: {} });
@@ -1007,13 +1516,29 @@ const hugeId = 0x1_0000_0000;
 const hugeSingle = await ui.fail("catalog.thumbnail", { photoId: hugeId });
 const hugeBatch = await ui.fail("catalog.thumbnails", { photoIds: [photoId, hugeId] });
 console.log(`  thumbnail cap: ${hugeSingle}`);
-assert(hugeSingle.startsWith("-32602") && hugeSingle.includes("4294967295"), `an id over the frame limit must be -32602, got ${hugeSingle}`);
-assert(hugeBatch.startsWith("-32602"), `the batch must refuse an unrepresentable id, got ${hugeBatch}`);
+assert(
+  hugeSingle.startsWith("-32602") && hugeSingle.includes("4294967295"),
+  `an id over the frame limit must be -32602, got ${hugeSingle}`,
+);
+assert(
+  hugeBatch.startsWith("-32602"),
+  `the batch must refuse an unrepresentable id, got ${hugeBatch}`,
+);
 assert(ui.thumbnails.length === framesBefore, "a refused thumbnail request must send no frame");
 
-for (const notification of ["stack.changed", "engine.log", "catalog.changed", "job.progress", "python.output", "python.finished"]) {
+for (const notification of [
+  "stack.changed",
+  "engine.log",
+  "catalog.changed",
+  "job.progress",
+  "python.output",
+  "python.finished",
+]) {
   const called = await ui.fail(notification, {});
-  assert(called.startsWith("-32601"), `${notification} as a method should be -32601, got ${called}`);
+  assert(
+    called.startsWith("-32601"),
+    `${notification} as a method should be -32601, got ${called}`,
+  );
 }
 
 // stack.set is the script/agent write path; it takes ids the caller invented.
@@ -1027,16 +1552,26 @@ const replaced = await timed("stack.set", () =>
   }),
 );
 assert(replaced.stack.length === 2, "stack.set did not replace the stack");
-assert(replaced.stack[0].op === "white_balance" && replaced.stack[1].op === "vibrance", "stack.set reordered");
+assert(
+  replaced.stack[0].op === "white_balance" && replaced.stack[1].op === "vibrance",
+  "stack.set reordered",
+);
 await timed("view.render (wb+vib)", () => ui.call("view.render", { viewId }));
 
-const shortened = await timed("op.remove", () => ui.call("op.remove", { photoId, opId: "cafe0001" }));
-assert(shortened.stack.length === 1 && shortened.stack[0].id === "cafe0002", "op.remove removed the wrong op");
+const shortened = await timed("op.remove", () =>
+  ui.call("op.remove", { photoId, opId: "cafe0001" }),
+);
+assert(
+  shortened.stack.length === 1 && shortened.stack[0].id === "cafe0002",
+  "op.remove removed the wrong op",
+);
 
 // Close and reopen: the stack must come back from the sidecar, not from memory.
 await timed("view.close", () => ui.call("view.close", { viewId }));
 await timed("photo.close", () => ui.call("photo.close", { photoId }));
-const reopened = await timed("photo.open (sidecar)", () => ui.call("photo.open", { path: samplePath }));
+const reopened = await timed("photo.open (sidecar)", () =>
+  ui.call("photo.open", { path: samplePath }),
+);
 assert(reopened.photoId === photoId, "the catalog id must be stable across close and open");
 assert(reopened.sidecarLoaded === true, "reopening must report that the sidecar was restored");
 photoId = reopened.photoId;
@@ -1065,7 +1600,9 @@ assert(!existsSync(portFile), "the daemon must remove its mcp.port file on the w
 const stubScratch = `${scratch}-stub`;
 const stubEngine = startEngine(stubScratch, ["--no-mcp"], { LATENT_MASK_STUB: "1" });
 const stub = await connect(await stubEngine.endpoint);
-const stubPhoto = await timed("photo.open (stub)", () => stub.call("photo.open", { path: samplePath }));
+const stubPhoto = await timed("photo.open (stub)", () =>
+  stub.call("photo.open", { path: samplePath }),
+);
 let stubId: number = stubPhoto.photoId;
 const stubView = await stub.call("view.open", { photoId: stubId, width: 640, height: 480 });
 await stub.call("stack.set", {
@@ -1081,29 +1618,54 @@ await stub.call("stack.set", {
   ],
 });
 const beforeDetect = await stub.call("stack.get", { photoId: stubId });
-assert(beforeDetect.stack[0].mask.components[0].state === "pending", "an unrun AI component is pending");
+assert(
+  beforeDetect.stack[0].mask.components[0].state === "pending",
+  "an unrun AI component is pending",
+);
 
 const stubJob = await timed("mask.detect (stub)", () =>
   stub.call("mask.detect", { photoId: stubId, opId: "stub0001", componentId: "subject1" }),
 );
 const running = await stub.call("stack.get", { photoId: stubId });
-assert(running.stack[0].mask.components[0].state === "pending", "detect must mark the component pending");
-assert(running.stack[0].mask.components[0].jobId === stubJob.jobId, "the component must carry its jobId");
+assert(
+  running.stack[0].mask.components[0].state === "pending",
+  "detect must mark the component pending",
+);
+assert(
+  running.stack[0].mask.components[0].jobId === stubJob.jobId,
+  "the component must carry its jobId",
+);
 await waitFor("the stub detect to finish", () =>
-  stub.notifications.some((n) => n.method === "job.progress" && n.params.jobId === stubJob.jobId && n.params.finished),
+  stub.notifications.some(
+    (n) => n.method === "job.progress" && n.params.jobId === stubJob.jobId && n.params.finished,
+  ),
 );
 const stubProgress = stub.notifications.find(
   (n) => n.method === "job.progress" && n.params.jobId === stubJob.jobId && n.params.finished,
 )!;
-assert(stubProgress.params.kind === "mask" && stubProgress.params.state === "done", `stub detect failed: ${JSON.stringify(stubProgress.params)}`);
+assert(
+  stubProgress.params.kind === "mask" && stubProgress.params.state === "done",
+  `stub detect failed: ${JSON.stringify(stubProgress.params)}`,
+);
 
 const stubReady = await stub.call("stack.get", { photoId: stubId });
 const detected = stubReady.stack[0].mask.components[0];
-console.log(`  stub subject -> ${detected.state}, model ${detected.params.model}, raster ${detected.params.raster}`);
+console.log(
+  `  stub subject -> ${detected.state}, model ${detected.params.model}, raster ${detected.params.raster}`,
+);
 assert(detected.state === "ready", "a finished detect must leave the component ready");
-assert(detected.params.model === "stub-shapes", "the component must name the model that produced it");
-assert(detected.params.sourceHash === stubPhoto.hash, "the raster must be tied to the source image");
-assert(existsSync(`${samplePath}.latent.d/${detected.params.raster}`), "the raster must be cached beside the sidecar");
+assert(
+  detected.params.model === "stub-shapes",
+  "the component must name the model that produced it",
+);
+assert(
+  detected.params.sourceHash === stubPhoto.hash,
+  "the raster must be tied to the source image",
+);
+assert(
+  existsSync(`${samplePath}.latent.d/${detected.params.raster}`),
+  "the raster must be cached beside the sidecar",
+);
 
 const stubPreview = await stub.call("mask.preview", {
   photoId: stubId,
@@ -1112,7 +1674,10 @@ const stubPreview = await stub.call("mask.preview", {
   viewId: stubView.viewId,
 });
 console.log(`  stub subject coverage ${(stubPreview.coverage * 100).toFixed(1)}%`);
-assert(stubPreview.coverage > 0.05, `a detected subject must cover something, got ${stubPreview.coverage}`);
+assert(
+  stubPreview.coverage > 0.05,
+  `a detected subject must cover something, got ${stubPreview.coverage}`,
+);
 assert(stub.masks.at(-1)!.width === 640, "the raster follows the view it was sized for");
 
 // The raster outlives the process: reopening reads the PNG back rather than re-detecting.
@@ -1173,9 +1738,15 @@ if (!existsSync(`${modelStore}/birefnet-lite`)) {
       ],
     });
     const begin = performance.now();
-    const job = await ai.call("mask.detect", { photoId: aiId, opId: "ai000001", componentId: "detected" });
+    const job = await ai.call("mask.detect", {
+      photoId: aiId,
+      opId: "ai000001",
+      componentId: "detected",
+    });
     await waitFor(`the ${kind} detect to finish`, () =>
-      ai.notifications.some((n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished),
+      ai.notifications.some(
+        (n) => n.method === "job.progress" && n.params.jobId === job.jobId && n.params.finished,
+      ),
     );
     const elapsed = performance.now() - begin;
     const progress = ai.notifications.find(
@@ -1194,25 +1765,43 @@ if (!existsSync(`${modelStore}/birefnet-lite`)) {
       `  ${kind.padEnd(8)} ${(preview.coverage * 100).toFixed(2).padStart(6)}% ` +
         `via ${component.params.model} in ${elapsed.toFixed(0)} ms`,
     );
-    assert(component.state === "ready", `a finished detect leaves the component ready, not ${component.state}`);
-    assert(component.params.sourceHash === aiPhoto.hash, "the raster must be tied to the source image");
-    assert(existsSync(`${samplePath}.latent.d/${component.params.raster}`), "the raster is cached beside the sidecar");
+    assert(
+      component.state === "ready",
+      `a finished detect leaves the component ready, not ${component.state}`,
+    );
+    assert(
+      component.params.sourceHash === aiPhoto.hash,
+      "the raster must be tied to the source image",
+    );
+    assert(
+      existsSync(`${samplePath}.latent.d/${component.params.raster}`),
+      "the raster is cached beside the sidecar",
+    );
     return { coverage: preview.coverage, model: component.params.model as string };
   }
 
   // A box around the woman, normalised over the content rect -> SAM 2.
   const objects = await detectMask("objects", { box: [0.3, 0.2, 0.7, 0.9] });
   assert(objects.model === "sam2-hiera-base-plus", `objects must run SAM 2, not ${objects.model}`);
-  assert(objects.coverage > 0.08 && objects.coverage < 0.16, `objects coverage ${objects.coverage}`);
+  assert(
+    objects.coverage > 0.08 && objects.coverage < 0.16,
+    `objects coverage ${objects.coverage}`,
+  );
 
   // Florence-2 finds the box, SAM 2 turns it into a mask. The hat is small.
   const text = await detectMask("text", { prompt: "the hat" });
-  assert(text.model === "florence-2-base+sam2-hiera-base-plus", `text must chain both models, not ${text.model}`);
+  assert(
+    text.model === "florence-2-base+sam2-hiera-base-plus",
+    `text must chain both models, not ${text.model}`,
+  );
   assert(text.coverage > 0.005 && text.coverage < 0.05, `"the hat" coverage ${text.coverage}`);
 
   const subject = await detectMask("subject");
   assert(subject.model === "birefnet-lite", `subject must run BiRefNet, not ${subject.model}`);
-  assert(subject.coverage > 0.08 && subject.coverage < 0.16, `subject coverage ${subject.coverage}`);
+  assert(
+    subject.coverage > 0.08 && subject.coverage < 0.16,
+    `subject coverage ${subject.coverage}`,
+  );
 
   // A seamless paper backdrop is not a sky, and the empty answer is the feature.
   const sky = await detectMask("sky");
@@ -1226,7 +1815,10 @@ if (!existsSync(`${modelStore}/birefnet-lite`)) {
   // A second prompt on the same photo reuses the cached SAM 2 embedding, so it skips the
   // ~100 ms encode. Timings are printed above; this only asserts the answer is the same.
   const again = await detectMask("objects", { box: [0.3, 0.2, 0.7, 0.9] });
-  assert(Math.abs(again.coverage - objects.coverage) < 1e-9, "the cached embedding must give the same mask");
+  assert(
+    Math.abs(again.coverage - objects.coverage) < 1e-9,
+    "the cached embedding must give the same mask",
+  );
 
   // The picture: -100 saturation everywhere the subject is *not*, so she keeps her colour
   // and the backdrop goes grey. Same mask, inverted — which is also why the preview above

@@ -1,8 +1,13 @@
 #include "server/server.h"
 
 #include "catalog/thumbnail.h"
+#include "generative/generative.h"
+#include "generative/image_io.h"
 #include "image/jpeg.h"
 #include "image/png.h"
+#include "merge/frame_info.h"
+#include "merge/merge.h"
+#include "merge/source_image.h"
 #include "ops/mask.h"
 #include "ops/registry.h"
 #include "ops/sha256.h"
@@ -13,6 +18,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <algorithm>
@@ -37,6 +43,9 @@ constexpr int kMethodNotFound = -32601;
 constexpr int kEngineFailure = -32000;
 constexpr uint32_t kDefaultThumbnailSize = 256;
 constexpr int kPreviewQuality = 88;
+// merge.preview's default long edge: big enough to judge a stitch, small enough that the
+// whole preview comes out of the raws' embedded JPEGs.
+constexpr int kMergePreviewLongEdge = 1024;
 constexpr size_t kImportProgressEvery = 8;
 constexpr int kDefaultScriptTimeoutMs = 30000;
 // mask.preview without a viewId, and the input a detector is handed: both proxy sizes,
@@ -46,6 +55,9 @@ constexpr uint32_t kMaskDetectInputSize = 1024;
 // LTHM carries the photo id in a u32 (protocol/frames.md); a larger rowid cannot be
 // tagged, so the request is refused instead of answered with a truncated frame.
 constexpr int64_t kMaxThumbnailPhotoId = 0xFFFFFFFF;
+// Exporting a photo nobody opened uploads it under an id no catalog rowid can be: rowids
+// start at 1, so a negative one cannot collide with an open photo's texture.
+constexpr int64_t kExportScratchPhotoId = -1;
 constexpr std::array<std::string_view, 6> kNotificationNames = {
     "stack.changed", "engine.log",    "catalog.changed",
     "job.progress",  "python.output", "python.finished"};
@@ -143,6 +155,40 @@ nlohmann::json content_rect(const ViewGeometry& geometry) {
       {geometry.content_x, geometry.content_y, geometry.content_width, geometry.content_height});
 }
 
+// `imageTransform`: image-normalised -> view pixel, row-major 3x3 applied to (x, y, 1)
+// with a homogeneous divide. Projective rather than affine because the Transform sliders'
+// keystone is, and it carries the viewport's zoom and pan as well, so one matrix takes a
+// pointer to a mask coordinate and a mask coordinate back to a canvas pixel.
+nlohmann::json image_transform(const GeometryMap& map) {
+  return nlohmann::json(image_transform_wire(map));
+}
+
+// `view.render`'s optional viewport. Absent leaves the view where it was, which is what
+// every client that does not zoom sends.
+std::optional<Viewport> viewport_param(const nlohmann::json& params) {
+  if (!params.contains("viewport") || params["viewport"].is_null()) return std::nullopt;
+  if (!params["viewport"].is_object()) {
+    throw RpcError(kInvalidParams, "params.viewport must be an object");
+  }
+  const nlohmann::json& given = params["viewport"];
+  Viewport viewport;
+  viewport.scale = given.value("scale", 1.0);
+  if (!std::isfinite(viewport.scale) || viewport.scale < kMinViewportScale ||
+      viewport.scale > kMaxViewportScale) {
+    throw RpcError(kInvalidParams, "params.viewport.scale is out of range");
+  }
+  const bool has_centre = given.contains("centerX") && given.contains("centerY");
+  viewport.center_x = given.value("centerX", 0.5);
+  viewport.center_y = given.value("centerY", 0.5);
+  if (!std::isfinite(viewport.center_x) || !std::isfinite(viewport.center_y)) {
+    throw RpcError(kInvalidParams, "params.viewport centre must be finite");
+  }
+  // Fit is not a scale of 1 with a centre: it is "centre the image", which is what every
+  // render did before the viewport existed and what Ctrl+0 goes back to.
+  viewport.fit = !has_centre || viewport.scale <= kMinViewportScale;
+  return viewport;
+}
+
 // The frame's target field is a u32: an id that does not fit could only go out mislabelled.
 void require_thumbnailable(int64_t photo_id) {
   if (photo_id <= kMaxThumbnailPhotoId) return;
@@ -189,6 +235,19 @@ Stack sanitize_stack(const Stack& input, std::vector<std::string>& warnings) {
     out.push_back(std::move(copy));
   }
   return out;
+}
+
+// What mask.detect renders for the detector: every enabled op below `op_id`, minus the
+// geometry ops. Without a geometry op the view's content rect is the whole frame, so the
+// render is the uncropped photo and a detector's coordinates are image-normalised.
+Stack detect_input_stack(const Stack& stack, std::string_view op_id) {
+  Stack below;
+  for (const Op& op : stack) {
+    if (op.id == op_id) break;
+    if (is_geometry_op(op.name)) continue;
+    below.push_back(op);
+  }
+  return below;
 }
 
 // A component's raster cache key: its params, the model that produced it and the source
@@ -255,6 +314,30 @@ std::vector<std::string> collect_raw_files(const std::vector<std::string>& paths
   return files;
 }
 
+// `make_thumbnail` reads the file through LibRaw, and LibRaw refuses a Photo Merge result
+// (merge/source_image.h). This is the same job for either kind of source.
+Thumbnail make_any_thumbnail(const std::string& path, const std::string& cache, uint32_t size) {
+  if (!is_source_tiff(path)) return make_thumbnail(path, cache, size);
+
+  const SourceMetadata source = read_source_metadata(path);
+  const Rgb8Image image = box_resize_to_fit(
+      linear_to_srgb(to_linear(decode_raw(path)), static_cast<float>(source.scale)), size);
+  Thumbnail thumbnail;
+  thumbnail.width = image.width;
+  thumbnail.height = image.height;
+  thumbnail.jpeg = encode_jpeg(image, kPreviewQuality);
+
+  std::error_code error;
+  std::filesystem::create_directories(std::filesystem::path(cache).parent_path(), error);
+  std::ofstream file(cache, std::ios::binary | std::ios::trunc);
+  // An unwritable cache is not worth failing the request for, same as make_thumbnail.
+  if (file) {
+    file.write(reinterpret_cast<const char*>(thumbnail.jpeg.data()),
+               static_cast<std::streamsize>(thumbnail.jpeg.size()));
+  }
+  return thumbnail;
+}
+
 }  // namespace
 
 Server::Server(Renderer& renderer, ServerOptions options)
@@ -284,6 +367,12 @@ void Server::run() {
   };
   behavior.close = [this](Peer* peer, int, std::string_view) { std::erase(peers_, peer); };
 
+  // The one HTTP route the daemon serves: the PNG a merge.preview job just wrote. A
+  // renderer loaded from http://localhost cannot read file://, and a preview is a picture
+  // nobody should pay a new binary frame type for, so it is fetched over this listener.
+  app.get("/preview/:name", [this](uWS::HttpResponse<false>* response, uWS::HttpRequest* request) {
+    serve_preview(response, request->getParameter("name"));
+  });
   app.ws<PerSocketData>("/*", std::move(behavior));
   app.listen("127.0.0.1", options_.port,
              [this](us_listen_socket_t* token) { listen_socket_ = token; });
@@ -292,13 +381,17 @@ void Server::run() {
   }
 
   const int bound = us_socket_local_port(0, reinterpret_cast<us_socket_t*>(listen_socket_));
+  // Merge previews answer with an absolute URL, so the port has to outlive this scope.
+  bound_port_ = bound;
   std::printf("listening on ws://127.0.0.1:%d\n", bound);
   std::printf("catalog %s\n", catalog_.path().c_str());
   std::fflush(stdout);
 
-  const std::string package_dir = options_.python_package_dir.empty()
-                                      ? std::string(LATENT_PYTHON_PACKAGE_DIR)
-                                      : options_.python_package_dir;
+  // Flag, then environment (a packaged build's AppRun sets it), then the build tree.
+  const char* package_dir_env = std::getenv("LATENT_PYTHON_PACKAGE_DIR");
+  std::string package_dir = options_.python_package_dir;
+  if (package_dir.empty() && package_dir_env != nullptr) package_dir = package_dir_env;
+  if (package_dir.empty()) package_dir = LATENT_PYTHON_PACKAGE_DIR;
   try {
     python_ = std::make_unique<PythonHost>(*this, package_dir);
   } catch (const std::exception& error) {
@@ -444,9 +537,16 @@ std::optional<nlohmann::json> Server::dispatch(std::string_view method,
   if (method == "catalog.thumbnails") return handle_catalog_thumbnails(params, peer, responder);
   if (method == "catalog.remove") return handle_catalog_remove(params);
   if (method == "job.cancel") return handle_job_cancel(params);
+  if (method == "merge.hdr") return handle_merge(MergeKind::Hdr, params, false);
+  if (method == "merge.panorama") return handle_merge(MergeKind::Panorama, params, false);
+  if (method == "merge.hdrPanorama") return handle_merge(MergeKind::HdrPanorama, params, false);
+  if (method == "merge.preview") return handle_merge(merge_kind_from_params(params), params, true);
   if (method == "mask.preview") return handle_mask_preview(params, peer);
   if (method == "mask.detect") return handle_mask_detect(params, peer);
+  if (method == "generative.run") return handle_generative_run(params);
+  if (method == "generative.status") return handle_generative_status(responder);
   if (method == "mask.stroke") return handle_mask_stroke(params, peer);
+  if (method == "export.run") return handle_export_run(params);
   throw RpcError(kMethodNotFound, "unknown method '" + std::string(method) + "'");
 }
 
@@ -485,7 +585,10 @@ std::optional<nlohmann::json> Server::handle_photo_open(const nlohmann::json& pa
   worker_.submit([this, file, responder] {
     try {
       auto raw = std::make_shared<DecodedRaw>(decode_raw(file));
-      const RawMetadata metadata = read_raw_metadata(file);
+      // A Photo Merge result is not a raw and LibRaw will not open it; its row comes from
+      // the sidecar the merge wrote (merge/source_image.h).
+      const RawMetadata metadata =
+          is_source_tiff(file) ? read_source_row(file) : read_raw_metadata(file);
       const std::string hash = sha256_file_hex(file);
       post([this, file, raw, metadata, hash, responder] {
         finish_photo_open(file, raw, metadata, hash, responder);
@@ -531,6 +634,10 @@ void Server::finish_photo_open(const std::string& path, const std::shared_ptr<De
       warnings.emplace_back(std::string("ignoring sidecar: ") + failure.what());
     }
     if (sidecar.has_value()) {
+      // Masks written before image space name no space and hold content-rect coordinates.
+      // This is the one place that knows both the stack's geometry and the photo's size,
+      // so it is where they are converted; the next save writes them back as `image`.
+      migrate_mask_space(sidecar->stack, photo.width, photo.height);
       photo.history = History(sanitize_stack(sidecar->stack, warnings));
       photo.sidecar_loaded = true;
     }
@@ -544,6 +651,9 @@ void Server::finish_photo_open(const std::string& path, const std::shared_ptr<De
     // The sidecar names AI rasters by path; without them a `ready` component would render
     // as "select everything" instead of what the model found.
     load_mask_rasters(opened);
+    // Same rule for a generative op: without its cached PNG it would render as if the fill
+    // had never happened, which is worse than showing a stale one.
+    load_generative_results(opened);
     broadcast_stack_changed(opened, "load", responder.peer);
     reply_result(responder, photo_open_result(opened));
   } catch (const std::exception& failure) {
@@ -713,10 +823,27 @@ nlohmann::json Server::handle_view_render(const nlohmann::json& params, Peer* pe
     renderer_.resize_view(view.id, require_size(params, "width"), require_size(params, "height"));
   }
 
-  const ViewGeometry geometry = renderer_.view_geometry(view.id);
+  // `geometry: "full"` is the crop tool's frame: the whole image, the crop op's rect and
+  // straighten bypassed. Anything else than the two declared words is a bad request.
+  bool bypass_crop = false;
+  if (params.contains("geometry") && !params["geometry"].is_null()) {
+    const std::string mode = require_string(params, "geometry");
+    if (mode != "stack" && mode != "full") {
+      throw RpcError(kInvalidParams, "params.geometry must be 'stack' or 'full'");
+    }
+    bypass_crop = mode == "full";
+  }
+
+  const std::optional<Viewport> viewport = viewport_param(params);
+  if (viewport) renderer_.set_viewport(view.id, *viewport);
+
+  ViewGeometry geometry = renderer_.view_geometry(view.id);
   view.frame.resize(kFrameHeaderBytes + static_cast<size_t>(geometry.width) * geometry.height * 4);
-  const RenderTiming timing =
-      renderer_.render(view.id, found->second.history.current(), view.frame, kFrameHeaderBytes);
+  const RenderTiming timing = renderer_.render(view.id, found->second.history.current(), view.frame,
+                                               kFrameHeaderBytes, bypass_crop);
+  // The render is what resolves the geometry — a crop edit or the bypass changes the image
+  // rect inside the frame — so the rect goes out after it, never the one from before.
+  geometry = renderer_.view_geometry(view.id);
   ++view.seq;
   view.has_frame = true;
   write_frame_header(view.frame, "LFRM", geometry.width, geometry.height, view.seq, view.id, 0);
@@ -726,10 +853,17 @@ nlohmann::json Server::handle_view_render(const nlohmann::json& params, Peer* pe
   // the frame it holds is the newest state or one render behind. `contentRect` is where
   // the image sits inside that frame: crop and rotate change its aspect, so the letterbox
   // is not something the client can derive from the photo's own size.
+  const Viewport resolved = renderer_.view_viewport(view.id);
   return {{"seq", view.seq},
           {"width", geometry.width},
           {"height", geometry.height},
           {"contentRect", content_rect(geometry)},
+          {"imageTransform", image_transform(renderer_.view_map(view.id))},
+          {"viewport",
+           {{"scale", resolved.scale},
+            {"centerX", resolved.center_x},
+            {"centerY", resolved.center_y},
+            {"fit", resolved.fit}}},
           {"renderMs", timing.render_ms},
           {"readbackMs", timing.readback_ms},
           {"revision", found->second.history.revision()}};
@@ -918,7 +1052,7 @@ std::optional<nlohmann::json> Server::handle_catalog_thumbnail(const nlohmann::j
   const std::string path = row.path;
   worker_.submit([this, photo_id, path, cache, size, responder] {
     try {
-      const Thumbnail thumbnail = make_thumbnail(path, cache, size);
+      const Thumbnail thumbnail = make_any_thumbnail(path, cache, size);
       post([this, photo_id, thumbnail, responder] {
         send_thumbnail(responder.peer, photo_id, thumbnail.jpeg, thumbnail.width, thumbnail.height);
         reply_result(
@@ -979,7 +1113,7 @@ std::optional<nlohmann::json> Server::handle_catalog_thumbnails(const nlohmann::
     std::vector<int64_t> failed = missing;
     for (const PendingThumbnail& entry : pending) {
       try {
-        const Thumbnail thumbnail = make_thumbnail(entry.path, entry.cache, size);
+        const Thumbnail thumbnail = make_any_thumbnail(entry.path, entry.cache, size);
         ++made;
         const int64_t photo_id = entry.photo_id;
         post([this, photo_id, thumbnail, responder] {
@@ -1079,17 +1213,22 @@ nlohmann::json Server::handle_mask_preview(const nlohmann::json& params, Peer* p
 
   std::vector<uint8_t> frame;
   ViewGeometry geometry;
+  GeometryMap map;
   const MaskReadout readout =
-      send_mask_frame(peer, photo, view_id, op_id, component_id, frame, geometry);
+      send_mask_frame(peer, photo, view_id, op_id, component_id, frame, geometry, map);
+  // The raster is view-space — it is what the overlay blits — but the component's own
+  // coordinates are image-space, so the matrix goes out beside the rect.
   return {{"width", readout.width},
           {"height", readout.height},
           {"contentRect", content_rect(geometry)},
+          {"imageTransform", image_transform(map)},
           {"coverage", readout.coverage}};
 }
 
 MaskReadout Server::send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view_id,
                                     const std::string& op_id, const std::string& component_id,
-                                    std::vector<uint8_t>& frame, ViewGeometry& geometry) {
+                                    std::vector<uint8_t>& frame, ViewGeometry& geometry,
+                                    GeometryMap& map) {
   uint32_t target = view_id;
   const bool temporary = target == 0;
   if (temporary) {
@@ -1111,6 +1250,9 @@ MaskReadout Server::send_mask_frame(Peer* peer, PhotoState& photo, uint32_t view
     frame.assign(kFrameHeaderBytes + (static_cast<size_t>(geometry.width) * geometry.height), 0);
     readout = renderer_.read_mask(target, photo.history.current(), op_id, component_id, frame,
                                   kFrameHeaderBytes);
+    // After the read: it is the render inside it that resolves the stage.
+    geometry = renderer_.view_geometry(target);
+    map = renderer_.view_map(target);
   } catch (...) {
     if (temporary) renderer_.close_view(target);
     throw;
@@ -1165,15 +1307,18 @@ int64_t Server::start_mask_detect(PhotoState& photo, const std::string& op_id,
   request.kind = component->kind;
   request.params = component->params;
   op->mask = mask_to_json(mask);
+  // Taken before the commit below moves `next` out from under us.
+  const Stack input_stack = detect_input_stack(next, op_id);
   // Engine bookkeeping, not a user edit: pending replaces the current snapshot instead of
   // costing an undo step. The result below commits for real, so it reaches the sidecar.
   commit(photo, std::move(next), true, "ui", origin);
 
-  // What the detector sees. Phase 1 hands it the whole stack rendered small, which is
-  // also what an agent looking at render_preview would see; cropping to the sub-stack
-  // below the op is the generative path's problem (PROMPT.md 3.5) and lands with SAM 2.
+  // What the detector sees: the stack *below* this op, with every geometry op dropped, so
+  // the boxes and points it answers with are already in the image space the mask is stored
+  // in. Rendering the cropped picture instead would put a subject's box at the wrong place
+  // the moment the crop moved.
   try {
-    const OffscreenFrame input = render_offscreen(photo.id, kMaskDetectInputSize);
+    const OffscreenFrame input = render_offscreen(photo.id, kMaskDetectInputSize, input_stack);
     request.image = rgba_to_rgb(input.rgba, input.geometry.width, input.geometry.content_x,
                                 input.geometry.content_y, input.geometry.content_width,
                                 input.geometry.content_height);
@@ -1389,7 +1534,7 @@ void Server::thumbnail_job(int64_t job_id, int64_t parent_job_id,
     const std::string cache = thumbnail_cache_path(thumbnail_key(*row), kDefaultThumbnailSize);
     try {
       if (!read_cached_thumbnail(cache).has_value()) {
-        make_thumbnail(row->path, cache, kDefaultThumbnailSize);
+        make_any_thumbnail(row->path, cache, kDefaultThumbnailSize);
       }
     } catch (const std::exception& error) {
       std::fprintf(stderr, "[warn] thumbnail failed for %s: %s\n", row->path.c_str(), error.what());
@@ -1484,6 +1629,9 @@ nlohmann::json Server::stack_state(const PhotoState& photo) {
                           {"revision", photo.history.revision()},
                           {"canUndo", photo.history.can_undo()},
                           {"canRedo", photo.history.can_redo()}};
+  // `stale` is derived from the stack below each generative op, so it is added on the way
+  // out and never stored: a sidecar that recorded it would be wrong the moment it loaded.
+  annotate_generative_stale(state["stack"], photo.history.current());
   for (const auto& [view_id, view] : views_) {
     if (view.photo_id != photo.id || !view.has_frame) continue;
     const ViewGeometry geometry = renderer_.view_geometry(view_id);
@@ -1546,6 +1694,11 @@ void Server::save_sidecar(PhotoState& photo) {
 }
 
 Server::OffscreenFrame Server::render_offscreen(int64_t photo_id, uint32_t max_size) {
+  return render_offscreen(photo_id, max_size, require_photo(photo_id).history.current());
+}
+
+Server::OffscreenFrame Server::render_offscreen(int64_t photo_id, uint32_t max_size,
+                                                const Stack& stack) {
   const PhotoState& photo = require_photo(photo_id);
   const double aspect = static_cast<double>(photo.width) / std::max(1U, photo.height);
   uint32_t width = std::clamp(max_size, 32U, 4096U);
@@ -1561,7 +1714,7 @@ Server::OffscreenFrame Server::render_offscreen(int64_t photo_id, uint32_t max_s
   try {
     out.geometry = renderer_.view_geometry(view_id);
     out.rgba.resize(static_cast<size_t>(out.geometry.width) * out.geometry.height * 4);
-    renderer_.render(view_id, photo.history.current(), out.rgba, 0);
+    renderer_.render(view_id, stack, out.rgba, 0);
   } catch (...) {
     renderer_.close_view(view_id);
     throw;
@@ -1787,6 +1940,713 @@ nlohmann::json Server::catalog_list(int limit) {
     photos.push_back(entry);
   }
   return photos;
+}
+
+nlohmann::json Server::handle_export_run(const nlohmann::json& params) {
+  return start_export(params);
+}
+
+nlohmann::json Server::start_export(const nlohmann::json& params) {
+  ExportOptions options;
+  try {
+    options = export_options_from_json(params);
+  } catch (const OpError& error) {
+    throw RpcError(kInvalidParams, error.what());
+  }
+  if (options.format == ExportFormat::Avif && !export_avif_available()) {
+    throw RpcError(kInvalidParams, "this build of latentd has no AVIF encoder");
+  }
+
+  // Resolving the paths up front turns an unknown id into -32602 instead of a job that
+  // reports a failure per photo it never had.
+  std::vector<std::string> paths;
+  paths.reserve(options.photo_ids.size());
+  for (int64_t photo_id : options.photo_ids) {
+    const auto open = photos_.find(photo_id);
+    if (open != photos_.end()) {
+      paths.push_back(open->second.path);
+      continue;
+    }
+    const std::optional<CatalogPhoto> row = catalog_.get(photo_id);
+    if (!row.has_value()) {
+      throw RpcError(kInvalidParams, "unknown photoId " + std::to_string(photo_id));
+    }
+    paths.push_back(row->path);
+  }
+
+  const std::vector<ExportTarget> targets = plan_export(options, options.photo_ids, paths);
+  const int64_t job_id = next_job_id_++;
+  job_started(job_id);
+  publish_progress(job_id, 0, "export", 0, static_cast<int64_t>(targets.size()), "running", "");
+  worker_.submit([this, job_id, options, targets] { export_job(job_id, options, targets); });
+
+  nlohmann::json files = nlohmann::json::array();
+  for (const ExportTarget& target : targets) {
+    files.push_back(target.output_path);
+  }
+  // `files` is not on the wire (protocol ExportRunResult); it is what the Python and MCP
+  // surfaces answer with, so an agent knows where to look without watching job.progress.
+  return {{"jobId", job_id}, {"total", targets.size()}, {"files", files}};
+}
+
+Rgb16Image Server::render_one_export(const ExportTarget& target,
+                                     const ExportRenderOptions& options) {
+  Rgb16Image image;
+  bool open = false;
+  run_on_server_thread([&] {
+    const auto found = photos_.find(target.photo_id);
+    open = found != photos_.end() && renderer_.has_photo(target.photo_id);
+    if (!open) return;
+    image = renderer_.render_export(target.photo_id, found->second.history.current(), options);
+  });
+  if (open) return image;
+
+  // Not open: decode here, on the worker, because a 24 MP raw is over a second and the
+  // server thread has a socket to answer. Only the upload and the render hop over.
+  const DecodedRaw raw = decode_raw(target.source_path);
+  Stack stack;
+  const std::optional<Sidecar> sidecar = read_sidecar(sidecar_path_for(target.source_path));
+  if (sidecar.has_value()) stack = sidecar->stack;
+
+  // The AI mask rasters the sidecar points at. photo.open does this through
+  // load_mask_rasters; an export of a photo nobody opened has to do it itself, or every
+  // AI component would contribute nothing and the masked ops would render unmasked.
+  std::vector<std::pair<std::string, GrayImage>> rasters;
+  for (const Op& op : stack) {
+    if (!op.mask.has_value()) continue;
+    for (const MaskComponent& component : mask_from_json(*op.mask).components) {
+      if (!mask_kind_is_ai(component.kind)) continue;
+      const std::string relative = component.params.value("raster", std::string());
+      if (relative.empty()) continue;
+      std::optional<GrayImage> raster =
+          read_gray_png(sidecar_dir_for(target.source_path) + "/" + relative);
+      if (raster.has_value()) rasters.emplace_back(component.id, std::move(*raster));
+    }
+  }
+
+  run_on_server_thread([&] {
+    renderer_.load_photo(kExportScratchPhotoId, raw);
+    try {
+      for (auto& [component_id, raster] : rasters) {
+        renderer_.put_mask_raster(kExportScratchPhotoId, component_id, component_id,
+                                  std::move(raster));
+      }
+      image = renderer_.render_export(kExportScratchPhotoId, stack, options);
+    } catch (...) {
+      renderer_.unload_photo(kExportScratchPhotoId);
+      throw;
+    }
+    renderer_.unload_photo(kExportScratchPhotoId);
+  });
+  return image;
+}
+
+void Server::export_job(int64_t job_id, const ExportOptions& options,
+                        const std::vector<ExportTarget>& targets) {
+  ExportRenderOptions render_options;
+  render_options.resize = options.resize;
+  render_options.sharpen = options.sharpen;
+  render_options.color_space = options.color_space;
+  const auto total = static_cast<int64_t>(targets.size());
+
+  ExportCallbacks callbacks;
+  callbacks.cancelled = [this, job_id] { return worker_.stopping() || job_cancelled(job_id); };
+  callbacks.progress = [this, job_id, total](size_t done, size_t, const std::string& path) {
+    publish_progress(job_id, 0, "export", static_cast<int64_t>(done), total, "running", path);
+  };
+  // warn() broadcasts, and broadcasting is the server thread's job; this runs on the worker.
+  callbacks.warn = [this](const std::string& message) {
+    post([this, message] { warn(message, 0); });
+  };
+  callbacks.render = [this, &render_options](const ExportTarget& target) {
+    return render_one_export(target, render_options);
+  };
+
+  ExportOutcome outcome;
+  std::string failure;
+  try {
+    outcome = run_export(options, targets, callbacks);
+  } catch (const std::exception& error) {
+    // Only the things run_export does outside the per-photo try reach here: the ICC, and
+    // creating the output directory.
+    failure = error.what();
+  }
+  if (failure.empty()) failure = outcome.error;
+  std::string state = failure.empty() ? "done" : "error";
+  if (outcome.cancelled) state = "cancelled";
+  publish_progress(job_id, 0, "export", static_cast<int64_t>(outcome.done), total, state,
+                   std::to_string(outcome.written) + " of " + std::to_string(total) + " written",
+                   failure);
+  job_finished(job_id);
+}
+
+// ---- generative ops (PROMPT.md 3.5) -----------------------------------------------------
+
+namespace {
+
+// The probe render the mask's bounding box is measured on, and the long edge the crop is
+// aimed at — what Flux Fill and Qwen-Image-Edit are trained around.
+constexpr uint32_t kGenerativeProbeSize = 1024;
+constexpr uint32_t kGenerativeCropSize = 1536;
+// Context around the hole, as a share of the frame's long edge. A model given nothing but
+// the hole has nothing to continue.
+constexpr double kGenerativePadding = 0.06;
+
+// One render of `stack` into a throwaway view, plus `op_id`'s mask read out of the same
+// view so the two are pixel-aligned by construction.
+struct ProbeFrame {
+  ViewGeometry geometry;
+  std::vector<uint8_t> rgba;
+  std::vector<uint8_t> coverage;
+};
+
+ProbeFrame probe_generative(Renderer& renderer, uint32_t view_id, int64_t photo_id,
+                            uint32_t long_edge, uint32_t photo_width, uint32_t photo_height,
+                            const Stack& stack, const std::string& op_id) {
+  const double aspect = static_cast<double>(photo_width) / std::max(1U, photo_height);
+  uint32_t width = std::clamp(long_edge, 64U, 4096U);
+  auto height = std::max(1U, static_cast<uint32_t>(std::lround(width / aspect)));
+  if (height > width) {
+    height = std::clamp(long_edge, 64U, 4096U);
+    width = std::max(1U, static_cast<uint32_t>(std::lround(height * aspect)));
+  }
+
+  renderer.open_view(view_id, photo_id, width, height);
+  ProbeFrame frame;
+  try {
+    frame.geometry = renderer.view_geometry(view_id);
+    const size_t pixels = static_cast<size_t>(frame.geometry.width) * frame.geometry.height;
+    frame.rgba.resize(pixels * 4);
+    renderer.render(view_id, stack, frame.rgba, 0);
+    frame.coverage.assign(pixels, 0);
+    renderer.read_mask(view_id, stack, op_id, {}, frame.coverage, 0);
+  } catch (...) {
+    renderer.close_view(view_id);
+    throw;
+  }
+  renderer.close_view(view_id);
+  return frame;
+}
+
+MaskWindow window_of(const ViewGeometry& geometry) {
+  MaskWindow window;
+  window.stride = geometry.width;
+  window.content_x = static_cast<uint32_t>(std::max(geometry.content_x, 0));
+  window.content_y = static_cast<uint32_t>(std::max(geometry.content_y, 0));
+  window.content_width = geometry.content_width;
+  window.content_height = geometry.content_height;
+  return window;
+}
+
+GrayImage crop_coverage(const ProbeFrame& frame, const CropBox& box) {
+  const MaskWindow window = window_of(frame.geometry);
+  GrayImage image;
+  image.width = box.width;
+  image.height = box.height;
+  image.pixels.assign(static_cast<size_t>(box.width) * box.height, 0);
+  for (uint32_t y = 0; y < box.height; ++y) {
+    const size_t from =
+        (static_cast<size_t>(window.content_y + box.y + y) * window.stride) + window.content_x +
+        box.x;
+    if (from + box.width > frame.coverage.size()) break;
+    std::memcpy(image.pixels.data() + (static_cast<size_t>(y) * box.width),
+                frame.coverage.data() + from, box.width);
+  }
+  return image;
+}
+
+}  // namespace
+
+nlohmann::json Server::handle_generative_run(const nlohmann::json& params) {
+  PhotoState& photo = photo_for(params);
+  return {{"jobId", start_generative(photo, require_string(params, "opId"))}};
+}
+
+std::optional<nlohmann::json> Server::handle_generative_status(const Responder& responder) {
+  worker_.submit([this, responder] {
+    nlohmann::json status = generative_status();
+    post([this, responder, status] { reply_result(responder, status); });
+  });
+  return std::nullopt;
+}
+
+int64_t Server::start_generative(PhotoState& photo, const std::string& op_id) {
+  const Stack stack = photo.history.current();
+  const Op* op = find_op(stack, op_id);
+  if (op == nullptr) throw RpcError(kInvalidParams, "unknown opId '" + op_id + "'");
+  if (!is_generative_op(op->name)) {
+    throw RpcError(kInvalidParams, "op '" + op_id + "' is not a generative op");
+  }
+  if (!op->mask.has_value() || !op->mask->contains("components") ||
+      (*op->mask)["components"].empty()) {
+    throw RpcError(kInvalidParams, "a generative op needs a mask: it is the region to repaint");
+  }
+
+  // What the model sees is exactly what the composite will mix into: the ops below this
+  // one, plus this op with its result stripped so the last run cannot paint itself into
+  // its own input.
+  Stack input = generative_input_stack(stack, op_id);
+  Op probe = *op;
+  probe.result.clear();
+  probe.result_rect.clear();
+  input.push_back(std::move(probe));
+
+  const ProbeFrame first =
+      probe_generative(renderer_, next_view_id_++, photo.id, kGenerativeProbeSize, photo.width,
+                       photo.height, input, op_id);
+  const std::optional<GenerativeRect> bounds =
+      mask_bounds(first.coverage, window_of(first.geometry), kGenerativePadding);
+  if (!bounds.has_value()) {
+    throw RpcError(kInvalidParams, "the op's mask is empty: there is nothing to repaint");
+  }
+
+  // A second, larger render when the hole is small: the crop is what the model works on,
+  // so it is the crop that should land near 1536 px, not the whole frame.
+  const uint32_t render_size = view_size_for_crop(*bounds, kGenerativeProbeSize, kGenerativeCropSize);
+  const ProbeFrame frame =
+      render_size == kGenerativeProbeSize
+          ? first
+          : probe_generative(renderer_, next_view_id_++, photo.id, render_size, photo.width,
+                             photo.height, input, op_id);
+  const CropBox box =
+      crop_box(*bounds, frame.geometry.content_width, frame.geometry.content_height);
+  const GenerativeRect rect =
+      rect_of(box, frame.geometry.content_width, frame.geometry.content_height);
+
+  Rgb8Image crop = rgba_to_rgb(
+      frame.rgba, frame.geometry.width,
+      static_cast<uint32_t>(std::max(frame.geometry.content_x, 0)) + box.x,
+      static_cast<uint32_t>(std::max(frame.geometry.content_y, 0)) + box.y, box.width, box.height);
+  GrayImage coverage = crop_coverage(frame, box);
+  const uint32_t long_edge = std::max(crop.width, crop.height);
+  if (long_edge > kGenerativeCropSize) {
+    const double scale = static_cast<double>(kGenerativeCropSize) / long_edge;
+    const auto width = std::max(8U, static_cast<uint32_t>(std::lround(crop.width * scale)) & ~7U);
+    const auto height = std::max(8U, static_cast<uint32_t>(std::lround(crop.height * scale)) & ~7U);
+    crop = box_resize(crop, width, height);
+    coverage = resample_gray(coverage, width, height);
+  }
+
+  const int64_t job_id = next_job_id_++;
+  GenerativeRequest request;
+  request.task = op->name == "remove" ? "remove" : "fill";
+  request.prompt = op->params.value("prompt", std::string());
+  request.model = op->params.value("model", std::string());
+  request.seed = static_cast<int64_t>(op->params.value("seed", 0.0));
+  request.image = encode_rgb_png(crop);
+  request.mask = encode_gray_png(coverage);
+  request.work_dir = (std::filesystem::temp_directory_path() /
+                      ("latent-generative-" + std::to_string(job_id)))
+                         .string();
+  std::error_code directory_error;
+  std::filesystem::create_directories(request.work_dir, directory_error);
+
+  const std::string backend_name = op->params.value("backend", std::string("auto"));
+  const std::string input_hash = generative_input_hash(stack, op_id);
+  const std::vector<double> stored_rect = rect.to_vector();
+  const int64_t photo_id = photo.id;
+  job_started(job_id);
+  publish_progress(job_id, 0, "generative", 0, 100, "running", request.task);
+  // Nothing about the op changes until the job lands: a run that fails leaves the last
+  // result exactly as it was, and a run that succeeds is the only thing that writes one.
+  worker_.submit([this, request, backend_name, photo_id, op_id, job_id, input_hash,
+                  stored_rect] {
+    GenerativeResult result;
+    try {
+      const std::unique_ptr<GenerativeBackend> backend = make_generative_backend(backend_name);
+      result = backend->inpaint(request, [this, job_id](double fraction, const std::string& note) {
+        if (job_cancelled(job_id)) return false;
+        const auto done = static_cast<int64_t>(std::lround(std::max(fraction, 0.0) * 100));
+        publish_progress(job_id, 0, "generative", done, 100, "running", note);
+        return true;
+      });
+    } catch (const std::exception& error) {
+      result.ok = false;
+      result.code = "engine_error";
+      result.message = error.what();
+    }
+    std::error_code cleanup;
+    std::filesystem::remove_all(request.work_dir, cleanup);
+    post([this, photo_id, op_id, job_id, input_hash, stored_rect, result] {
+      finish_generative(photo_id, op_id, job_id, input_hash, stored_rect, result);
+    });
+  });
+  return job_id;
+}
+
+void Server::finish_generative(int64_t photo_id, const std::string& op_id, int64_t job_id,
+                               const std::string& input_hash, const std::vector<double>& rect,
+                               const GenerativeResult& result) {
+  const bool cancelled = job_cancelled(job_id);
+  job_finished(job_id);
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) {
+    publish_progress(job_id, 0, "generative", 1, 1, "cancelled", "photo closed");
+    return;
+  }
+  PhotoState& photo = found->second;
+  if (!result.ok) {
+    const std::string state = cancelled || result.code == "cancelled" ? "cancelled" : "error";
+    const std::string message =
+        result.hint.empty() ? result.message : result.message + " — " + result.hint;
+    publish_progress(job_id, 0, "generative", 1, 1, state, message, message);
+    return;
+  }
+
+  Stack next = photo.history.current();
+  Op* op = find_op(next, op_id);
+  if (op == nullptr) {
+    publish_progress(job_id, 0, "generative", 1, 1, "cancelled", "op is gone");
+    return;
+  }
+
+  const std::string relative = generative_result_relative_path(op_id);
+  const std::string path = sidecar_dir_for(photo.path) + "/" + relative;
+  try {
+    write_file(path, result.png);
+  } catch (const std::exception& error) {
+    warn(std::string("generative result not cached on disk: ") + error.what(), photo.id);
+  }
+  const std::optional<Rgb8Image> image = decode_rgb_png(result.png);
+  if (!image.has_value()) {
+    const std::string message = "the backend returned something that is not a PNG";
+    publish_progress(job_id, 0, "generative", 1, 1, "error", message, message);
+    return;
+  }
+  // The path is the upload's identity, and it never changes for an op — so the pixels are
+  // handed over under a key that changes with them: the path plus this run's input hash.
+  op->result = relative;
+  op->input_hash = input_hash;
+  op->result_rect = rect;
+  renderer_.put_generative_result(photo.id, op_id, relative, *image);
+
+  commit(photo, std::move(next), false, "ui", nullptr);
+  publish_progress(job_id, 0, "generative", 1, 1, "done",
+                   result.model.empty() ? result.workflow : result.model);
+}
+
+void Server::load_generative_results(const PhotoState& photo) {
+  for (const Op& op : photo.history.current()) {
+    if (!is_generative_op(op.name) || op.result.empty()) continue;
+    try {
+      const std::optional<Rgb8Image> image =
+          read_rgb_png(sidecar_dir_for(photo.path) + "/" + op.result);
+      if (!image.has_value()) continue;
+      renderer_.put_generative_result(photo.id, op.id, op.result, *image);
+    } catch (const std::exception& error) {
+      warn(std::string("generative result not reloaded: ") + error.what(), photo.id);
+    }
+  }
+}
+
+int64_t Server::run_generative(int64_t photo_id, const std::string& op_id) {
+  return start_generative(require_photo(photo_id), op_id);
+}
+
+nlohmann::json Server::generative_state() {
+  return generative_status();
+}
+
+namespace {
+
+// Lightroom's own counts (reference/lightroom/hdr-panorama.md), plus the panorama cap the
+// compose step can hold in memory (merge/pano.h).
+size_t min_sources(MergeKind kind) {
+  return kind == MergeKind::HdrPanorama ? 4 : 2;
+}
+
+size_t max_sources(MergeKind kind) {
+  switch (kind) {
+    case MergeKind::Hdr:
+      return 7;
+    case MergeKind::Panorama:
+      return 12;
+    case MergeKind::HdrPanorama:
+      break;
+  }
+  return 48;
+}
+
+// The catalog's shutter column is a display string ("1/400"), so the merged row's has to
+// be one too. raw_metadata.cpp formats it the same way from the same LibRaw field.
+std::string shutter_text(double seconds) {
+  if (seconds <= 0) return {};
+  std::array<char, 32> buffer{};
+  if (seconds >= 1.0) {
+    std::snprintf(buffer.data(), buffer.size(), "%.1f", seconds);
+    return std::string(buffer.data());
+  }
+  std::snprintf(buffer.data(), buffer.size(), "1/%d", static_cast<int>(std::lround(1.0 / seconds)));
+  return std::string(buffer.data());
+}
+
+// `<first source>-HDR.tif` next to the sources, stepping a counter rather than replacing a
+// merge that is already there.
+std::string default_merge_path(const std::string& first, MergeKind kind) {
+  const std::filesystem::path source(first);
+  const std::filesystem::path directory = source.parent_path();
+  const std::string stem = source.stem().string() + "-" + merge_suffix(kind);
+  std::error_code error;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    const std::string suffix = attempt == 0 ? "" : "-" + std::to_string(attempt + 1);
+    const std::filesystem::path candidate = directory / (stem + suffix + ".tif");
+    if (!std::filesystem::exists(candidate, error)) return candidate.string();
+  }
+  throw RpcError(kInvalidParams, "cannot find a free name next to " + first);
+}
+
+}  // namespace
+
+nlohmann::json Server::start_merge(const nlohmann::json& params) {
+  const bool preview = optional_flag(params, "preview");
+  return handle_merge(merge_kind_from_params(params), params, preview);
+}
+
+MergeKind Server::merge_kind_from_params(const nlohmann::json& params) {
+  const std::string kind = require_string(params, "kind");
+  if (kind != "hdr" && kind != "panorama" && kind != "hdrPanorama") {
+    throw RpcError(kInvalidParams, "params.kind must be hdr, panorama or hdrPanorama");
+  }
+  return merge_kind_from_name(kind);
+}
+
+nlohmann::json Server::handle_merge(MergeKind kind, const nlohmann::json& params, bool preview) {
+  const std::vector<int64_t> photo_ids = id_array(params, "photoIds");
+  if (photo_ids.size() < min_sources(kind) || photo_ids.size() > max_sources(kind)) {
+    throw RpcError(kInvalidParams, std::string("merge to ") + merge_kind_name(kind) + " takes " +
+                                       std::to_string(min_sources(kind)) + " to " +
+                                       std::to_string(max_sources(kind)) + " photos, got " +
+                                       std::to_string(photo_ids.size()));
+  }
+
+  MergeRequest request;
+  request.kind = kind;
+  request.preview = preview;
+  for (int64_t photo_id : photo_ids) {
+    const CatalogPhoto row = require_row(photo_id);
+    if (!std::filesystem::is_regular_file(row.path)) {
+      throw RpcError(kInvalidParams, "photo " + std::to_string(photo_id) + " is gone: " + row.path);
+    }
+    request.paths.push_back(row.path);
+  }
+  if (params.contains("deghost")) {
+    request.hdr.deghost = deghost_from_name(require_string(params, "deghost"));
+  }
+  request.hdr.auto_align = optional_flag(params, "autoAlign", true);
+  if (params.contains("projection")) {
+    request.pano.projection = projection_from_name(require_string(params, "projection"));
+  }
+  request.pano.boundary_warp = std::clamp(optional_int(params, "boundaryWarp", 0), 0, 100);
+  request.pano.auto_crop = optional_flag(params, "autoCrop", true);
+
+  if (preview) {
+    request.long_edge = static_cast<uint32_t>(
+        std::clamp(optional_int(params, "longEdge", kMergePreviewLongEdge), 128, 4096));
+  } else if (params.contains("outputPath")) {
+    request.output_path = require_string(params, "outputPath");
+  } else {
+    request.output_path = default_merge_path(request.paths.front(), kind);
+  }
+
+  const int64_t job_id = next_job_id_++;
+  job_started(job_id);
+  publish_merge_progress(job_id, 0, static_cast<int64_t>(request.paths.size()) + 2, "running",
+                         preview ? "preview queued" : "queued");
+  worker_.submit([this, job_id, request] { merge_job(job_id, request); });
+  return {{"jobId", job_id}};
+}
+
+void Server::merge_job(int64_t job_id, MergeRequest request) {
+  using clock = std::chrono::steady_clock;
+  const auto started = clock::now();
+  const auto sources = static_cast<int64_t>(request.paths.size());
+  // One tick per decode, one for the merge, one for the write.
+  const int64_t total = sources + 2;
+  const auto elapsed_ms = [started] {
+    return std::chrono::duration<double, std::milli>(clock::now() - started).count();
+  };
+
+  try {
+    SourceMetadata metadata;
+    metadata.merge = merge_kind_name(request.kind);
+    std::vector<MergeFrame> frames;
+    frames.reserve(request.paths.size());
+    int64_t done = 0;
+    for (const std::string& path : request.paths) {
+      if (worker_.stopping() || job_cancelled(job_id)) throw std::runtime_error("cancelled");
+      const std::string name = std::filesystem::path(path).filename().string();
+      publish_merge_progress(job_id, done, total, "running", "decoding " + name);
+
+      const FrameInfo info = read_frame_info(path);
+      // The preview merges the embedded JPEG, which is display-referred and carries the
+      // camera's own tone curve: undoing the sRGB transfer gets it close enough to linear
+      // for a picture, and nowhere near close enough for the file the merge writes.
+      LinearImage image = request.preview
+                              ? srgb_to_linear(load_raw_preview(path, request.long_edge))
+                              : to_linear(decode_raw(path));
+      const double focal = focal_pixels(info, image.width);
+      frames.push_back(MergeFrame{std::move(image), exposure_value(info), focal});
+      metadata.sources.push_back(name);
+      if (done == 0) {
+        metadata.camera = info.camera;
+        metadata.white_balance = info.white_balance;
+        metadata.captured_at = info.captured_at;
+        metadata.aperture = info.aperture;
+        metadata.iso = static_cast<int>(std::lround(info.iso));
+        metadata.focal_length = info.focal_length;
+        metadata.shutter = shutter_text(info.shutter);
+      }
+      ++done;
+    }
+
+    MergeProgress progress;
+    progress.cancelled = [this, job_id] { return worker_.stopping() || job_cancelled(job_id); };
+    progress.tick = [this, job_id, sources, total](int, int, const std::string& stage) {
+      publish_merge_progress(job_id, sources, total, "running", stage);
+    };
+
+    LinearImage merged;
+    if (request.kind == MergeKind::Hdr) {
+      std::vector<HdrFrame> bracket;
+      bracket.reserve(frames.size());
+      for (MergeFrame& frame : frames) {
+        bracket.push_back(HdrFrame{std::move(frame.image), frame.ev});
+      }
+      HdrOutcome outcome = merge_hdr(std::move(bracket), request.hdr, progress);
+      metadata.scale = outcome.scale;
+      merged = std::move(outcome.image);
+    } else if (request.kind == MergeKind::Panorama) {
+      std::vector<PanoFrame> panels;
+      panels.reserve(frames.size());
+      for (MergeFrame& frame : frames) {
+        panels.push_back(PanoFrame{std::move(frame.image), frame.focal_px});
+      }
+      PanoOutcome outcome = merge_panorama(std::move(panels), request.pano, progress);
+      merged = std::move(outcome.image);
+    } else {
+      HdrPanoOptions options;
+      options.hdr = request.hdr;
+      options.pano = request.pano;
+      HdrPanoOutcome outcome = merge_hdr_panorama(std::move(frames), options, progress);
+      metadata.scale = outcome.scale;
+      merged = std::move(outcome.image);
+    }
+    frames.clear();
+
+    const uint32_t width = merged.width;
+    const uint32_t height = merged.height;
+    if (request.preview) {
+      const std::string name = "merge-" + std::to_string(job_id) + ".png";
+      const std::string path = preview_directory() + "/" + name;
+      publish_merge_progress(job_id, total - 1, total, "running", "writing preview");
+      // The preview is a picture, not a source: the radiance scale is folded back in, so
+      // an HDR merge previews at its reference exposure instead of as a dark frame with
+      // one bright corner, and the result is encoded for a screen.
+      write_rgb_png(path, linear_to_srgb(merged, static_cast<float>(metadata.scale)));
+      const nlohmann::json result = {
+          {"previewPath", path},
+          {"previewUrl", "http://127.0.0.1:" + std::to_string(bound_port_) + "/preview/" + name},
+          {"width", width},
+          {"height", height},
+          {"durationMs", elapsed_ms()}};
+      publish_merge_progress(job_id, total, total, "done", "preview ready", result);
+      job_finished(job_id);
+      return;
+    }
+
+    publish_merge_progress(job_id, total - 1, total, "running", "writing " + request.output_path);
+    write_source_tiff(request.output_path, merged, metadata);
+    merged.rgb.clear();
+    merged.rgb.shrink_to_fit();
+    const double duration = elapsed_ms();
+    const std::string path = request.output_path;
+    post([this, job_id, path, metadata, width, height, duration] {
+      finish_merge(job_id, path, metadata, width, height, duration);
+    });
+  } catch (const std::exception& failure) {
+    const std::string message = failure.what();
+    const bool cancelled = message == "cancelled";
+    publish_merge_progress(job_id, 0, total, cancelled ? "cancelled" : "error",
+                           cancelled ? "cancelled" : message, nlohmann::json(),
+                           cancelled ? std::string() : message);
+    job_finished(job_id);
+  }
+}
+
+void Server::finish_merge(int64_t job_id, const std::string& path, const SourceMetadata& metadata,
+                          uint32_t width, uint32_t height, double duration_ms) {
+  const int64_t total = static_cast<int64_t>(metadata.sources.size()) + 2;
+  try {
+    const int64_t photo_id = catalog_.register_photo(path, read_source_row(path), false);
+    catalog_.set_hash(photo_id, sha256_file_hex(path));
+    notify_catalog_changed({photo_id}, "import");
+    const nlohmann::json result = {{"photoId", photo_id},
+                                   {"path", path},
+                                   {"width", width},
+                                   {"height", height},
+                                   {"durationMs", duration_ms}};
+    publish_merge_progress(job_id, total, total, "done",
+                           std::to_string(metadata.sources.size()) + " photos merged", result);
+  } catch (const std::exception& failure) {
+    publish_merge_progress(job_id, total, total, "error", failure.what(), nlohmann::json(),
+                           failure.what());
+  }
+  job_finished(job_id);
+}
+
+void Server::publish_merge_progress(int64_t job_id, int64_t done, int64_t total,
+                                    std::string_view state, const std::string& message,
+                                    const nlohmann::json& result, const std::string& error) {
+  nlohmann::json params = {{"jobId", job_id},
+                           {"kind", "merge"},
+                           {"done", done},
+                           {"total", total},
+                           {"finished", state != "running"},
+                           {"state", state}};
+  if (!message.empty()) params["message"] = message;
+  if (!error.empty()) params["error"] = error;
+  if (!result.is_null()) params["result"] = result;
+  post([this, params] {
+    broadcast({{"jsonrpc", "2.0"}, {"method", "job.progress"}, {"params", params}});
+  });
+}
+
+std::string Server::preview_directory() {
+  const char* cache_home = std::getenv("XDG_CACHE_HOME");
+  std::filesystem::path root;
+  if (cache_home != nullptr && cache_home[0] != '\0') {
+    root = std::filesystem::path(cache_home) / "latent" / "merge-previews";
+  } else {
+    const char* home = std::getenv("HOME");
+    const std::filesystem::path base =
+        home == nullptr ? std::filesystem::current_path() : std::filesystem::path(home);
+    root = base / ".cache" / "latent" / "merge-previews";
+  }
+  std::error_code error;
+  std::filesystem::create_directories(root, error);
+  return root.string();
+}
+
+void Server::serve_preview(uWS::HttpResponse<false>* response, std::string_view name) {
+  // Only a bare filename inside the preview directory: this listener is not a file server.
+  const bool safe = !name.empty() && name.find('/') == std::string_view::npos &&
+                    name.find('\\') == std::string_view::npos &&
+                    name.find("..") == std::string_view::npos;
+  std::ifstream file;
+  if (safe) {
+    file.open(preview_directory() + "/" + std::string(name), std::ios::binary | std::ios::ate);
+  }
+  if (!safe || !file) {
+    response->writeStatus("404 Not Found")->end("no such preview");
+    return;
+  }
+  const std::streamsize size = file.tellg();
+  std::string body(static_cast<size_t>(std::max<std::streamsize>(size, 0)), '\0');
+  file.seekg(0);
+  file.read(body.data(), size);
+  response->writeHeader("Content-Type", "image/png")
+      ->writeHeader("Cache-Control", "no-store")
+      ->end(body);
 }
 
 }  // namespace latent

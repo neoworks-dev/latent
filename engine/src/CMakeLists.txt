@@ -2,6 +2,7 @@
 # Catch2 tests link it directly and run on a machine without a device.
 add_library(latent_ops STATIC
   ops/curve.cpp
+  ops/geometry.cpp
   ops/history.cpp
   ops/mask.cpp
   ops/mask_raster.cpp
@@ -41,6 +42,54 @@ target_link_libraries(latent_catalog PUBLIC latent_ops latent_ai unofficial::sql
   PkgConfig::LIBRAW PNG::PNG
   $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>)
 
+# latent_export is the encoders, the output colour transform and the job runner. No GPU:
+# it takes a finished 16-bit buffer and turns it into a file, so the encoder tests run
+# without a device and the renderer can depend on it for Rgb16Image.
+add_library(latent_export STATIC
+  export/color_space.cpp
+  export/encoder.cpp
+  export/export_job.cpp
+  export/export_options.cpp)
+target_include_directories(latent_export PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(latent_export PUBLIC latent_ops latent_catalog TIFF::TIFF PNG::PNG
+  lcms2::lcms2)
+if(TARGET avif)
+  target_link_libraries(latent_export PUBLIC avif)
+  target_compile_definitions(latent_export PUBLIC LATENT_HAVE_AVIF)
+else()
+  message(WARNING "libavif not found: latentd will refuse AVIF exports")
+endif()
+
+# latent_merge is Photo Merge: alignment, the HDR estimate, the stitch, and the 16-bit
+# TIFF the merged image becomes. Deliberately free of decode_raw — it is handed finished
+# frames — so it stays out of latent_core's dependency cycle and its tests run headless.
+add_library(latent_merge STATIC
+  merge/align.cpp
+  merge/frame_info.cpp
+  merge/hdr.cpp
+  merge/merge.cpp
+  merge/merge_image.cpp
+  merge/pano.cpp
+  merge/source_image.cpp)
+target_include_directories(latent_merge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(latent_merge PUBLIC latent_ops latent_catalog PkgConfig::LIBRAW TIFF::TIFF)
+
+# latent_generative is the ComfyUI half (PROMPT.md 3.5): the op-stack arithmetic behind a
+# cached raster, the graphs Latent ships, the colour PNG codec the crop and the result move
+# as, and the two backends. No GPU and no sockets — it spawns the `comfy` CLI and nothing
+# else — so the generative tests run headless with the stub backend.
+add_library(latent_generative STATIC
+  generative/comfy_backend.cpp
+  generative/comfy_cli.cpp
+  generative/generative.cpp
+  generative/image_io.cpp
+  generative/stub_backend.cpp
+  generative/workflow.cpp)
+target_include_directories(latent_generative PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(latent_generative PUBLIC latent_ops latent_catalog PNG::PNG)
+target_compile_definitions(latent_generative PRIVATE
+  LATENT_WORKFLOW_DIR="${CMAKE_SOURCE_DIR}/workflows")
+
 # Python home = the vcpkg install prefix (…/lib/python3.12 is Python3_STDLIB).
 get_filename_component(LATENT_PYTHON_HOME "${Python3_STDLIB}/../.." ABSOLUTE)
 
@@ -53,8 +102,9 @@ add_library(latent_core STATIC
   python/module.cpp
   raw/raw_decode.cpp
   server/server.cpp)
-target_link_libraries(latent_core PUBLIC latent_ops latent_catalog wgpu_native PkgConfig::LIBRAW
-  unofficial::uwebsockets::uwebsockets pybind11::embed)
+target_link_libraries(latent_core PUBLIC latent_ops latent_catalog latent_export latent_merge
+  latent_generative wgpu_native PkgConfig::LIBRAW unofficial::uwebsockets::uwebsockets
+  pybind11::embed)
 target_compile_definitions(latent_core PRIVATE
   LATENT_PYTHON_HOME="${LATENT_PYTHON_HOME}"
   LATENT_PYTHON_PACKAGE_DIR="${CMAKE_SOURCE_DIR}/python/latent")
@@ -66,7 +116,9 @@ latent_embed_shaders(latent_core
   ${CMAKE_SOURCE_DIR}/shaders/neighborhood.wgsl
   ${CMAKE_SOURCE_DIR}/shaders/display.wgsl
   ${CMAKE_SOURCE_DIR}/shaders/mask.wgsl
-  ${CMAKE_SOURCE_DIR}/shaders/mask_combine.wgsl)
+  ${CMAKE_SOURCE_DIR}/shaders/mask_combine.wgsl
+  ${CMAKE_SOURCE_DIR}/shaders/export.wgsl
+  ${CMAKE_SOURCE_DIR}/shaders/composite.wgsl)
 
 # The MCP SDK is pip-installed into the bundled interpreter; vcpkg has no port for it.
 # The stamp keeps it to once per build directory, and the script never fails the build.
@@ -85,7 +137,13 @@ target_link_libraries(latentd PRIVATE latent_core)
 add_dependencies(latentd latent_python_deps)
 # libpython is linked statically; extension modules (pydantic_core etc.) dlopen'd by the
 # interpreter resolve CPython symbols against the executable, so they must be exported.
-target_link_options(latentd PRIVATE -rdynamic)
+# Nothing else may be: -rdynamic alone also exported every static vcpkg archive, and a
+# shared library loaded later binds to the executable first — libcudnn_graph.so took our
+# zlib's `inflate`/`inflateInit2_` instead of the system's and segfaulted decompressing its
+# runtime-compiled kernels (Florence-2 in the daemon, never in a probe without -rdynamic).
+# Every archive except libpython stays private.
+target_link_options(latentd PRIVATE -rdynamic
+  "-Wl,--exclude-libs,libz.a:liblzma.a:libbz2.a:libjpeg.a:libturbojpeg.a:libpng16.a:libpng.a:libtiff.a:libaom.a:libavif.a:libyuv.a:liblcms2.a:libcrypto.a:libssl.a:libexpat.a:libffi.a:libuuid.a:libb2.a:libjasper.a:libraw_r.a:libsqlite3.a:libuSockets.a")
 # apps/desktop looks for engine/build/dev/latentd, so the binary sits in the build root.
 set_target_properties(latentd PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
   BUILD_RPATH "${ORT_LIB_DIR}" INSTALL_RPATH "${ORT_LIB_DIR}")

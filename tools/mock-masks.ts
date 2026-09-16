@@ -5,6 +5,7 @@
 // Everything here is pure. The engine's real rasters live on the GPU and are cached on
 // disk; a mock that keeps the maths in one testable file is the closest honest stand-in.
 import type { Mask, MaskComponent, MaskComponentKind, Op } from "@latent/protocol";
+import type { ContentRect, Geometry } from "./mock-crop";
 import { FRAME_FORMAT_R8, FRAME_HEADER_BYTES } from "@latent/protocol";
 
 /** The base image under the mask, for the kinds that sample it (luminance, color). */
@@ -360,6 +361,7 @@ export function combineMask(
   width: number,
   height: number,
   sampler: ImageSampler,
+  map?: MockGeometryMap,
 ): Uint8Array {
   const combined = new Float32Array(width * height);
   let seeded = false;
@@ -373,7 +375,30 @@ export function combineMask(
     }
     applyMode(combined, raster, component.mode);
   }
-  return toBytes(combined);
+  // Everything above rasterised in *image* space, which is where a mask's coordinates live
+  // (protocol Mask.space). The frame the overlay lies over is the cropped, straightened,
+  // zoomed picture, so the last step is one nearest-neighbour resample through the same
+  // matrix the engine hands the UI as `imageTransform`.
+  return toBytes(map ? resampleThroughGeometry(combined, width, height, map) : combined);
+}
+
+function resampleThroughGeometry(
+  source: Float32Array,
+  width: number,
+  height: number,
+  map: MockGeometryMap,
+): Float32Array {
+  const out = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const [u, v] = apply(map.viewToImage, x + 0.5, y + 0.5);
+      if (u < 0 || u >= 1 || v < 0 || v >= 1) continue;
+      const sx = Math.min(width - 1, Math.floor(u * width));
+      const sy = Math.min(height - 1, Math.floor(v * height));
+      out[y * width + x] = source[sy * width + sx] ?? 0;
+    }
+  }
+  return out;
 }
 
 function applyMode(combined: Float32Array, raster: Float32Array, mode: string): void {
@@ -478,4 +503,189 @@ export function seedComponentStates(stack: Op[]): Op[] {
     if (!op.mask) return op;
     return { ...op, mask: { components: op.mask.components.map(seedState) } };
   });
+}
+
+// ---- geometry ------------------------------------------------------------------------
+// Where a mask's image-space coordinates land on the frame the mock paints. The crop,
+// straighten, rotate and flip half is `tools/mock-crop.ts` — it owns the pixels and the
+// fitted content rect; this adds the viewport's zoom and pan on top, and turns the pair
+// into the `imageTransform` matrix the engine answers with (protocol ViewRenderResult).
+
+/** Row-major 3×3 applied to (x, y, 1) with a homogeneous divide. */
+export type Mat3 = [number, number, number, number, number, number, number, number, number];
+
+export const IDENTITY: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+export function multiply(a: Mat3, b: Mat3): Mat3 {
+  const out = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (let row = 0; row < 3; row++) {
+    for (let column = 0; column < 3; column++) {
+      out[row * 3 + column] =
+        (a[row * 3] ?? 0) * (b[column] ?? 0) +
+        (a[row * 3 + 1] ?? 0) * (b[3 + column] ?? 0) +
+        (a[row * 3 + 2] ?? 0) * (b[6 + column] ?? 0);
+    }
+  }
+  return out as Mat3;
+}
+
+export function invert(m: Mat3): Mat3 {
+  const c0 = m[4] * m[8] - m[5] * m[7];
+  const c1 = m[5] * m[6] - m[3] * m[8];
+  const c2 = m[3] * m[7] - m[4] * m[6];
+  const determinant = m[0] * c0 + m[1] * c1 + m[2] * c2;
+  if (Math.abs(determinant) < 1e-12) return IDENTITY;
+  const k = 1 / determinant;
+  return [
+    c0 * k,
+    (m[2] * m[7] - m[1] * m[8]) * k,
+    (m[1] * m[5] - m[2] * m[4]) * k,
+    c1 * k,
+    (m[0] * m[8] - m[2] * m[6]) * k,
+    (m[2] * m[3] - m[0] * m[5]) * k,
+    c2 * k,
+    (m[1] * m[6] - m[0] * m[7]) * k,
+    (m[0] * m[4] - m[1] * m[3]) * k,
+  ];
+}
+
+export function apply(m: Mat3, x: number, y: number): [number, number] {
+  const w = m[6] * x + m[7] * y + m[8];
+  if (Math.abs(w) < 1e-12) return [0, 0];
+  return [(m[0] * x + m[1] * y + m[2]) / w, (m[3] * x + m[4] * y + m[5]) / w];
+}
+
+/** `view.render`'s viewport: 1 is fit, and the centre is an image-normalised point. */
+export interface MockViewport {
+  scale: number;
+  centerX: number;
+  centerY: number;
+  fit: boolean;
+}
+
+export const FIT: MockViewport = { scale: 1, centerX: 0.5, centerY: 0.5, fit: true };
+
+export interface MockGeometryMap {
+  /** `[x, y, width, height]` of the image inside the frame, zoom included. */
+  content: ContentRect;
+  /** frame pixel → image 0..1. */
+  viewToImage: Mat3;
+  /** image 0..1 → frame pixel: `imageTransform` on the wire. */
+  imageToView: Mat3;
+}
+
+/**
+ * Content rect 0..1 → image 0..1, the same composition `mock-crop.ts` walks per pixel and
+ * `engine/src/ops/geometry.cpp` builds as a matrix: crop, centre on the crop's middle with
+ * the frame's aspect, straighten, put it back, then the quarter turns and the mirrors.
+ */
+function contentToImage(geometry: Geometry, frameWidth: number, frameHeight: number): Mat3 {
+  const turned = geometry.quadrant % 2 !== 0;
+  const workAspect = turned ? frameHeight / frameWidth : frameWidth / frameHeight;
+  const cropWidth = geometry.right - geometry.left;
+  const cropHeight = geometry.bottom - geometry.top;
+  const centreX = (geometry.left + geometry.right) / 2;
+  const centreY = (geometry.top + geometry.bottom) / 2;
+  const radians = (geometry.angle * Math.PI) / 180;
+
+  const crop: Mat3 = [cropWidth, 0, geometry.left, 0, cropHeight, geometry.top, 0, 0, 1];
+  const toCentre: Mat3 = [workAspect, 0, -workAspect * centreX, 0, 1, -centreY, 0, 0, 1];
+  const unrotate: Mat3 = [
+    Math.cos(radians),
+    Math.sin(radians),
+    0,
+    -Math.sin(radians),
+    Math.cos(radians),
+    0,
+    0,
+    0,
+    1,
+  ];
+  const fromCentre: Mat3 = [1 / workAspect, 0, centreX, 0, 1, centreY, 0, 0, 1];
+  let turn: Mat3 = IDENTITY;
+  if (geometry.quadrant === 1) turn = [0, 1, 0, -1, 0, 1, 0, 0, 1];
+  if (geometry.quadrant === 2) turn = [-1, 0, 1, 0, -1, 1, 0, 0, 1];
+  if (geometry.quadrant === 3) turn = [0, -1, 1, 1, 0, 0, 0, 0, 1];
+  const mirror: Mat3 = [
+    geometry.flipHorizontal ? -1 : 1,
+    0,
+    geometry.flipHorizontal ? 1 : 0,
+    0,
+    geometry.flipVertical ? -1 : 1,
+    geometry.flipVertical ? 1 : 0,
+    0,
+    0,
+    1,
+  ];
+  return multiply(
+    multiply(mirror, turn),
+    multiply(fromCentre, multiply(unrotate, multiply(toCentre, crop))),
+  );
+}
+
+function place(view: number, extent: number, centre: number, fit: boolean): number {
+  if (fit || extent <= view) return Math.round((view - extent) / 2);
+  return Math.round(Math.min(0, Math.max(view - extent, view / 2 - centre * extent)));
+}
+
+/**
+ * The fitted rect `mock-crop.ts` produced, grown by the viewport's zoom and slid to its
+ * centre — clamped, as the engine clamps, so a zoomed frame is never part letterbox.
+ */
+export function geometryMap(
+  geometry: Geometry,
+  fitted: ContentRect,
+  frameWidth: number,
+  frameHeight: number,
+  viewport: MockViewport = FIT,
+): MockGeometryMap {
+  const toImage = contentToImage(geometry, frameWidth, frameHeight);
+  const scale = Math.min(32, Math.max(1, viewport.scale));
+  const width = Math.max(1, Math.round(fitted[2] * scale));
+  const height = Math.max(1, Math.round(fitted[3] * scale));
+  const centre = viewport.fit
+    ? [0.5, 0.5]
+    : apply(invert(toImage), viewport.centerX, viewport.centerY);
+  const x = place(frameWidth, width, centre[0] ?? 0.5, viewport.fit);
+  const y = place(frameHeight, height, centre[1] ?? 0.5, viewport.fit);
+  const viewToContent: Mat3 = [1 / width, 0, -x / width, 0, 1 / height, -y / height, 0, 0, 1];
+  const viewToImage = multiply(toImage, viewToContent);
+  return { content: [x, y, width, height], viewToImage, imageToView: invert(viewToImage) };
+}
+
+/**
+ * The zoom, applied to the pixels: the fitted picture rescaled from `fitted` into the
+ * map's own rect, nearest-neighbour, black outside. A fitted viewport is a no-op.
+ */
+export function applyViewport(
+  frame: ArrayBuffer,
+  headerBytes: number,
+  width: number,
+  height: number,
+  fitted: ContentRect,
+  map: MockGeometryMap,
+): void {
+  const [fitX, fitY, fitWidth, fitHeight] = fitted;
+  const [zoomX, zoomY, zoomWidth, zoomHeight] = map.content;
+  if (fitX === zoomX && fitY === zoomY && fitWidth === zoomWidth && fitHeight === zoomHeight) {
+    return;
+  }
+  const pixels = new Uint8Array(frame, headerBytes);
+  const source = pixels.slice();
+  pixels.fill(0);
+  for (let y = 0; y < height; y++) {
+    const v = (y - zoomY) / zoomHeight;
+    if (v < 0 || v >= 1) continue;
+    const sourceY = Math.floor(fitY + v * fitHeight);
+    for (let x = 0; x < width; x++) {
+      const u = (x - zoomX) / zoomWidth;
+      if (u < 0 || u >= 1) continue;
+      const from = (sourceY * width + Math.floor(fitX + u * fitWidth)) * 4;
+      const to = (y * width + x) * 4;
+      pixels[to] = source[from] ?? 0;
+      pixels[to + 1] = source[from + 1] ?? 0;
+      pixels[to + 2] = source[from + 2] ?? 0;
+      pixels[to + 3] = 255;
+    }
+  }
 }

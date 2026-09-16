@@ -1,3 +1,10 @@
+// The detectors behind mask.detect, and the shape stubs that stand in for them.
+//
+// `request.image` is an **image-space** render: the server hands it the stack below the
+// masked op with every geometry op removed (src/server/server.cpp, `detect_input_stack`),
+// so the boxes and points a model answers with are already normalised over the uncropped
+// photo — the space a mask stores (protocol Mask.space). A detector never sees the crop and
+// never has to undo one.
 #include "ai/mask_detect.h"
 
 #include "ai/dedicated.h"

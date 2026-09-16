@@ -655,6 +655,8 @@ describe("catalog over the socket", () => {
         "Detail",
         "Optics",
         "Geometry",
+        // Generative sorts after Lightroom's own panels: Lightroom has no such section.
+        "Generative",
       ]);
       const whiteBalance = described.ops.find((op) => op.name === "white_balance");
       expect(whiteBalance?.section).toBe("Color");

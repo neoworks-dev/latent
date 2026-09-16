@@ -28,7 +28,8 @@ TEST_CASE("every registered op has a panel, a label and params") {
 }
 
 TEST_CASE("ops.describe lists Lightroom's sections in Lightroom's order") {
-  const std::vector<std::string> expected = {"Light",  "Color",  "Effects",
+  // Generative sits next to Effects: it is Latent's own section, not one of Lightroom's.
+  const std::vector<std::string> expected = {"Light",  "Color",  "Effects", "Generative",
                                              "Detail", "Optics", "Geometry"};
   const nlohmann::json described = describe_ops();
   std::vector<std::string> seen;

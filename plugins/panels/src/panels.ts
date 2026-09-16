@@ -4,8 +4,16 @@
 import type { Op, OpDefinition, OpParamDisplay, OpParamSpec } from "@latent/protocol";
 import { curveJson, curvePoints, type SplitName } from "./curve";
 
-/** Lightroom's Edit-panel headings, top to bottom. Sections the engine invents sort after. */
-export const sectionOrder = ["Light", "Color", "Effects", "Detail", "Optics", "Geometry"] as const;
+/** Lightroom's Edit-panel headings, top to bottom, then Latent's own. */
+export const sectionOrder = [
+  "Light",
+  "Color",
+  "Effects",
+  "Detail",
+  "Optics",
+  "Geometry",
+  "Generative",
+] as const;
 
 /** Headings for an engine that predates `section` and only reports the `panel` key. */
 const legacyLabels: Record<string, string> = {

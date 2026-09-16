@@ -1,5 +1,7 @@
 #include "raw/raw_decode.h"
 
+#include "merge/source_image.h"
+
 #include <chrono>
 
 #include <memory>
@@ -22,6 +24,17 @@ using ProcessedImage = std::unique_ptr<libraw_processed_image_t, ProcessedImageD
 DecodedRaw decode_raw(const std::string& path) {
   using clock = std::chrono::steady_clock;
   const auto started = clock::now();
+
+  // A Photo Merge result is a source image, not a raw: already demosaiced and already in
+  // the working space (merge/source_image.h). There is nothing for LibRaw to do — no
+  // linearise, no camera matrix — so the whole block below is skipped rather than made
+  // into an identity. Only a .tif with a `.latent-source.json` beside it takes this path,
+  // so a TIFF-based raw still goes to LibRaw.
+  if (is_source_tiff(path)) {
+    DecodedRaw out = read_source_tiff(path);
+    out.decode_ms = std::chrono::duration<double, std::milli>(clock::now() - started).count();
+    return out;
+  }
 
   LibRaw raw;
   auto& params = raw.imgdata.params;

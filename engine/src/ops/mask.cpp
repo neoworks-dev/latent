@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <numbers>
 #include <span>
 #include <string>
 #include <unordered_set>
@@ -20,6 +21,7 @@ constexpr std::array<std::string_view, 12> kKindNames = {
     "brush",   "linear", "radial",     "luminance", "color",  "depth"};
 constexpr std::array<std::string_view, 3> kModeNames = {"add", "subtract", "intersect"};
 constexpr std::array<std::string_view, 4> kStateNames = {"ready", "pending", "stale", "failed"};
+constexpr std::array<std::string_view, 2> kSpaceNames = {"image", "content"};
 
 // A drag can legitimately put a gradient handle a little outside the frame, so
 // coordinates are allowed one frame of slack either way; anything wilder is a bug in the
@@ -234,6 +236,10 @@ std::string_view mask_state_name(MaskState state) {
   return kStateNames[static_cast<size_t>(state)];
 }
 
+std::string_view mask_space_name(MaskSpace space) {
+  return kSpaceNames[static_cast<size_t>(space)];
+}
+
 bool mask_kind_is_ai(MaskKind kind) {
   switch (kind) {
     case MaskKind::Brush:
@@ -268,9 +274,20 @@ MaskState mask_state_from_name(std::string_view name) {
   reject("unknown component state '" + std::string(name) + "'");
 }
 
+MaskSpace mask_space_from_name(std::string_view name) {
+  for (size_t i = 0; i < kSpaceNames.size(); ++i) {
+    if (kSpaceNames[i] == name) return static_cast<MaskSpace>(i);
+  }
+  reject("unknown mask space '" + std::string(name) + "'");
+}
+
 Mask mask_from_json(const nlohmann::json& value) {
   if (!value.is_object()) reject("mask must be an object");
   Mask mask;
+  if (value.contains("space") && !value["space"].is_null()) {
+    if (!value["space"].is_string()) reject("mask.space must be a string");
+    mask.space = mask_space_from_name(value["space"].get<std::string>());
+  }
   const nlohmann::json components = value.value("components", nlohmann::json::array());
   if (!components.is_array()) reject("mask.components must be an array");
 
@@ -342,7 +359,9 @@ nlohmann::json mask_to_json(const Mask& mask) {
   for (const MaskComponent& component : mask.components) {
     components.push_back(component_to_json(component));
   }
-  return {{"components", components}};
+  // Always written, never inferred: a sidecar that names its space cannot be migrated
+  // twice, and a client reading one knows which convention the numbers follow.
+  return {{"components", components}, {"space", mask_space_name(mask.space)}};
 }
 
 nlohmann::json normalize_mask(const nlohmann::json& value) {
@@ -416,6 +435,129 @@ void append_brush_stroke(nlohmann::json& params, const BrushStroke& stroke) {
   std::vector<BrushStroke> strokes = brush_strokes(params);
   strokes.push_back(stroke);
   params[std::string(kBrushStrokeDataKey)] = brush_strokes_to_json(strokes);
+}
+
+namespace {
+
+// The content -> image map in the metric the shaders work in: x scaled by the aspect so a
+// circle is a circle. `columns` are the images of the unit x and y vectors at `at`, which
+// is everything a scalar or an angle needs to follow the map.
+struct LocalFrame {
+  std::array<double, 2> x{1, 0};
+  std::array<double, 2> y{0, 1};
+};
+
+LocalFrame local_frame(const GeometryMap& map, double content_aspect, double u, double v) {
+  constexpr double kStep = 1e-3;
+  const auto at = [&](double su, double sv) {
+    const std::array<double, 2> image = mat3_apply(map.content_to_image, su, sv);
+    return std::array<double, 2>{image[0] * map.image_aspect, image[1]};
+  };
+  const std::array<double, 2> right = at(u + (kStep / content_aspect), v);
+  const std::array<double, 2> left = at(u - (kStep / content_aspect), v);
+  const std::array<double, 2> down = at(u, v + kStep);
+  const std::array<double, 2> up = at(u, v - kStep);
+  LocalFrame frame;
+  frame.x = {(right[0] - left[0]) / (2 * kStep), (right[1] - left[1]) / (2 * kStep)};
+  frame.y = {(down[0] - up[0]) / (2 * kStep), (down[1] - up[1]) / (2 * kStep)};
+  return frame;
+}
+
+std::array<double, 2> to_image(const GeometryMap& map, const nlohmann::json& point) {
+  if (!point.is_array() || point.size() < 2) return {0, 0};
+  return mat3_apply(map.content_to_image, point[0].get<double>(), point[1].get<double>());
+}
+
+nlohmann::json point_to_image(const GeometryMap& map, const nlohmann::json& point) {
+  const std::array<double, 2> image = to_image(map, point);
+  return nlohmann::json::array({image[0], image[1]});
+}
+
+void migrate_params(MaskKind kind, nlohmann::json& params, const GeometryMap& map,
+                    double content_aspect) {
+  if (kind == MaskKind::Linear) {
+    if (params.contains("start")) params["start"] = point_to_image(map, params["start"]);
+    if (params.contains("end")) params["end"] = point_to_image(map, params["end"]);
+    return;
+  }
+  if (kind == MaskKind::Radial) {
+    const nlohmann::json centre = params.value("center", nlohmann::json::array({0.5, 0.5}));
+    const LocalFrame frame =
+        local_frame(map, content_aspect, centre[0].get<double>(), centre[1].get<double>());
+    params["center"] = point_to_image(map, centre);
+    if (params.contains("radius")) {
+      const double x_scale = std::hypot(frame.x[0], frame.x[1]);
+      const double y_scale = std::hypot(frame.y[0], frame.y[1]);
+      params["radius"] = nlohmann::json::array({params["radius"][0].get<double>() * x_scale,
+                                                params["radius"][1].get<double>() * y_scale});
+    }
+    const double turn = std::atan2(frame.x[1], frame.x[0]) * 180.0 / std::numbers::pi;
+    params["angle"] = params.value("angle", 0.0) + turn;
+    return;
+  }
+  if (kind == MaskKind::Objects) {
+    if (params.contains("box")) {
+      const std::array<double, 2> first =
+          to_image(map, nlohmann::json::array({params["box"][0], params["box"][1]}));
+      const std::array<double, 2> second =
+          to_image(map, nlohmann::json::array({params["box"][2], params["box"][3]}));
+      params["box"] =
+          nlohmann::json::array({std::min(first[0], second[0]), std::min(first[1], second[1]),
+                                 std::max(first[0], second[0]), std::max(first[1], second[1])});
+    }
+    if (params.contains("points") && params["points"].is_array()) {
+      for (nlohmann::json& point : params["points"])
+        point = point_to_image(map, point);
+    }
+    return;
+  }
+  if (kind != MaskKind::Brush) return;
+  const LocalFrame frame = local_frame(map, content_aspect, 0.5, 0.5);
+  const double scale =
+      std::sqrt(std::hypot(frame.x[0], frame.x[1]) * std::hypot(frame.y[0], frame.y[1]));
+  if (params.contains("size")) params["size"] = params["size"].get<double>() * scale;
+  const auto key = std::string(kBrushStrokeDataKey);
+  if (!params.contains(key) || !params[key].is_array()) return;
+  for (nlohmann::json& stroke : params[key]) {
+    if (stroke.contains("size")) stroke["size"] = stroke["size"].get<double>() * scale;
+    if (!stroke.contains("points") || !stroke["points"].is_array()) continue;
+    for (nlohmann::json& point : stroke["points"]) {
+      const std::array<double, 2> image = to_image(map, point);
+      const double pressure = point.size() > 2 ? point[2].get<double>() : 1.0;
+      point = nlohmann::json::array({image[0], image[1], pressure});
+    }
+  }
+}
+
+}  // namespace
+
+nlohmann::json migrate_mask_space(const nlohmann::json& mask, const GeometryMap& map) {
+  if (!mask.is_object()) return mask;
+  const std::string declared = mask.value("space", std::string("image"));
+  if (declared != mask_space_name(MaskSpace::Content)) return mask;
+  nlohmann::json out = mask;
+  out["space"] = mask_space_name(MaskSpace::Image);
+  if (!out.contains("components") || !out["components"].is_array()) return out;
+  const double content_aspect =
+      map.content.height == 0
+          ? 1.0
+          : static_cast<double>(map.content.width) / static_cast<double>(map.content.height);
+  for (nlohmann::json& component : out["components"]) {
+    if (!component.is_object() || !component.contains("kind")) continue;
+    if (!component.contains("params") || !component["params"].is_object()) continue;
+    migrate_params(mask_kind_from_name(component["kind"].get<std::string>()), component["params"],
+                   map, content_aspect);
+  }
+  return out;
+}
+
+void migrate_mask_space(Stack& stack, uint32_t photo_width, uint32_t photo_height) {
+  const GeometryMap map = geometry_map(geometry_from_stack(stack), photo_width, photo_height,
+                                       photo_width, photo_height);
+  for (Op& op : stack) {
+    if (!op.mask.has_value()) continue;
+    op.mask = migrate_mask_space(*op.mask, map);
+  }
 }
 
 std::string sidecar_dir_for(std::string_view photo_path) {

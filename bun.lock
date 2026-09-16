@@ -39,8 +39,12 @@
         "@latent/contracts": "workspace:*",
         "@latent/plugin-catalog": "workspace:*",
         "@latent/plugin-console": "workspace:*",
+        "@latent/plugin-crop": "workspace:*",
+        "@latent/plugin-export": "workspace:*",
+        "@latent/plugin-generative": "workspace:*",
         "@latent/plugin-layers": "workspace:*",
         "@latent/plugin-masks": "workspace:*",
+        "@latent/plugin-merge": "workspace:*",
         "@latent/plugin-panels": "workspace:*",
         "@latent/protocol": "workspace:*",
         "@neoworks-dev/ui": "link:@neoworks-dev/ui",
@@ -119,6 +123,67 @@
         "svelte": "^5.56.4",
       },
     },
+    "plugins/crop": {
+      "name": "@latent/plugin-crop",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/plugin-panels": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
+    "plugins/export": {
+      "name": "@latent/plugin-export",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/plugin-catalog": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
+    "plugins/generative": {
+      "name": "@latent/plugin-generative",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/plugin-masks": "workspace:*",
+        "@latent/plugin-panels": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
     "plugins/layers": {
       "name": "@latent/plugin-layers",
       "version": "0.0.0",
@@ -145,6 +210,27 @@
       "version": "0.0.0",
       "dependencies": {
         "@latent/contracts": "workspace:*",
+        "@latent/plugin-panels": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
+      },
+    },
+    "plugins/merge": {
+      "name": "@latent/plugin-merge",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/plugin-catalog": "workspace:*",
         "@latent/plugin-panels": "workspace:*",
         "@latent/protocol": "workspace:*",
         "@neoworks-dev/ui": "link:@neoworks-dev/ui",
@@ -342,9 +428,17 @@
 
     "@latent/plugin-console": ["@latent/plugin-console@workspace:plugins/console"],
 
+    "@latent/plugin-crop": ["@latent/plugin-crop@workspace:plugins/crop"],
+
+    "@latent/plugin-export": ["@latent/plugin-export@workspace:plugins/export"],
+
+    "@latent/plugin-generative": ["@latent/plugin-generative@workspace:plugins/generative"],
+
     "@latent/plugin-layers": ["@latent/plugin-layers@workspace:plugins/layers"],
 
     "@latent/plugin-masks": ["@latent/plugin-masks@workspace:plugins/masks"],
+
+    "@latent/plugin-merge": ["@latent/plugin-merge@workspace:plugins/merge"],
 
     "@latent/plugin-panels": ["@latent/plugin-panels@workspace:plugins/panels"],
 

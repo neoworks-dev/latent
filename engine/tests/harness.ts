@@ -94,6 +94,12 @@ export function startEngine(
     },
   );
   process.on("exit", () => process_.kill("SIGKILL"));
+  // A crash mid-test otherwise reads as "timed out waiting for …": the socket just goes
+  // quiet. Say so the moment it happens.
+  void process_.exited.then((code) => {
+    if (code === 0 || process_.signalCode === "SIGTERM") return;
+    console.error(`[latentd] exited: code ${code}, signal ${process_.signalCode}`);
+  });
 
   let announce: (endpoint: string) => void = () => {};
   let announceMcp: (url: string) => void = () => {};

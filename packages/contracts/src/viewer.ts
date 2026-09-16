@@ -66,8 +66,216 @@ export function imagePoint(x: number, y: number, rect: OverlayRect): { x: number
   return { x: (x - rect.x) / rect.width, y: (y - rect.y) / rect.height };
 }
 
+/**
+ * `view.render`'s and `mask.preview`'s `imageTransform`: image-normalised → view pixel, a
+ * row-major 3×3 applied to `(x, y, 1)` with a homogeneous divide. Projective, not affine —
+ * the Transform sliders' keystone is — and it carries crop, straighten, rotate, flip and
+ * the viewport's zoom and pan, so it is the one thing that relates what a mask stores to
+ * what the canvas shows.
+ */
+export type ImageTransform = [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+];
+
+/** The uncropped photo laid straight into the frame: what an engine without the field means. */
+export const IDENTITY_IMAGE_TRANSFORM: ImageTransform = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+/** `(x, y, 1)` through a 3×3, divided by w. A degenerate w yields the origin, never NaN. */
+export function applyImageTransform(
+  matrix: ImageTransform,
+  x: number,
+  y: number,
+): { x: number; y: number } {
+  const w = matrix[6] * x + matrix[7] * y + matrix[8];
+  if (Math.abs(w) < 1e-12) return { x: 0, y: 0 };
+  return {
+    x: (matrix[0] * x + matrix[1] * y + matrix[2]) / w,
+    y: (matrix[3] * x + matrix[4] * y + matrix[5]) / w,
+  };
+}
+
+/** The other direction. A singular matrix answers with the identity rather than throwing. */
+export function invertImageTransform(m: ImageTransform): ImageTransform {
+  const c0 = m[4] * m[8] - m[5] * m[7];
+  const c1 = m[5] * m[6] - m[3] * m[8];
+  const c2 = m[3] * m[7] - m[4] * m[6];
+  const determinant = m[0] * c0 + m[1] * c1 + m[2] * c2;
+  if (Math.abs(determinant) < 1e-12) return IDENTITY_IMAGE_TRANSFORM;
+  const k = 1 / determinant;
+  return [
+    c0 * k,
+    (m[2] * m[7] - m[1] * m[8]) * k,
+    (m[1] * m[5] - m[2] * m[4]) * k,
+    c1 * k,
+    (m[0] * m[8] - m[2] * m[6]) * k,
+    (m[2] * m[3] - m[0] * m[5]) * k,
+    c2 * k,
+    (m[1] * m[6] - m[0] * m[7]) * k,
+    (m[0] * m[4] - m[1] * m[3]) * k,
+  ];
+}
+
+/**
+ * Zoom and pan, exactly `view.render`'s `viewport`. `scale` 1 is fit-to-view; the centre is
+ * the image-normalised point the view is centred on and means nothing while `fit` is set.
+ * Not edit state — it never reaches the stack.
+ */
+export interface ViewportState {
+  scale: number;
+  centerX: number;
+  centerY: number;
+  fit: boolean;
+}
+
+export const FIT_VIEWPORT: ViewportState = { scale: 1, centerX: 0.5, centerY: 0.5, fit: true };
+
+/** The engine's answer for the frame on screen: what the next zoom is computed against. */
+export interface ViewportFrame {
+  /** `[x, y, width, height]` of the photo inside the frame, in frame pixels. */
+  contentRect: ContentRect;
+  frameWidth: number;
+  frameHeight: number;
+  /** image-normalised → frame pixel, for the scale below. */
+  transform: ImageTransform;
+  /** The scale the rect and the matrix were rendered at. */
+  scale: number;
+}
+
+export const MIN_VIEWPORT_SCALE = 1;
+export const MAX_VIEWPORT_SCALE = 32;
+
+export function clampViewportScale(scale: number): number {
+  if (!Number.isFinite(scale)) return MIN_VIEWPORT_SCALE;
+  return Math.min(MAX_VIEWPORT_SCALE, Math.max(MIN_VIEWPORT_SCALE, scale));
+}
+
+/**
+ * The engine's clamp, mirrored so the readout does not jump on the next frame: a rect wider
+ * than the view is dragged only until its edge reaches the view's, and one that fits is
+ * centred.
+ */
+function clampCentre(centre: number, extent: number, view: number): number {
+  if (extent <= view) return 0.5;
+  const margin = view / (2 * extent);
+  return Math.min(1 - margin, Math.max(margin, centre));
+}
+
+/**
+ * Zoom to `nextScale` about a point of the frame, keeping whatever is under that point
+ * where it is — the gesture every image viewer has. `anchorX`/`anchorY` are frame pixels;
+ * the frame's own centre is what a keyboard step passes.
+ */
+export function zoomViewport(
+  frame: ViewportFrame,
+  nextScale: number,
+  anchorX: number,
+  anchorY: number,
+): ViewportState {
+  const scale = clampViewportScale(nextScale);
+  const [x, y, width, height] = frame.contentRect;
+  if (width <= 0 || height <= 0 || frame.scale <= 0) return { ...FIT_VIEWPORT, scale };
+  if (scale <= MIN_VIEWPORT_SCALE) return FIT_VIEWPORT;
+  // Content-normalised: scale-independent, which is what makes this arithmetic short.
+  const u = (anchorX - x) / width;
+  const v = (anchorY - y) / height;
+  const grown = scale / frame.scale;
+  const nextWidth = width * grown;
+  const nextHeight = height * grown;
+  const centreU = clampCentre(
+    u + (frame.frameWidth / 2 - anchorX) / nextWidth,
+    nextWidth,
+    frame.frameWidth,
+  );
+  const centreV = clampCentre(
+    v + (frame.frameHeight / 2 - anchorY) / nextHeight,
+    nextHeight,
+    frame.frameHeight,
+  );
+  // Back to image space through the frame that is on screen: the content → image half of
+  // the map does not depend on the zoom, so the current rect and matrix are enough.
+  const centre = applyImageTransform(
+    invertImageTransform(frame.transform),
+    x + centreU * width,
+    y + centreV * height,
+  );
+  return { scale, centerX: centre.x, centerY: centre.y, fit: false };
+}
+
+/**
+ * A drag: the picture follows the pointer by `dx`/`dy` frame pixels, so the centre moves
+ * against it. Not a zoom with a moved anchor — that is the identity, because holding a
+ * point still at an unchanged scale is holding the whole picture still.
+ */
+export function panViewport(
+  frame: ViewportFrame,
+  current: ViewportState,
+  dx: number,
+  dy: number,
+): ViewportState {
+  if (current.fit) return current;
+  const [x, y, width, height] = frame.contentRect;
+  if (width <= 0 || height <= 0) return current;
+  const centreU = clampCentre((frame.frameWidth / 2 - x - dx) / width, width, frame.frameWidth);
+  const centreV = clampCentre((frame.frameHeight / 2 - y - dy) / height, height, frame.frameHeight);
+  const centre = applyImageTransform(
+    invertImageTransform(frame.transform),
+    x + centreU * width,
+    y + centreV * height,
+  );
+  return { scale: current.scale, centerX: centre.x, centerY: centre.y, fit: false };
+}
+
+/**
+ * The scale at which one image pixel is one frame pixel. Read off the matrix rather than
+ * off the crop, so a rotated or cropped photo answers correctly too.
+ */
+export function oneToOneScale(frame: ViewportFrame, photoWidth: number): number {
+  const left = applyImageTransform(frame.transform, 0, 0.5);
+  const right = applyImageTransform(frame.transform, 1, 0.5);
+  const onScreen = Math.hypot(right.x - left.x, right.y - left.y);
+  if (onScreen <= 0 || photoWidth <= 0) return MIN_VIEWPORT_SCALE;
+  return clampViewportScale((frame.scale * photoWidth) / onScreen);
+}
+
+/** `Fit`, `100%`, `250%` — what the viewer's status bar shows. */
+export function zoomLabel(viewport: ViewportState, oneToOne: number): string {
+  if (viewport.fit) return "Fit";
+  return `${Math.round((viewport.scale / oneToOne) * 100)}%`;
+}
+
+/**
+ * Image coordinates ↔ the overlay canvas' CSS pixels. A painter is handed one of these and
+ * uses nothing else: a mask component stores image-normalised points, and where those land
+ * on screen depends on the crop, the straighten and the zoom, none of which a painter
+ * should have to know about.
+ */
+export interface OverlayMap {
+  /** A mask coordinate → a point to draw at. */
+  toCanvas(x: number, y: number): { x: number; y: number };
+  /** A point on the canvas → the mask coordinate under it. */
+  toImage(x: number, y: number): { x: number; y: number };
+  /**
+   * The image's long edge in canvas pixels. A brush diameter is a fraction of that edge, so
+   * this is what its on-screen radius is measured with. Approximate under a keystone, exact
+   * under crop, straighten, rotate, flip and zoom.
+   */
+  readonly scale: number;
+}
+
 /** Draws on top of the frame. Called on every overlay repaint, never per engine frame. */
-export type OverlayDraw = (context: CanvasRenderingContext2D, rect: OverlayRect) => void;
+export type OverlayDraw = (
+  context: CanvasRenderingContext2D,
+  rect: OverlayRect,
+  map: OverlayMap,
+) => void;
 
 /**
  * A pointer over the photo, in image-normalised coordinates: `x`/`y` are 0..1 across the
@@ -78,6 +286,14 @@ export interface OverlayPointer {
   kind: "down" | "move" | "up" | "cancel" | "wheel";
   x: number;
   y: number;
+  /**
+   * The same pointer in image-normalised coordinates: 0..1 across the *uncropped* photo,
+   * which is the space masks are stored in. `x`/`y` above stay what they always were —
+   * 0..1 over the content rect, what the crop tool draws in — so the two agree exactly
+   * when nothing is cropped and diverge as soon as something is.
+   */
+  imageX: number;
+  imageY: number;
   pointerId: number;
   buttons: number;
   altKey: boolean;
@@ -94,6 +310,8 @@ export interface OverlayPointer {
 export interface ViewerOverlay {
   /** The drawn image's rect. Reactive: it changes with the frame size and the viewport. */
   readonly rect: OverlayRect;
+  /** Image ↔ canvas, from the engine's `imageTransform`. Painters get this as an argument. */
+  readonly map: OverlayMap;
   /** Registers a painter and repaints. Returns the detach, which repaints again. */
   attachOverlay(draw: OverlayDraw): () => void;
   /** Pointer and wheel events over the image, newest handler first. Returns the removal. */
@@ -114,6 +332,8 @@ export interface ViewerOverlay {
   attachCanvas(canvas: HTMLCanvasElement): () => void;
   /** The host canvas' CSS size, so the letterbox rect can be computed. */
   setBoxSize(width: number, height: number): void;
+  /** The engine's `imageTransform` for the frame just drawn; `null` when it sent none. */
+  setImageTransform(matrix: ImageTransform | null): void;
   /** Raw DOM event in, normalised pointer out. True when a handler consumed it. */
   dispatch(
     kind: OverlayPointer["kind"],
@@ -170,6 +390,20 @@ export interface ViewerService {
   selectOp(opId: string | null): void;
   /** The canvas' transparent overlay, for tools that draw on top of the frame. */
   readonly overlay: ViewerOverlay;
+  /** Zoom and pan as the engine last confirmed them. Never edit state. */
+  readonly viewport: ViewportState;
+  /** `Fit`, `100%`, `250%`: the status bar's readout of the above. */
+  readonly zoom: string;
+  /** Zoom about a point of the canvas, in its CSS pixels; no point means its centre. */
+  zoomTo(scale: number, anchorX?: number, anchorY?: number): void;
+  /** A ratio step of the same, which is what the wheel and `+`/`-` do. */
+  zoomBy(factor: number, anchorX?: number, anchorY?: number): void;
+  /** Fit ↔ 1:1, the `Z` key. */
+  toggleZoom(anchorX?: number, anchorY?: number): void;
+  zoomToFit(): void;
+  zoomToActual(): void;
+  /** Drag the picture by this many canvas CSS pixels. */
+  panBy(dx: number, dy: number): void;
   /**
    * Opens a photo and a view for it, `width`×`height` in device pixels. Without a size the
    * viewer renders at the size its canvas last reported, which is what the filmstrip wants.

@@ -98,19 +98,24 @@ export function defaultComponent(
   return { ...base, feather: 0 };
 }
 
+// Every one of these spreads the mask it was handed rather than rebuilding it: `space`
+// says which convention the coordinates follow (protocol Mask.space) and is the engine's
+// to set. A new mask has none, which the engine reads as `image` — the only space a tool
+// in this plugin writes, because every point here comes from the overlay's image map.
 export function addComponent(mask: Mask | undefined, component: MaskComponent): Mask {
-  return { components: [...(mask?.components ?? []), component] };
+  return { ...mask, components: [...(mask?.components ?? []), component] };
 }
 
 /** Dropping the last component drops the mask: an op with an empty mask is not a layer. */
 export function removeComponent(mask: Mask, id: string): Mask | undefined {
   const components = mask.components.filter((component) => component.id !== id);
   if (components.length === 0) return undefined;
-  return { components };
+  return { ...mask, components };
 }
 
 export function patchComponent(mask: Mask, id: string, patch: Partial<MaskComponent>): Mask {
   return {
+    ...mask,
     components: mask.components.map((component) => {
       if (component.id !== id) return component;
       return { ...component, ...patch };
@@ -125,6 +130,7 @@ export function patchComponentParams(
   params: Record<string, unknown>,
 ): Mask {
   return {
+    ...mask,
     components: mask.components.map((component) => {
       if (component.id !== id) return component;
       return { ...component, params: { ...component.params, ...params } };

@@ -4,8 +4,12 @@
 // filters, and one rgba8 output that gets read back per frame.
 #pragma once
 
+#include "export/encoder.h"
+#include "export/export_options.h"
 #include "gpu/gpu.h"
 #include "image/gray.h"
+#include "image/jpeg.h"
+#include "ops/geometry.h"
 #include "ops/op.h"
 #include "raw/raw_decode.h"
 
@@ -51,6 +55,8 @@ enum class OpKind : uint32_t {
   ChromaticAberration = 107,
   // 200+: no pass of its own; folded into the proxy's sampling pass (downscale.wgsl).
   Geometry = 200,
+  // 300+: composite.wgsl, which mixes a cached raster back in rather than computing one.
+  Generative = 300,
 };
 
 OpKind op_kind(std::string_view name);
@@ -69,13 +75,23 @@ struct MaskReadout {
   double coverage = 0;
 };
 
+// What Renderer::render_export needs from export.run's options: the output size and the
+// two passes that only an export runs. The encoder half lives in src/export/.
+struct ExportRenderOptions {
+  ExportResize resize;
+  ExportSharpen sharpen;
+  ExportColorSpace color_space = ExportColorSpace::Srgb;
+};
+
 struct ViewGeometry {
   uint32_t width = 0;
   uint32_t height = 0;
   // The letterboxed image rect inside the view, in pixels. Crop, rotate and the Transform
   // sliders change its aspect, so it is not the photo's aspect once geometry is edited.
-  uint32_t content_x = 0;
-  uint32_t content_y = 0;
+  // Signed and free to exceed the frame: a zoomed view is a window into a rect that starts
+  // off the top left corner (protocol ViewRenderParams.viewport).
+  int32_t content_x = 0;
+  int32_t content_y = 0;
   uint32_t content_width = 0;
   uint32_t content_height = 0;
 };
@@ -101,10 +117,22 @@ class Renderer {
   ViewGeometry view_geometry(uint32_t view_id) const;
   void resize_view(uint32_t view_id, uint32_t width, uint32_t height);
 
+  // Zoom and pan. Sticky per view, so a slider tick after a zoom renders the same window;
+  // the next render rebuilds the proxy's base from the full-res texture at the new scale.
+  void set_viewport(uint32_t view_id, const Viewport& viewport);
+  Viewport view_viewport(uint32_t view_id) const;
+  // The geometry stage as the last render resolved it. `image_to_view` is what goes on the
+  // wire as `imageTransform`, and is how the UI converts a pointer into a mask coordinate.
+  GeometryMap view_map(uint32_t view_id) const;
+
   // Renders the stack into the view and writes width*height*4 rgba8 bytes into
-  // `out` starting at `offset`. `out` must already be large enough.
+  // `out` starting at `offset`. `out` must already be large enough. `bypass_crop` drops
+  // the crop op's rect and straighten angle for this frame — the whole image, letterboxed
+  // as usual — which is what the crop tool draws its overlay on; rotate, flip and
+  // Transform still apply because they move the whole image (protocol view.render
+  // `geometry: "full"`).
   RenderTiming render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
-                      size_t offset);
+                      size_t offset, bool bypass_crop = false);
 
   // An AI component's raster: mask.detect's output, or the PNG cache reloaded when the
   // photo was opened. Held per photo and resampled into whatever size a view needs, so it
@@ -114,11 +142,32 @@ class Renderer {
   bool has_mask_raster(int64_t photo_id, std::string_view component_id,
                        std::string_view hash) const;
 
+  // A generative op's cached raster (PROMPT.md 3.5): the crop a backend repainted, held per
+  // photo and uploaded once. `key` is the op's `result` path, which changes whenever the
+  // pixels do, so a stale upload cannot outlive them. An op whose result the renderer has
+  // not been handed composites nothing and renders as if it were not there.
+  void put_generative_result(int64_t photo_id, std::string_view op_id, std::string_view key,
+                             const Rgb8Image& image);
+  bool has_generative_result(int64_t photo_id, std::string_view op_id,
+                             std::string_view key) const;
+
   // Renders the stack into the view — which builds any mask it needs — then reads one r8
   // mask back into `out`: `op_id`'s combined mask, or one component's raster when
   // `component_id` is not empty. Throws if either is unknown.
   MaskReadout read_mask(uint32_t view_id, const Stack& stack, std::string_view op_id,
                         std::string_view component_id, std::vector<uint8_t>& out, size_t offset);
+
+  // export.run's render: the same op chain as the preview, run once at the photo's native
+  // resolution — masks included, rasterised at full res — then resized in linear light,
+  // output-sharpened and converted into the target colour space. Blocks the calling thread
+  // for the whole thing; it is the server thread, because that thread owns the device.
+  //
+  // One texture, never tiled: a 24 MP frame is far inside `maxTextureDimension2D` (32768
+  // on this adapter). A photo whose cropped size exceeds that limit throws instead — a
+  // tiled fallback would need the neighbourhood passes to overlap their tiles and is
+  // deliberately out of scope (NEXT.md).
+  Rgb16Image render_export(int64_t photo_id, const Stack& stack,
+                           const ExportRenderOptions& options);
 
  private:
   struct Photo;
@@ -129,7 +178,7 @@ class Renderer {
   void build_base(View& view);
   // Runs the op chain into the view's ping-pong textures and returns the texture the last
   // pass wrote (the base when the stack had nothing to do).
-  WGPUTextureView run_passes(View& view, const Stack& stack);
+  WGPUTextureView run_passes(View& view, const Stack& stack, bool bypass_crop);
   // Rasterises and folds one op's mask into a cached r8 texture. Called between passes,
   // because a luminance or colour component reads the op's input, which only exists once
   // everything below it has been submitted.
@@ -145,6 +194,10 @@ class Renderer {
   RenderPipelineHandle display_pipeline_;
   RenderPipelineHandle mask_pipeline_;
   RenderPipelineHandle mask_combine_pipeline_;
+  RenderPipelineHandle composite_pipeline_;
+  // Built on the first export: nothing else writes rgba16uint, and a daemon that never
+  // exports should not pay for the pipeline.
+  RenderPipelineHandle export_pipeline_;
   // 1x1 r8: white is "the op applies everywhere" for an unmasked op, black is the empty
   // accumulator every mask folds into.
   TextureHandle white_mask_;

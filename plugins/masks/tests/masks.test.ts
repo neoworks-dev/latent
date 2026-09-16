@@ -20,9 +20,10 @@ import {
 } from "../src/masks";
 import {
   boxFromDrag,
+  boxPoints,
   brushSizeAfterStep,
   brushSizeAfterWheel,
-  ellipseBox,
+  ellipsePoints,
   linearFromDrag,
   MAX_BRUSH_SIZE,
   MIN_BRUSH_SIZE,
@@ -193,9 +194,23 @@ describe("tools", () => {
     expect(buffer.anchor).toBeNull();
   });
 
-  test("an ellipse maps onto the drawn image, not onto the canvas box", () => {
-    const box = ellipseBox([0.5, 0.5], [0.25, 0.5], { x: 10, y: 20, width: 200, height: 100 });
-    expect(box).toEqual({ cx: 110, cy: 70, rx: 50, ry: 50 });
+  test("an ellipse is image-space points, so the map can bend them", () => {
+    const points = ellipsePoints([0.5, 0.5], [0.25, 0.5]);
+    // Right, bottom, left, top of the ellipse: the extremes are the parameters themselves.
+    expect(points[0]).toEqual([0.75, 0.5]);
+    expect(points[16]).toEqual([0.5, 1]);
+    const centre = points.reduce((sum, [x, y]) => [sum[0] + x, sum[1] + y], [0, 0]);
+    expect(centre[0] / points.length).toBeCloseTo(0.5, 6);
+    expect(centre[1] / points.length).toBeCloseTo(0.5, 6);
+  });
+
+  test("a box is its four corners, clockwise from the top left", () => {
+    expect(boxPoints([0.1, 0.2, 0.6, 0.8])).toEqual([
+      [0.1, 0.2],
+      [0.6, 0.2],
+      [0.6, 0.8],
+      [0.1, 0.8],
+    ]);
   });
 });
 

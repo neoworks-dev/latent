@@ -29,6 +29,10 @@ nlohmann::json op_to_json(const Op& op) {
   if (op.mask.has_value()) value["mask"] = *op.mask;
   // Absent means 100 (protocol Op.opacity), so a stack nobody has touched stays terse.
   if (op.opacity != kFullOpacity) value["opacity"] = op.opacity;
+  // Generative bookkeeping: present only on an op that has actually produced pixels.
+  if (!op.result.empty()) value["result"] = op.result;
+  if (!op.input_hash.empty()) value["inputHash"] = op.input_hash;
+  if (op.result_rect.size() == 4) value["resultRect"] = op.result_rect;
   return value;
 }
 
@@ -61,6 +65,24 @@ Op op_from_json(const nlohmann::json& value) {
   if (value.contains("enabled")) {
     if (!value["enabled"].is_boolean()) throw OpError("op.enabled must be a boolean");
     op.enabled = value["enabled"].get<bool>();
+  }
+  if (value.contains("result") && !value["result"].is_null()) {
+    if (!value["result"].is_string()) throw OpError("op.result must be a string");
+    op.result = value["result"].get<std::string>();
+  }
+  if (value.contains("inputHash") && !value["inputHash"].is_null()) {
+    if (!value["inputHash"].is_string()) throw OpError("op.inputHash must be a string");
+    op.input_hash = value["inputHash"].get<std::string>();
+  }
+  if (value.contains("resultRect") && !value["resultRect"].is_null()) {
+    const nlohmann::json& rect = value["resultRect"];
+    if (!rect.is_array() || rect.size() != 4) {
+      throw OpError("op.resultRect must be [x0, y0, x1, y1]");
+    }
+    for (const nlohmann::json& edge : rect) {
+      if (!edge.is_number()) throw OpError("op.resultRect must hold numbers");
+      op.result_rect.push_back(edge.get<double>());
+    }
   }
   return op;
 }

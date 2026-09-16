@@ -1,6 +1,7 @@
 # Latent — agent rules
 
-Read `PROMPT.md` first. It holds why + architecture. This file: how to work here.
+Read `PROMPT.md` first. It holds why + architecture. `NEXT.md` is the ordered backlog;
+strike a line there when its work commits. This file: how to work here.
 
 ## Voice
 
@@ -32,15 +33,36 @@ mirror Lightroom 1:1.
   `engine/third_party/` (gitignored).
 - GPU via `webgpu.h` (wgpu-native). WGSL in `engine/shaders/`. Images in textures, ping-pong
   `rgba16float` render passes; storage/compute allowed for histograms, masks. Upload raw as
-  `rgba16uint`, scale first pass. Working space linear Rec.2020. Proxy-res preview only;
-  full-res for export/1:1.
+  `rgba16uint`, scale first pass. Working space is **linear sRGB primaries** (LibRaw
+  `output_color = 1`, `ops.wgsl` header); export and generative rasters transform from
+  there. Proxy-res preview only; full-res only for export (`Renderer::render_export`).
+- Masks are keyed to **image space**: 0..1 over the uncropped decoded photo. The geometry
+  stage is one matrix in `engine/src/ops/geometry.{h,cpp}`; every mask pass, the proxy's
+  sampling pass, `imageTransform` on the wire and the legacy sidecar migration read it.
+  Never re-derive it. Lens distortion is not in the matrix (no closed-form inverse); the
+  shader applies it forwards. `view.render`'s `viewport` (zoom/pan) is sticky per view and
+  is not edit state: never in the stack or the sidecar. `geometry: "full"` renders with the
+  crop rect and straighten bypassed (the crop tool's view).
+- Generative ops (`generative_fill`, `remove`) are `PipelineStage::Generative` rasters:
+  `result` PNG + `inputHash` + `resultRect`, composited by `composite.wgsl`; every op below
+  that stage feeds the hash, ops above apply to the patch. `LATENT_GENERATIVE_STUB=1` swaps
+  the ComfyUI backend for a local fill. Graphs in `engine/workflows/` (README lists the
+  substituted node ids). `comfy --json <cmd>` is one envelope, `comfy --json-stream` is
+  NDJSON; a Typer usage error prints nothing and exits 2.
+- Merged photos (HDR/pano) are 16-bit linear TIFF + `<file>.latent-source.json`; LibRaw
+  refuses a plain TIFF, so metadata/thumbnail paths need the source-TIFF branch
+  (`read_source_row`, `make_any_thumbnail`). `~/Pictures/Photos` has no exposure bracket.
 - Python: embedded CPython 3.12 **from vcpkg** (bundled, not system), pybind11 module
   `latent` in `engine/src/python/`. Pure-Python side + MCP server in `engine/python/latent/`.
   MCP = official Python SDK **2.x** (`from mcp.server.mcpserver import MCPServer`; `FastMCP`
   is the dead 1.x name), never C++. Embedding rules: set `PyConfig.home` to the vcpkg prefix
   (`Python3_STDLIB/../..`) or nothing imports; link the executable with `-rdynamic` (static
   libpython; extension modules like pydantic_core resolve symbols against the exe); catch
-  `py::error_already_set` inside the interpreter's lifetime or it core-dumps at teardown. pip
+  `py::error_already_set` inside the interpreter's lifetime or it core-dumps at teardown.
+  `-rdynamic` must export libpython **only**: every other static archive is on
+  `--exclude-libs` (`engine/src/CMakeLists.txt`), because a shared library loaded later
+  binds to the executable first — cuDNN once took our zlib's `inflate` and segfaulted.
+  A daemon crash mid-test reads as a timeout; `coredumpctl list latentd` first. pip
   into the bundled interpreter: `build/dev/vcpkg_installed/x64-linux/tools/python3/python3.12 -m pip`.
 - wgpu-native v29: `wgpuInstanceWaitAny` panics "not implemented". Use
   `WGPUCallbackMode_AllowProcessEvents` + `wgpuInstanceProcessEvents` / `wgpuDevicePoll(device,
@@ -157,3 +179,20 @@ config (`moritz.utcke@gmx.de`). Never force-push. Never merge unverified into `m
 - `latent` npm name taken. Workspace scope `@latent/*`, all private.
 - LibRaw output 16-bit int RGB; white/black level per camera from LibRaw `color` struct.
 - One `BrowserWindow`. Compare views = panes, never second window.
+- A service setter called from a pane's `$effect` must not read the `$state` it writes
+  (`ViewerState.geometry` is a plain field for that reason) or the effect re-runs forever.
+- The viewer overlay's painter is a plain function: a tool drawing stack-derived geometry
+  calls `overlay.redraw()` itself when the stack changes without a frame behind it.
+- nlohmann reads `{{"a", x}, {"b", y}}` in a nested initialiser as an **array**; an op whose
+  `mask` is an array silently renders unmasked. Parse a string literal in tests.
+- `structuredClone` refuses a Svelte `$state` proxy; copy a mask out of the stack via JSON.
+- Parallel agents share `engine/build/dev`: every engine build, ctest and real-engine run
+  goes through `flock /tmp/latent-engine.lock`, and each agent works on its own copy of the
+  sample raw (the sidecar next to it is clobbered otherwise).
+
+## Packaging
+
+`go-task appimage` (`Taskfile.yml`) → `dist/Latent-x86_64.AppImage`: Release `latentd`
+(`engine/build/release`), vcpkg Python with the MCP SDK, ORT + CUDA provider, Electron from
+`node_modules`, built editor. `AppRun` relocates through `LATENT_ENGINE`,
+`LATENT_PYTHON_HOME`, `LATENT_PYTHON_PACKAGE_DIR`. Models and CUDA/cuDNN are not bundled.

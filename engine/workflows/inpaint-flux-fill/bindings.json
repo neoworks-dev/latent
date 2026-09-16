@@ -1,0 +1,18 @@
+{
+  "task": "fill",
+  "label": "Flux.1 Fill Dev",
+  "requires": [
+    "flux1-fill-dev.safetensors",
+    "ae.safetensors",
+    "clip_l.safetensors",
+    "t5xxl_fp16.safetensors"
+  ],
+  "bindings": {
+    "image": "160.image",
+    "mask": "211.image",
+    "prompt": "108.text",
+    "seed": "112.seed",
+    "model": "106.unet_name",
+    "output": "313"
+  }
+}

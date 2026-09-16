@@ -1,0 +1,10 @@
+output_prefix: outputs/latent-inpaint-sdxl
+pipeline:
+  - fragment: inpaint-sdxl
+    alias: fill
+    inputs:
+      inpaintmodelconditioning_pixels: inputs/crop.png
+      inpaintmodelconditioning_mask: inputs/mask.png
+    params:
+      cliptextencode_text: "a photograph"
+      ksampler_seed: 0

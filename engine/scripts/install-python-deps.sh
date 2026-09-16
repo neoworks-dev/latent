@@ -20,6 +20,13 @@ if "$python" -c "import mcp" >/dev/null 2>&1; then
 fi
 
 echo "install-python-deps: installing mcp into $python"
+# vcpkg's CPython ships without pip; ensurepip bootstraps it from the bundled wheel.
+if ! "$python" -m pip --version >/dev/null 2>&1; then
+  "$python" -m ensurepip --upgrade --default-pip >/dev/null || {
+    echo "install-python-deps: ensurepip failed; latentd will start without the MCP server" >&2
+    exit 0
+  }
+fi
 if ! "$python" -m pip install --disable-pip-version-check --quiet "mcp==2.2.0"; then
   echo "install-python-deps: pip failed; latentd will start without the MCP server" >&2
 fi

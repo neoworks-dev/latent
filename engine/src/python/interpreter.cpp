@@ -26,6 +26,15 @@ std::filesystem::path config_dir() {
   return base / ".config" / "latent";
 }
 
+// The compiled-in home points into the build tree's vcpkg prefix. A packaged build
+// (Taskfile.yml → AppImage) relocates the interpreter and names the new prefix through
+// the environment; the same override serves anyone running latentd from a moved tree.
+const char* python_home() {
+  const char* override = std::getenv("LATENT_PYTHON_HOME");
+  if (override != nullptr && override[0] != '\0') return override;
+  return LATENT_PYTHON_HOME;
+}
+
 // Drops the GIL for its scope when this thread holds it, and does nothing when it does
 // not. PyEval_SaveThread crashes if called without the GIL, and both call paths exist.
 class DropGilIfHeld {
@@ -49,7 +58,7 @@ class PythonHost::Interpreter {
     // sys.prefix from argv[0] and finds neither its stdlib nor site-packages.
     PyConfig config;
     PyConfig_InitPythonConfig(&config);
-    PyConfig_SetBytesString(&config, &config.home, LATENT_PYTHON_HOME);
+    PyConfig_SetBytesString(&config, &config.home, python_home());
     scoped_ = std::make_unique<py::scoped_interpreter>(&config);
     PyConfig_Clear(&config);
   }

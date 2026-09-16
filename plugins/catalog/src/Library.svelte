@@ -9,6 +9,7 @@
   // overflow is a small popover). Tree and collection rows are 24 px dense rows rather
   // than `ListRow`, which is a 44 px card with its own surface.
   import { kernelContext } from "@latent/contracts";
+  import type { MergeKind } from "@latent/protocol";
   import { Button, SectionHeader, Select, Tooltip } from "@neoworks-dev/ui";
   import CaretDownIcon from "phosphor-svelte/lib/CaretDownIcon";
   import CaretRightIcon from "phosphor-svelte/lib/CaretRightIcon";
@@ -22,9 +23,17 @@
   import { folderRows, folderTree, isSortKey, sortOptions, type CatalogFilter } from "./catalog";
 
   const { paneId: _paneId }: { paneId: string } = $props();
-  const catalog = kernelContext().catalog;
+  const ctx = kernelContext();
+  const catalog = ctx.catalog;
 
   const rows = $derived(folderRows(folderTree(catalog.folders), catalog.collapsedFolders));
+  // Photo Merge is not the catalog's feature: the library only says which photos and which
+  // kind, on a kernel event. Whoever owns the dialog listens for it.
+  const mergeKinds: { kind: MergeKind; label: string }[] = [
+    { kind: "hdr", label: "HDR" },
+    { kind: "panorama", label: "Panorama" },
+    { kind: "hdrPanorama", label: "HDR Pano" },
+  ];
   const quickFilters: { label: string; filter: CatalogFilter }[] = [
     { label: "All", filter: {} },
     { label: "Picks", filter: { flag: "pick" } },
@@ -51,6 +60,10 @@
     target.blur();
     if (renamingId !== null) return;
     void createCollection();
+  }
+
+  function startMerge(kind: MergeKind): void {
+    ctx.emit("catalog/merge", kind, [...catalog.selection]);
   }
 
   async function importFiles(): Promise<void> {
@@ -153,6 +166,22 @@
       </button>
     {/each}
   </div>
+
+  <!-- Lightroom's Photo > Photo Merge, which only means anything on two or more photos. -->
+  {#if catalog.selection.length >= 2}
+    <div data-photo-merge={catalog.selection.length}>
+      <SectionHeader title="Photo Merge" />
+      <div class="flex gap-1">
+        {#each mergeKinds as entry (entry.kind)}
+          <span data-merge-start={entry.kind}>
+            <Button size="sm" variant="ghost" onclick={() => startMerge(entry.kind)}>
+              {entry.label}
+            </Button>
+          </span>
+        {/each}
+      </div>
+    </div>
+  {/if}
 
   <div class="flex items-center gap-1" data-sort={catalog.sort}>
     <span class="text-dim">Sort</span>

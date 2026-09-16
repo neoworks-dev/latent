@@ -1,0 +1,12 @@
+{
+  "task": "remove",
+  "label": "SDXL remove",
+  "requires": ["RealVisXL_V5.0_fp16.safetensors"],
+  "bindings": {
+    "image": "156.image",
+    "mask": "207.image",
+    "seed": "105.seed",
+    "model": "101.ckpt_name",
+    "output": "309"
+  }
+}

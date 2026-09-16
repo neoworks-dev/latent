@@ -134,8 +134,16 @@ A generative op is a **cached raster**, not a formula. It stores the params that
 and the result pixels; it cannot be recomputed on the fly.
 
 ```
-{ op: "generative_fill", params: { backend, model, prompt, seed }, mask, result: "<opId>.png", inputHash }
+{ op: "generative_fill", params: { backend, model, prompt, seed }, mask, result: "<opId>.png", inputHash, resultRect }
 ```
+
+`resultRect` is where the crop came from, in image pixels snapped to 8; the composite
+needs it and cannot recompute it from a mask that may have moved since. Built 2026-09-16
+(`engine/src/generative/`, `composite.wgsl`, `engine/workflows/`): `generative_fill` and
+`remove` sit at `PipelineStage::Generative`, so "below" means every op under that stage
+regardless of stack order — a tone or colour edit never marks a fill stale and applies to
+the patch; crop, noise reduction and optics edits do. ComfyUI ran end to end with SDXL
+inpaint; the Flux Fill graph is wired and switches on when its weights land.
 
 Backends implement one C++ interface:
 `GenerativeBackend::inpaint({ image, mask, prompt, model, seed }) → PNG bytes`. ComfyUI is
@@ -185,10 +193,14 @@ is tight; ComfyUI unloads between jobs, or the CLI routes to cloud.
 
 The engine renders full-res with the same passes as the preview — pixel-identical by
 construction — reads back, and encodes in-process: JPEG (libjpeg-turbo), 16-bit TIFF
-(libtiff), AVIF/HEIF 10-bit (libheif), PNG (libpng). Resize happens in linear space on the
-GPU before the display transform; output sharpening (screen / matte / glossy) is the last
-pass. Output profile per export (sRGB, Display P3, Rec.2020, ProPhoto): matrix + OETF in the
-final pass, ICC embedded via lcms2. Batch export is an engine job queue; the UI shows
+(libtiff), AVIF 10-bit (libavif + aom), 16-bit PNG (libpng). Resize happens in linear
+space on the GPU before the display transform; output sharpening (screen / matte / glossy)
+is the last pass. Output profile per export (sRGB, Display P3, AdobeRGB, Rec.2020,
+ProPhoto): matrix + OETF in the final GPU pass (`export.wgsl`), so the readback is already
+in the target space; the ICC embedded via lcms2 is built from the same primaries. Built
+2026-09-16: `export.run` job, `latent.export`, MCP `export`; 24 MP JPEG 353 ms, TIFF16
+1.5 s, AVIF 4.2 s. Not yet: tiled export above `maxTextureDimension2D`, EXIF/IPTC,
+export presets. Batch export is an engine job queue; the UI shows
 progress and stays responsive because the engine is a separate process. DNG export is
 Phase 3.
 
@@ -219,9 +231,21 @@ invert), `luminance` (range + smoothness), `color` (sampled colours + range), `d
 (Phase 2). `mode` ∈ `add | subtract | intersect`. Every component has `invert`, `feather`,
 `opacity`.
 
+**Coordinates are image space.** Every component coordinate — linear points, radial
+centre and radii, brush points and size, object boxes — is normalised 0..1 over the
+uncropped decoded photo, never over the cropped view, so a mask painted on a subject stays
+on it through crop, straighten, rotate, flip and Transform. The geometry stage is one
+matrix (`engine/src/ops/geometry.{h,cpp}`); `mask.wgsl` carries each view pixel back
+through it before evaluating a shape, brush/AI rasters are stored at image-proxy size and
+sampled through it, and `mask.detect` sees a geometry-bypassed render of the sub-stack
+below the op. `mask.preview` still answers a view-space raster; `view.render` and
+`mask.preview` carry `imageTransform` (3×3, image-normalised → view pixel) so the overlay
+converts both ways. Sidecars written before this (`Mask.space` absent) are migrated at load.
+
 **Rasters live in the engine.** Each component rasterises to an `r8unorm` texture at proxy
 and at full res, cached under `photo.raf.latent.d/masks/<componentId>.<hash>.png` where
-`hash` covers the component params and, for AI kinds, the model id and the source hash.
+`hash` covers the component params, the geometry stage and, for AI kinds, the model id and
+the source hash.
 Combining components is a compute pass; the combined mask is what the op's pass samples.
 An op with a mask runs as `out = mix(in, op(in), mask * opacity)`. AI components are jobs
 (`job.progress`), never inline in a slider tick; until a job lands the component contributes
@@ -258,13 +282,13 @@ model wants a client that is nothing but UI.
 | Engine deps | **vcpkg manifest** (`engine/vcpkg.json`), pinned | System packages as the source of truth |
 | GPU | `webgpu.h` via **wgpu-native** (prebuilt; Rust inside, opaque). WGSL shaders. Dawn is a drop-in later | Raw Vulkan |
 | Raw decode | LibRaw, direct C++ | Write a demosaic algorithm |
-| Colour | LibRaw camera matrix → **linear Rec.2020** working space in WGSL → display transform in the final pass. lcms2 for ICC on export and the display profile | OCIO, hand-rolled transforms |
+| Colour | LibRaw camera matrix → **linear sRGB primaries** working space in WGSL (LibRaw `output_color = 1`; Rec.2020 was the plan, sRGB is what shipped — see `NEXT.md`) → display transform in the final pass. lcms2 for ICC on export and the display profile | OCIO, hand-rolled transforms |
 | Catalog | sqlite3 C API, WAL | Anything else |
 | Scripting | Embedded CPython via pybind11; `latent` module in C++; pure-Python helpers in `engine/python/latent/` | Pyodide, subprocess Python |
 | MCP | Official Python MCP SDK inside the embedded interpreter, streamable HTTP on 127.0.0.1; `latent mcp` stdio shim | A C++ MCP implementation, stdio-only |
 | AI inference | onnxruntime C++ API, CUDA / TensorRT EP: SAM 2, Florence-2, denoise | Training, ORT Web |
 | Generative | `GenerativeBackend` interface; default = spawn `comfy` CLI; hosted API impl later | Raw `/prompt` HTTP |
-| Export encode | libjpeg-turbo, libtiff, libheif, libpng, lcms2 | Encoding in the UI |
+| Export encode | libjpeg-turbo, libtiff, libavif (aom), libpng, lcms2 | Encoding in the UI |
 | Engine ↔ UI | One WebSocket (uWebSockets): JSON-RPC 2.0 text frames for commands/state, binary frames for preview pixels | Shared memory, N-API addons in Electron, REST |
 | Wire contract | `protocol/*.schema.json` — single source; TS types generated into `packages/protocol` | Hand-written types on both sides |
 | Shell | Electron: main spawns `latentd`, opens one window | Anything in main beyond process + window management |
@@ -420,6 +444,10 @@ Done when a Lightroom user sits down and does not ask where anything is.
 **Phase 2 — AI ops.** Generative fill and remove on a masked region (§3.5), denoise, upscale.
 ComfyUI does the work via the `comfy` CLI; the engine owns crop/composite and staleness.
 
+Status 2026-09-16: Phase 0–1 landed, Phase 2's generative fill/remove landed (denoise and
+upscale not), Phase 3's HDR merge and panorama landed (16-bit linear TIFF sources, float/DNG
+later). `NEXT.md` is the ordered remainder.
+
 **Phase 3 — the long tail.** Lens profiles, tethering, soft proofing, print, HDR merge, pano,
 colour labels, smart collections, XMP round-trip, persisted history, DNG export, catalog AI
 (CLIP/SigLIP embeddings for text search, face clustering, auto-cull), Dawn instead of
@@ -459,6 +487,7 @@ Code: `engine/probe/`. All five steps run; numbers are measured, not estimated.
 | 3 Frame path | 2560×1440 rgba8 over loopback WebSocket into an Electron canvas, 100 slider ticks: **p50 17.1 ms, p95 22.9 ms, mean 20.8 ms** (max 347 = first frame). Engine side 1.6 ms render + 5.0 ms readback; the rest is transport + `putImageData`. Under the 30 ms kill line; daemon model stands. Optimisation later: WebGL texture upload instead of `putImageData`. **Follow-up (same day, 811×1245 = 4 MB frames):** canvas was never the cost (`putImageData` 0.4 ms). Chromium's WebSocket receive is ~11 ms p50 for 4 MB, linear in bytes (0.5 MB → 2.6 ms), a Worker-owned socket is slower, `desynchronized` widens p95. After WebGL2 painter: request→pixels-on-GPU 11.0 / 16.2 ms p50/p95, +~8 ms vsync to presented. Remaining lever is bytes: half-res proxy while dragging, full on release. |
 | 4 Python + MCP | Bundled CPython 3.12.13 from vcpkg embedded via pybind11: interpreter up in **5.7 ms**. `PyConfig.home` must point at the vcpkg prefix and the executable needs `-rdynamic` (static libpython; extension modules resolve symbols against it). MCP Python SDK **2.2.0** (`MCPServer`, not `FastMCP`) served streamable HTTP from inside the daemon; `initialize` + `tools/call` round trip from curl returned a value computed in C++. |
 | 5 ORT CUDA | onnxruntime 1.30.0 cuda13 prebuilt links and loads the SAM 2 hiera-base-plus encoder (`~/.local/share/latent/models/`). Session init failed at first only because another process held 11.9 of 16 GB VRAM at the time (ComfyUI). Re-run with free VRAM: first run 222 ms, steady-state **82 ms** per 1024² encode, `RESULT PASS`. |
+| 6 Zoom (same day) | Second frame-path measurement at proxy 1082×1177 with four agents loading the machine: Fit 41.5 ms p50 total (engine 5.4–7.4, wire 25.5–26.8), 1:1 38.5 ms (engine 5.8–10.7, wire 23.9–24.5). Zoom only changes which source texels the sampling pass reads; the frame stays the view's size, so magnification is free and the wire share is still bytes. |
 
 #### 8.1.1 Mask models — 2026-09-16
 

@@ -1,7 +1,10 @@
 #include "pipeline/renderer.h"
 
+#include "export/color_space.h"
+#include "generative/generative.h"
 #include "image/png.h"
 #include "ops/curve.h"
+#include "ops/geometry.h"
 #include "ops/mask.h"
 #include "ops/mask_raster.h"
 #include "ops/registry.h"
@@ -13,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <numbers>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -64,9 +68,17 @@ struct MaskUniform {
   uint32_t invert = 0;
   float feather = 0;
   float opacity = 1;
+  // View pixel -> working frame, then the quadrant, the mirrors and the lens term: the
+  // chain that turns this invocation's pixel into a point on the uncropped photo.
+  float m0[4] = {1, 0, 0, 0};
+  float m1[4] = {0, 1, 0, 0};
+  float m2[4] = {0, 0, 1, 0};
+  float geom[4] = {0, 1, 0, 1};
+  float flip[4] = {1, 1, 0, 0};
   float v[24] = {};
 };
-static_assert(sizeof(MaskUniform) == 128, "must match MaskParams in mask.wgsl");
+static_assert(sizeof(MaskUniform) == 208, "must match MaskParams in mask.wgsl");
+static_assert(sizeof(MaskUniform) <= kOpUniformStride, "a mask must fit its uniform slot");
 
 struct CombineUniform {
   uint32_t mode = 0;
@@ -104,6 +116,17 @@ struct StoredRaster {
   GrayImage image;
 };
 
+// One generative op's result on the GPU: the PNG a backend returned, uploaded as rgba8 and
+// still display-referred — composite.wgsl linearises it. `key` is the op's `result` path,
+// which changes with the pixels, so a stale upload can never be mistaken for a fresh one.
+struct StoredResult {
+  std::string key;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  TextureHandle texture;
+  TextureViewHandle view;
+};
+
 struct FitUniform {
   float scale[2] = {1, 1};
   float taps[2] = {1, 1};
@@ -124,6 +147,14 @@ struct FrameUniform {
 };
 static_assert(sizeof(FrameUniform) == 16, "must match Frame in display.wgsl");
 
+struct ExportUniform {
+  float m0[4] = {1, 0, 0, 0};
+  float m1[4] = {0, 1, 0, 0};
+  float m2[4] = {0, 0, 1, 0};
+  float params[4] = {0, 0, 0, 0};
+};
+static_assert(sizeof(ExportUniform) == 64, "must match Output in export.wgsl");
+
 double param(const Op& op, const char* name, double fallback = 0.0) {
   const auto found = op.params.find(name);
   if (found == op.params.end() || !found->is_number()) return fallback;
@@ -139,82 +170,6 @@ std::string text(const Op& op, const char* name) {
   const auto found = op.params.find(name);
   if (found == op.params.end() || !found->is_string()) return {};
   return found->get<std::string>();
-}
-
-// Row-major 3x3, applied to (x, y, 1).
-using Mat3 = std::array<double, 9>;
-
-Mat3 multiply(const Mat3& a, const Mat3& b) {
-  Mat3 out{};
-  for (size_t row = 0; row < 3; ++row) {
-    for (size_t column = 0; column < 3; ++column) {
-      out[(row * 3) + column] = (a[row * 3] * b[column]) + (a[(row * 3) + 1] * b[3 + column]) +
-                                (a[(row * 3) + 2] * b[6 + column]);
-    }
-  }
-  return out;
-}
-
-// Everything that moves pixels rather than changing them: resolved from the stack once
-// per render and folded into the proxy's sampling pass.
-struct GeometryParams {
-  double left = 0;
-  double top = 0;
-  double right = 1;
-  double bottom = 1;
-  double angle = 0;
-  int quadrant = 0;
-  bool flip_horizontal = false;
-  bool flip_vertical = false;
-  double vertical = 0;
-  double horizontal = 0;
-  double rotate = 0;
-  double aspect = 0;
-  double scale = 100;
-  double offset_x = 0;
-  double offset_y = 0;
-  double distortion = 0;
-
-  bool operator==(const GeometryParams& other) const = default;
-};
-
-GeometryParams geometry_from_stack(const Stack& stack) {
-  GeometryParams geometry;
-  for (const Op& op : stack) {
-    if (!op.enabled) continue;
-    if (op.name == "crop") {
-      geometry.left = std::clamp(param(op, "left"), 0.0, 1.0);
-      geometry.top = std::clamp(param(op, "top"), 0.0, 1.0);
-      geometry.right = std::clamp(param(op, "right", 1.0), 0.0, 1.0);
-      geometry.bottom = std::clamp(param(op, "bottom", 1.0), 0.0, 1.0);
-      geometry.angle = param(op, "angle");
-      continue;
-    }
-    if (op.name == "rotate") {
-      geometry.quadrant = static_cast<int>(std::lround(param(op, "value") / 90.0)) & 3;
-      continue;
-    }
-    if (op.name == "flip") {
-      geometry.flip_horizontal = flag(op, "horizontal");
-      geometry.flip_vertical = flag(op, "vertical");
-      continue;
-    }
-    if (op.name == "transform") {
-      geometry.vertical = param(op, "vertical");
-      geometry.horizontal = param(op, "horizontal");
-      geometry.rotate = param(op, "rotate");
-      geometry.aspect = param(op, "aspect");
-      geometry.scale = param(op, "scale", 100.0);
-      geometry.offset_x = param(op, "offsetX");
-      geometry.offset_y = param(op, "offsetY");
-      continue;
-    }
-    if (op.name == "lens_correction") geometry.distortion = param(op, "distortion");
-  }
-  // A collapsed or inverted crop rect would divide by zero; keep at least one per cent.
-  geometry.right = std::max(geometry.right, geometry.left + 0.01);
-  geometry.bottom = std::max(geometry.bottom, geometry.top + 0.01);
-  return geometry;
 }
 
 // CIE xy of a Planckian radiator (Kim et al.), then linear sRGB at unit luminance. Only
@@ -353,6 +308,9 @@ bool is_neutral(const Op& op, OpKind kind) {
       return !flag(op, "enabled");
     case OpKind::ToneCurve:
     case OpKind::Geometry:
+    // A generative op has no neutral value: whether it does anything is decided by whether
+    // it has a result, which run_passes checks rather than guessing from the params.
+    case OpKind::Generative:
     case OpKind::None:
       return false;
     default:
@@ -540,16 +498,27 @@ std::array<double, 2> component_pair(const nlohmann::json& params, const char* k
   return {(*found)[0].get<double>(), (*found)[1].get<double>()};
 }
 
-MaskUniform mask_uniform(const MaskComponent& component, const ViewGeometry& geometry) {
+MaskUniform mask_uniform(const MaskComponent& component, const GeometryMap& map) {
   MaskUniform uniform;
   uniform.kind = static_cast<uint32_t>(mask_pass_kind(component.kind));
   uniform.invert = component.invert ? 1U : 0U;
   uniform.feather = static_cast<float>(component.feather / 100.0);
   uniform.opacity = static_cast<float>(component.opacity / 100.0);
-  uniform.origin[0] = static_cast<float>(geometry.content_x);
-  uniform.origin[1] = static_cast<float>(geometry.content_y);
-  uniform.size[0] = static_cast<float>(geometry.content_width);
-  uniform.size[1] = static_cast<float>(geometry.content_height);
+  uniform.origin[0] = static_cast<float>(map.content.x);
+  uniform.origin[1] = static_cast<float>(map.content.y);
+  uniform.size[0] = static_cast<float>(map.content.width);
+  uniform.size[1] = static_cast<float>(map.content.height);
+  for (int i = 0; i < 3; ++i) {
+    uniform.m0[i] = static_cast<float>(map.view_to_working[i]);
+    uniform.m1[i] = static_cast<float>(map.view_to_working[3 + i]);
+    uniform.m2[i] = static_cast<float>(map.view_to_working[6 + i]);
+  }
+  uniform.geom[0] = static_cast<float>(map.distortion_k);
+  uniform.geom[1] = static_cast<float>(map.work_aspect);
+  uniform.geom[2] = static_cast<float>(map.quadrant);
+  uniform.geom[3] = static_cast<float>(map.image_aspect);
+  uniform.flip[0] = map.flip_horizontal ? -1.0F : 1.0F;
+  uniform.flip[1] = map.flip_vertical ? -1.0F : 1.0F;
 
   switch (component.kind) {
     case MaskKind::Linear: {
@@ -606,17 +575,39 @@ MaskUniform mask_uniform(const MaskComponent& component, const ViewGeometry& geo
   }
 }
 
-// What invalidates a cached raster: the mask's own JSON, the view's size, and the content
-// rect inside it — mask coordinates are normalised over that rect, so a crop moves them.
+// What invalidates a cached raster: the mask's own JSON, the view's size, the content rect
+// inside it, and the geometry stage that put it there. The last is the whole point of image
+// space — the coordinates no longer move when a crop does, but the *pixels* they land on
+// do, so a straighten that leaves the content rect's size alone still has to re-rasterise.
 // The op's *input* deliberately does not: a masked slider drag must not re-rasterise, and
 // the price is that a luminance or colour mask keeps the levels it was built from until
-// the mask or the frame changes (see the report's UI to-do for mask.refresh).
-std::string mask_cache_key(const nlohmann::json& canonical, const ViewGeometry& geometry) {
+// the mask or the frame changes (see NEXT.md's mask.refresh).
+std::string mask_cache_key(const nlohmann::json& canonical, const GeometryMap& map,
+                           const GeometryParams& params, const ViewGeometry& geometry) {
   const nlohmann::json keyed = {
       {"m", canonical},
-      {"r",
-       {geometry.content_x, geometry.content_y, geometry.content_width, geometry.content_height}}};
+      {"r", {map.content.x, map.content.y, map.content.width, map.content.height}},
+      {"g", geometry_to_json(params)}};
   return mask_hash(keyed, geometry.width, geometry.height);
+}
+
+// Brush strokes and model rasters are stored in image space, so their size follows the
+// photo's own aspect and not the cropped content rect: the same buffer serves every crop.
+// It is the fit of the photo into the view's box — the resolution the user would see with
+// nothing cropped — and the shader samples it bilinearly, so a zoomed 1:1 view upsamples
+// it rather than paying to rebuild it on every zoom step.
+std::array<uint32_t, 2> image_raster_size(uint32_t photo_width, uint32_t photo_height,
+                                          uint32_t view_width, uint32_t view_height) {
+  const double aspect =
+      static_cast<double>(std::max(1U, photo_width)) / std::max(1U, photo_height);
+  double width = view_width;
+  double height = width / aspect;
+  if (height > view_height) {
+    height = view_height;
+    width = height * aspect;
+  }
+  return {std::max(1U, static_cast<uint32_t>(std::lround(width))),
+          std::max(1U, static_cast<uint32_t>(std::lround(height)))};
 }
 
 WGPUBindGroupEntry texture_entry(uint32_t binding, WGPUTextureView view) {
@@ -666,6 +657,7 @@ OpKind op_kind(std::string_view name) {
   if (name == "crop" || name == "rotate" || name == "flip" || name == "transform") {
     return OpKind::Geometry;
   }
+  if (is_generative_op(name)) return OpKind::Generative;
   return OpKind::None;
 }
 
@@ -677,6 +669,9 @@ struct Renderer::Photo {
   // AI mask rasters by componentId: written by mask.detect, reloaded from the PNG cache
   // at photo.open, shared by every view of this photo.
   std::unordered_map<std::string, StoredRaster> rasters;
+  // Generative results by opId. Unlike a mask raster these are uploaded once at their own
+  // resolution and sampled through the composite's rect, so no view holds a copy.
+  std::unordered_map<std::string, StoredResult> results;
 };
 
 struct Renderer::View {
@@ -684,6 +679,10 @@ struct Renderer::View {
   ViewGeometry geometry;
   bool base_valid = false;
   GeometryParams geometry_params;
+  // What the user asked to look at, and the stage resolved for it: every mask pass, every
+  // op pass and the `imageTransform` on the wire read this one object.
+  Viewport viewport;
+  GeometryMap map;
   TextureHandle base;
   TextureViewHandle base_view;
   TextureHandle ping[2];
@@ -727,6 +726,10 @@ Renderer::Renderer(uint32_t max_texture_dim) : gpu_(max_texture_dim) {
   mask_pipeline_ = gpu_.create_fullscreen_pipeline(mask.get(), WGPUTextureFormat_R8Unorm, "mask");
   mask_combine_pipeline_ = gpu_.create_fullscreen_pipeline(
       mask_combine.get(), WGPUTextureFormat_R8Unorm, "mask-combine");
+
+  const ShaderModuleHandle composite = gpu_.create_shader(shaders::kComposite, "composite");
+  composite_pipeline_ = gpu_.create_fullscreen_pipeline(
+      composite.get(), WGPUTextureFormat_RGBA16Float, "composite");
 
   const auto sampled =
       static_cast<WGPUTextureUsage>(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
@@ -870,65 +873,21 @@ void Renderer::resize_view(uint32_t view_id, uint32_t width, uint32_t height) {
 
 void Renderer::build_base(View& view) {
   const Photo& photo = *photos_.at(view.photo_id);
-  const GeometryParams& geometry_params = view.geometry_params;
-  const bool turned = (geometry_params.quadrant % 2) != 0;
-  const double work_width = turned ? photo.height : photo.width;
-  const double work_height = turned ? photo.width : photo.height;
-  const double crop_width = geometry_params.right - geometry_params.left;
-  const double crop_height = geometry_params.bottom - geometry_params.top;
-  const double content_aspect = (work_width * crop_width) / (work_height * crop_height);
+  view.map = geometry_map(view.geometry_params, photo.width, photo.height, view.geometry.width,
+                          view.geometry.height, view.viewport);
 
   ViewGeometry& geometry = view.geometry;
-  geometry.content_width = geometry.width;
-  geometry.content_height =
-      std::max(1U, static_cast<uint32_t>(std::lround(geometry.width / content_aspect)));
-  if (geometry.content_height > geometry.height) {
-    geometry.content_height = geometry.height;
-    geometry.content_width =
-        std::max(1U, static_cast<uint32_t>(std::lround(geometry.height * content_aspect)));
-  }
-  geometry.content_width = std::min(geometry.content_width, geometry.width);
-  geometry.content_x = (geometry.width - geometry.content_width) / 2;
-  geometry.content_y = (geometry.height - geometry.content_height) / 2;
+  geometry.content_x = view.map.content.x;
+  geometry.content_y = view.map.content.y;
+  geometry.content_width = view.map.content.width;
+  geometry.content_height = view.map.content.height;
 
-  // Destination pixel -> source texel, right to left: crop the 0..1 destination into the
-  // working frame, centre it on the crop's middle with the frame's aspect, undo the user's
-  // transform, and put it back. Every step is the inverse of what the slider says it does,
-  // because the pass walks destination pixels and asks where each came from.
-  const double work_aspect = work_width / work_height;
-  const double centre_x = (geometry_params.left + geometry_params.right) / 2.0;
-  const double centre_y = (geometry_params.top + geometry_params.bottom) / 2.0;
-  const Mat3 crop = {crop_width, 0, geometry_params.left, 0, crop_height, geometry_params.top, 0,
-                     0,          1};
-  const Mat3 to_centre = {work_aspect, 0, -work_aspect * centre_x, 0, 1, -centre_y, 0, 0, 1};
-  const Mat3 from_centre = {1.0 / work_aspect, 0, centre_x, 0, 1, centre_y, 0, 0, 1};
-
-  const double scale = std::max(geometry_params.scale, 1.0) / 100.0;
-  const Mat3 unscale = {1.0 / scale, 0, 0, 0, 1.0 / scale, 0, 0, 0, 1};
-  const Mat3 unoffset = {1, 0, -geometry_params.offset_x / 100.0 * work_aspect,
-                         0, 1, -geometry_params.offset_y / 100.0,
-                         0, 0, 1};
-  const double radians =
-      (geometry_params.angle + geometry_params.rotate) * std::numbers::pi / 180.0;
-  const Mat3 unrotate = {
-      std::cos(radians), std::sin(radians), 0, -std::sin(radians), std::cos(radians), 0, 0, 0, 1};
-  const double stretch = std::exp2(geometry_params.aspect / 100.0 * 0.5);
-  const Mat3 unstretch = {1.0 / stretch, 0, 0, 0, stretch, 0, 0, 0, 1};
-  const Mat3 unkeystone = {1,
-                           0,
-                           0,
-                           0,
-                           1,
-                           0,
-                           -geometry_params.horizontal / 100.0 * 0.5,
-                           -geometry_params.vertical / 100.0 * 0.5,
-                           1};
-  Mat3 matrix = multiply(unscale, multiply(to_centre, crop));
-  matrix = multiply(unoffset, matrix);
-  matrix = multiply(unrotate, matrix);
-  matrix = multiply(unstretch, matrix);
-  matrix = multiply(unkeystone, matrix);
-  matrix = multiply(from_centre, matrix);
+  const bool turned = (view.geometry_params.quadrant % 2) != 0;
+  const double work_width = turned ? photo.height : photo.width;
+  const double work_height = turned ? photo.width : photo.height;
+  const double crop_width = view.geometry_params.right - view.geometry_params.left;
+  const double crop_height = view.geometry_params.bottom - view.geometry_params.top;
+  const double scale = std::max(view.geometry_params.scale, 1.0) / 100.0;
 
   FitUniform fit;
   const double source_scale_x = turned ? (work_height * crop_height) / geometry.content_height
@@ -945,16 +904,24 @@ void Renderer::build_base(View& view) {
   fit.origin[1] = static_cast<float>(geometry.content_y);
   fit.extent[0] = static_cast<float>(geometry.content_width);
   fit.extent[1] = static_cast<float>(geometry.content_height);
-  fit.flip[0] = geometry_params.flip_horizontal ? -1.0F : 1.0F;
-  fit.flip[1] = geometry_params.flip_vertical ? -1.0F : 1.0F;
+  fit.flip[0] = view.geometry_params.flip_horizontal ? -1.0F : 1.0F;
+  fit.flip[1] = view.geometry_params.flip_vertical ? -1.0F : 1.0F;
+  // The pass walks destination pixels and asks where each came from, which is exactly the
+  // content-normalised half of the map (ops/geometry.cpp); it does its own origin/extent
+  // subtraction, so the matrix it wants is the one without them folded in.
+  const Mat3 matrix = mat3_multiply(
+      view.map.view_to_working,
+      Mat3{static_cast<double>(geometry.content_width), 0, static_cast<double>(geometry.content_x),
+           0, static_cast<double>(geometry.content_height),
+           static_cast<double>(geometry.content_y), 0, 0, 1});
   for (int i = 0; i < 3; ++i) {
     fit.m0[i] = static_cast<float>(matrix[i]);
     fit.m1[i] = static_cast<float>(matrix[3 + i]);
     fit.m2[i] = static_cast<float>(matrix[6 + i]);
   }
-  fit.params[0] = static_cast<float>(geometry_params.distortion / 100.0 * 0.3);
-  fit.params[1] = static_cast<float>(work_aspect);
-  fit.params[2] = static_cast<float>(geometry_params.quadrant);
+  fit.params[0] = static_cast<float>(view.map.distortion_k);
+  fit.params[1] = static_cast<float>(view.map.work_aspect);
+  fit.params[2] = static_cast<float>(view.geometry_params.quadrant);
   gpu_.write_buffer(view.fit_uniform.get(), 0, &fit, sizeof(fit));
 
   FrameUniform frame;
@@ -987,6 +954,8 @@ struct Renderer::Pass {
   std::string mask_hash;
   bool mask_dirty = false;
   WGPUTextureView mask_view = nullptr;
+  // A generative op's uploaded result, or null when the engine has not been handed one.
+  WGPUTextureView result_view = nullptr;
 };
 
 void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canonical,
@@ -1027,23 +996,26 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
 
   // Brush stroke lists and model rasters become r8 uploads before anything is encoded: a
   // queue write between two render passes of the same encoder is not ordered against them.
+  const std::array<uint32_t, 2> raster_size = image_raster_size(
+      photo.width, photo.height, view.geometry.width, view.geometry.height);
   for (const MaskComponent* component : active) {
     if (mask_pass_kind(component->kind) != MaskPass::Raster) continue;
     MaskComponentTexture& texture = entry.components[component->id];
     GrayImage image;
     std::string source_key;
     if (component->kind == MaskKind::Brush) {
-      source_key = mask_cache_key(component->params, view.geometry);
+      // No geometry in this key: the stroke list is in image space, so a crop or a zoom
+      // re-renders the pass below but never re-stamps the strokes.
+      source_key = mask_hash(component->params, raster_size[0], raster_size[1]);
       if (texture.source_hash == source_key) continue;
       image = rasterize_brush(brush_strokes(component->params), component->feather,
-                              view.geometry.content_width, view.geometry.content_height);
+                              raster_size[0], raster_size[1]);
     } else {
       const StoredRaster& stored = photo.rasters.at(component->id);
-      source_key = stored.hash + "@" + std::to_string(view.geometry.content_width) + "x" +
-                   std::to_string(view.geometry.content_height);
+      source_key = stored.hash + "@" + std::to_string(raster_size[0]) + "x" +
+                   std::to_string(raster_size[1]);
       if (texture.source_hash == source_key) continue;
-      image =
-          resample_gray(stored.image, view.geometry.content_width, view.geometry.content_height);
+      image = resample_gray(stored.image, raster_size[0], raster_size[1]);
     }
     texture.source = gpu_.create_texture(
         image.width, image.height, WGPUTextureFormat_R8Unorm,
@@ -1064,7 +1036,9 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
   size_t slot = 0;
   for (const MaskComponent* component : active) {
     MaskComponentTexture& texture = entry.components[component->id];
-    const std::string key = mask_cache_key(component_to_json(*component), view.geometry);
+    const std::string key =
+        mask_cache_key(component_to_json(*component), view.map, view.geometry_params,
+                       view.geometry);
     if (!texture.texture) {
       texture.texture =
           gpu_.create_texture(width, height, WGPUTextureFormat_R8Unorm, usage, "mask-component");
@@ -1072,7 +1046,7 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
       texture.hash.clear();
     }
     if (texture.hash != key) {
-      const MaskUniform uniform = mask_uniform(*component, view.geometry);
+      const MaskUniform uniform = mask_uniform(*component, view.map);
       gpu_.write_buffer(mask_uniforms_.get(), kOpUniformStride * slot, &uniform, sizeof(uniform));
       WGPUTextureView raster =
           texture.source_view ? texture.source_view.get() : white_mask_view_.get();
@@ -1119,10 +1093,24 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
                 [&mask](const auto& kept) { return find_component(mask, kept.first) == nullptr; });
 }
 
-WGPUTextureView Renderer::run_passes(View& view, const Stack& stack) {
+WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass_crop) {
   // Geometry is not a pass: it changes where the proxy samples from and how big the image
   // rect is, so a change to it rebuilds the base. Everything else leaves the base alone.
-  const GeometryParams geometry_params = geometry_from_stack(stack);
+  GeometryParams geometry_params = geometry_from_stack(stack);
+  // The crop tool asks for the uncropped image so the user sees what is being cut away.
+  // Only the crop op's own rect and straighten go; rotate, flip and Transform move the
+  // whole image and stay. The flag is part of what `base_valid` is compared against, so
+  // entering and leaving the tool each rebuild the base exactly once.
+  if (bypass_crop) {
+    geometry_params.left = 0;
+    geometry_params.top = 0;
+    geometry_params.right = 1;
+    geometry_params.bottom = 1;
+    geometry_params.angle = 0;
+  }
+  // The viewport is part of the stage: a zoom or a pan changes which source texels each
+  // proxy pixel samples, so the base is resampled — one fullscreen pass, the same cost as
+  // a window resize, and nothing above it in the chain notices.
   if (!view.base_valid || !(view.geometry_params == geometry_params)) {
     view.geometry_params = geometry_params;
     build_base(view);
@@ -1160,12 +1148,33 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack) {
     }
     pass.uniform = op_uniform(*op, kind, view.geometry);
     pass.uniform.opacity = static_cast<float>(std::clamp(op->opacity, 0.0, kFullOpacity) / 100.0);
+    // A generative op is a cached raster, so it draws nothing until a job has produced one
+    // and the engine has been handed it. `result_rect` is normalised over the content rect,
+    // which the viewport's zoom and pan scale along with everything else.
+    if (kind == OpKind::Generative) {
+      const Photo& photo = *photos_.at(view.photo_id);
+      const auto stored = photo.results.find(op->id);
+      const std::optional<GenerativeRect> rect = rect_from_json(op->result_rect);
+      if (stored == photo.results.end() || stored->second.key != op->result) continue;
+      if (!rect.has_value()) continue;
+      pass.result_view = stored->second.view.get();
+      const auto edge = [](double at, int32_t origin, uint32_t extent) {
+        return static_cast<float>(origin + (at * extent));
+      };
+      pass.uniform.v[0] = edge(rect->x0, view.geometry.content_x, view.geometry.content_width);
+      pass.uniform.v[1] = edge(rect->y0, view.geometry.content_y, view.geometry.content_height);
+      pass.uniform.v[2] = edge(rect->x1, view.geometry.content_x, view.geometry.content_width);
+      pass.uniform.v[3] = edge(rect->y1, view.geometry.content_y, view.geometry.content_height);
+      pass.uniform.v[4] = static_cast<float>(stored->second.width);
+      pass.uniform.v[5] = static_cast<float>(stored->second.height);
+    }
     // An empty component list is not a mask: the op still applies everywhere, at its
     // opacity. A list whose components are all pending is, and rasterises to nothing.
     if (op->mask.has_value() && op->mask->contains("components") &&
         !(*op->mask)["components"].empty()) {
       pass.mask_json = *op->mask;
-      pass.mask_hash = mask_cache_key(pass.mask_json, view.geometry);
+      pass.mask_hash =
+          mask_cache_key(pass.mask_json, view.map, view.geometry_params, view.geometry);
       const auto found = view.masks.find(op->id);
       pass.mask_dirty = found == view.masks.end() || found->second.hash != pass.mask_hash;
     }
@@ -1216,6 +1225,21 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack) {
 
     const WGPUBindGroupEntry uniform =
         buffer_entry(1, view.op_uniforms.get(), kOpUniformStride * i, sizeof(OpUniform));
+    // The generative composite mixes a cached raster in at this op's position instead of
+    // computing anything (PROMPT.md 3.5). It has to be tested before the neighbourhood
+    // branch, which claims every kind above Texture.
+    if (pass.kind == OpKind::Generative) {
+      const std::array<WGPUBindGroupEntry, 4> entries = {
+          texture_entry(0, source), uniform, texture_entry(2, pass.result_view),
+          texture_entry(3, pass.mask_view)};
+      bind_groups.push_back(gpu_.create_bind_group(composite_pipeline_.get(), entries));
+      WGPUTextureView target = view.ping_view[target_index % 2].get();
+      gpu_.encode_fullscreen_pass(encoder, composite_pipeline_.get(), bind_groups.back().get(),
+                                  target);
+      source = target;
+      ++target_index;
+      continue;
+    }
     if (pass.kind >= OpKind::Texture) {
       WGPUTextureView neighbours = source;
       if (needs_prepass(pass.kind)) {
@@ -1254,6 +1278,21 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack) {
   return source;
 }
 
+void Renderer::set_viewport(uint32_t view_id, const Viewport& viewport) {
+  View& view = view_for(view_id);
+  if (view.viewport == viewport) return;
+  view.viewport = viewport;
+  view.base_valid = false;
+}
+
+Viewport Renderer::view_viewport(uint32_t view_id) const {
+  return views_.at(view_id)->viewport;
+}
+
+GeometryMap Renderer::view_map(uint32_t view_id) const {
+  return views_.at(view_id)->map;
+}
+
 void Renderer::put_mask_raster(int64_t photo_id, std::string_view component_id,
                                std::string_view hash, GrayImage raster) {
   const auto found = photos_.find(photo_id);
@@ -1279,11 +1318,47 @@ bool Renderer::has_mask_raster(int64_t photo_id, std::string_view component_id,
   return stored != found->second->rasters.end() && stored->second.hash == hash;
 }
 
+void Renderer::put_generative_result(int64_t photo_id, std::string_view op_id,
+                                     std::string_view key, const Rgb8Image& image) {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) return;
+  if (image.width == 0 || image.height == 0) return;
+
+  // The GPU wants four channels; the PNG a backend returns has three. One copy, once per
+  // job, rather than a shader branch on every frame.
+  std::vector<uint8_t> rgba(static_cast<size_t>(image.width) * image.height * 4, 255);
+  for (size_t pixel = 0; pixel < static_cast<size_t>(image.width) * image.height; ++pixel) {
+    rgba[pixel * 4] = image.pixels[pixel * 3];
+    rgba[(pixel * 4) + 1] = image.pixels[(pixel * 3) + 1];
+    rgba[(pixel * 4) + 2] = image.pixels[(pixel * 3) + 2];
+  }
+
+  StoredResult stored;
+  stored.key = std::string(key);
+  stored.width = image.width;
+  stored.height = image.height;
+  stored.texture = gpu_.create_texture(
+      image.width, image.height, WGPUTextureFormat_RGBA8Unorm,
+      static_cast<WGPUTextureUsage>(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst),
+      "generative-result");
+  gpu_.write_texture(stored.texture.get(), image.width, image.height, 4, rgba.data(), rgba.size());
+  stored.view.reset(wgpuTextureCreateView(stored.texture.get(), nullptr));
+  found->second->results[std::string(op_id)] = std::move(stored);
+}
+
+bool Renderer::has_generative_result(int64_t photo_id, std::string_view op_id,
+                                     std::string_view key) const {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) return false;
+  const auto stored = found->second->results.find(std::string(op_id));
+  return stored != found->second->results.end() && stored->second.key == key;
+}
+
 MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::string_view op_id,
                                 std::string_view component_id, std::vector<uint8_t>& out,
                                 size_t offset) {
   View& view = view_for(view_id);
-  WGPUTextureView last = run_passes(view, stack);
+  WGPUTextureView last = run_passes(view, stack, false);
 
   const Op* op = find_op(stack, op_id);
   if (op == nullptr) throw std::runtime_error("unknown opId '" + std::string(op_id) + "'");
@@ -1293,7 +1368,8 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
   }
   // A disabled or neutral op has no pass, so run_passes never built its mask; the overlay
   // still has to be able to show it.
-  const std::string hash = mask_cache_key(*op->mask, view.geometry);
+  const std::string hash =
+      mask_cache_key(*op->mask, view.map, view.geometry_params, view.geometry);
   const auto found = view.masks.find(op->id);
   if (found == view.masks.end() || found->second.hash != hash) {
     build_mask(view, *op, *op->mask, hash, last);
@@ -1317,12 +1393,18 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
   MaskReadout readout;
   readout.width = entry.width;
   readout.height = entry.height;
+  // Over the image the user can actually see: zoomed in, the content rect runs off the
+  // frame, and counting pixels that were never rendered would make every mask look empty.
   size_t inside = 0;
   size_t counted = 0;
-  for (uint32_t y = view.geometry.content_y;
-       y < view.geometry.content_y + view.geometry.content_height; ++y) {
-    for (uint32_t x = view.geometry.content_x;
-         x < view.geometry.content_x + view.geometry.content_width; ++x) {
+  const int32_t x0 = std::max(view.geometry.content_x, 0);
+  const int32_t y0 = std::max(view.geometry.content_y, 0);
+  const auto x1 = static_cast<int32_t>(
+      std::min<int64_t>(view.geometry.content_x + view.geometry.content_width, entry.width));
+  const auto y1 = static_cast<int32_t>(
+      std::min<int64_t>(view.geometry.content_y + view.geometry.content_height, entry.height));
+  for (int32_t y = y0; y < y1; ++y) {
+    for (int32_t x = x0; x < x1; ++x) {
       ++counted;
       if (out[offset + (static_cast<size_t>(y) * entry.width) + x] > 127) ++inside;
     }
@@ -1333,12 +1415,12 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
 }
 
 RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
-                              size_t offset) {
+                              size_t offset, bool bypass_crop) {
   using clock = std::chrono::steady_clock;
   View& view = view_for(view_id);
   const auto started = clock::now();
 
-  WGPUTextureView source = run_passes(view, stack);
+  WGPUTextureView source = run_passes(view, stack, bypass_crop);
   const std::array<WGPUBindGroupEntry, 2> display_entries = {
       texture_entry(0, source), buffer_entry(1, view.frame_uniform.get(), 0, sizeof(FrameUniform))};
   const BindGroupHandle display = gpu_.create_bind_group(display_pipeline_.get(), display_entries);
@@ -1360,6 +1442,206 @@ RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<
   timing.render_ms = std::chrono::duration<double, std::milli>(rendered - started).count();
   timing.readback_ms = std::chrono::duration<double, std::milli>(read - rendered).count();
   return timing;
+}
+
+Rgb16Image Renderer::render_export(int64_t photo_id, const Stack& stack,
+                                   const ExportRenderOptions& options) {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) throw std::runtime_error("export on an unknown photo");
+  const Photo& photo = *found->second;
+
+  // The photo's native size *as the stack shows it*: the crop rect at sensor resolution,
+  // with the axes swapped when a quadrant rotation turned it.
+  const GeometryParams geometry_params = geometry_from_stack(stack);
+  const bool turned = (geometry_params.quadrant % 2) != 0;
+  const double work_width = turned ? photo.height : photo.width;
+  const double work_height = turned ? photo.width : photo.height;
+  const double native_width = work_width * (geometry_params.right - geometry_params.left);
+  const double native_height = work_height * (geometry_params.bottom - geometry_params.top);
+
+  // build_base letterboxes the content inside the frame, so asking for exactly the
+  // content's own aspect is what makes the two the same rectangle — an export has no bars.
+  const auto full_width = std::max(1U, static_cast<uint32_t>(std::lround(native_width)));
+  const double content_aspect = native_width / std::max(native_height, 1.0);
+  const auto full_height =
+      std::max(1U, static_cast<uint32_t>(std::lround(full_width / content_aspect)));
+  const uint32_t limit = gpu_.report().max_texture_dimension_2d;
+  if (std::max(full_width, full_height) > limit) {
+    throw std::runtime_error("export size exceeds the adapter's maxTextureDimension2D (" +
+                             std::to_string(limit) + "); tiled export is not implemented");
+  }
+
+  const auto usage = static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment |
+                                                   WGPUTextureUsage_TextureBinding);
+  // A view of its own, never in views_: it lives for this call, so a 24 MP ping-pong is
+  // not held against the next slider tick.
+  View view;
+  view.photo_id = photo_id;
+  view.geometry.width = full_width;
+  view.geometry.height = full_height;
+  view.fit_uniform = gpu_.create_uniform_buffer(sizeof(FitUniform), "export-fit");
+  view.frame_uniform = gpu_.create_uniform_buffer(sizeof(FrameUniform), "export-frame");
+  view.curve_uniforms = gpu_.create_uniform_buffer(kCurveSlotStride, "export-curves");
+  view.curve_capacity = 1;
+  view.base = gpu_.create_texture(full_width, full_height, WGPUTextureFormat_RGBA16Float, usage,
+                                  "export-base");
+  view.base_view.reset(wgpuTextureCreateView(view.base.get(), nullptr));
+  for (int i = 0; i < 2; ++i) {
+    view.ping[i] = gpu_.create_texture(full_width, full_height, WGPUTextureFormat_RGBA16Float,
+                                       usage, "export-ping");
+    view.ping_view[i].reset(wgpuTextureCreateView(view.ping[i].get(), nullptr));
+  }
+  view.scratch = gpu_.create_texture(full_width, full_height, WGPUTextureFormat_RGBA16Float, usage,
+                                     "export-scratch");
+  view.scratch_view.reset(wgpuTextureCreateView(view.scratch.get(), nullptr));
+
+  WGPUTextureView source = run_passes(view, stack, false);
+
+  // The developed image is letterboxed inside the frame like any other view, so the resize
+  // pass doubles as the crop that lifts it out: it always runs, and at 1:1 it is an exact
+  // texel-for-texel copy of the content rect. That is cheaper to reason about than trying
+  // to pick a frame size whose rounding leaves no bar.
+  const int32_t content_x = view.geometry.content_x;
+  const int32_t content_y = view.geometry.content_y;
+  const uint32_t content_width = std::max(1U, view.geometry.content_width);
+  const uint32_t content_height = std::max(1U, view.geometry.content_height);
+  const ExportSize out = export_resize_fit(options.resize, content_width, content_height);
+  if (std::max(out.width, out.height) > limit) {
+    throw std::runtime_error("resized export exceeds the adapter's maxTextureDimension2D (" +
+                             std::to_string(limit) + ")");
+  }
+
+  // Resize in linear light, before the output curve: the box filter is downscale.wgsl with
+  // the content rect as its homography, so a resized export and a proxy of the same size
+  // come out of the same code.
+  const TextureHandle resized = gpu_.create_texture(
+      out.width, out.height, WGPUTextureFormat_RGBA16Float, usage, "export-resized");
+  const TextureViewHandle resized_view(wgpuTextureCreateView(resized.get(), nullptr));
+  {
+    FitUniform fit;
+    fit.scale[0] = static_cast<float>(static_cast<double>(content_width) / out.width);
+    fit.scale[1] = static_cast<float>(static_cast<double>(content_height) / out.height);
+    // Upscaling leaves one tap, i.e. nearest neighbour. Enlarging past native is not what
+    // an export is for; the clamp keeps it honest rather than pretending to interpolate.
+    fit.taps[0] = std::clamp(std::floor(fit.scale[0]), 1.0F, 16.0F);
+    fit.taps[1] = std::clamp(std::floor(fit.scale[1]), 1.0F, 16.0F);
+    fit.size[0] = static_cast<float>(full_width);
+    fit.size[1] = static_cast<float>(full_height);
+    fit.extent[0] = static_cast<float>(out.width);
+    fit.extent[1] = static_cast<float>(out.height);
+    // Destination 0..1 -> the content rect, normalised over the frame texture. No rotation
+    // or crop here: run_passes already applied the whole geometry stage.
+    fit.m0[0] = static_cast<float>(static_cast<double>(content_width) / full_width);
+    fit.m0[2] = static_cast<float>(static_cast<double>(content_x) / full_width);
+    fit.m1[1] = static_cast<float>(static_cast<double>(content_height) / full_height);
+    fit.m1[2] = static_cast<float>(static_cast<double>(content_y) / full_height);
+    fit.params[1] = static_cast<float>(content_aspect);
+    const BufferHandle resize_uniform =
+        gpu_.create_uniform_buffer(sizeof(FitUniform), "export-resize");
+    gpu_.write_buffer(resize_uniform.get(), 0, &fit, sizeof(fit));
+    const std::array<WGPUBindGroupEntry, 2> entries = {
+        texture_entry(0, source), buffer_entry(1, resize_uniform.get(), 0, sizeof(FitUniform))};
+    const BindGroupHandle bind_group = gpu_.create_bind_group(downscale_pipeline_.get(), entries);
+    WGPUCommandEncoder encoder = gpu_.begin_commands("export-resize");
+    gpu_.encode_fullscreen_pass(encoder, downscale_pipeline_.get(), bind_group.get(),
+                                resized_view.get());
+    gpu_.submit(encoder);
+    gpu_.wait_idle();
+    gpu_.raise_pending_error();
+    source = resized_view.get();
+  }
+
+  // Output sharpening is the last thing that touches pixel values, exactly as in
+  // Lightroom: it is compensation for the output medium, not part of the develop.
+  const SharpenSettings sharpen = export_sharpen_settings(options.sharpen);
+  TextureHandle sharpen_blur;
+  TextureViewHandle sharpen_blur_view;
+  TextureHandle sharpened;
+  TextureViewHandle sharpened_view;
+  BufferHandle sharpen_uniform;
+  if (sharpen.radius > 0 && sharpen.amount > 0) {
+    OpUniform uniform;
+    uniform.kind = static_cast<uint32_t>(OpKind::Sharpening);
+    uniform.size[0] = static_cast<float>(out.width);
+    uniform.size[1] = static_cast<float>(out.height);
+    uniform.opacity = 1;
+    uniform.v[0] = sharpen.amount;
+    uniform.v[1] = 0.5F;  // detail: the middle of the develop op's own range
+    uniform.v[2] = 0;     // masking off — output sharpening is uniform by definition
+    uniform.v[24] = sharpen.radius;
+    sharpen_uniform = gpu_.create_uniform_buffer(sizeof(OpUniform), "export-sharpen");
+    gpu_.write_buffer(sharpen_uniform.get(), 0, &uniform, sizeof(uniform));
+    sharpen_blur = gpu_.create_texture(out.width, out.height, WGPUTextureFormat_RGBA16Float, usage,
+                                       "export-sharpen-blur");
+    sharpen_blur_view.reset(wgpuTextureCreateView(sharpen_blur.get(), nullptr));
+    sharpened = gpu_.create_texture(out.width, out.height, WGPUTextureFormat_RGBA16Float, usage,
+                                    "export-sharpened");
+    sharpened_view.reset(wgpuTextureCreateView(sharpened.get(), nullptr));
+
+    const WGPUBindGroupEntry slot = buffer_entry(1, sharpen_uniform.get(), 0, sizeof(OpUniform));
+    const std::array<WGPUBindGroupEntry, 2> blur_entries = {texture_entry(0, source), slot};
+    const BindGroupHandle blur = gpu_.create_bind_group(blur_pipeline_.get(), blur_entries);
+    const std::array<WGPUBindGroupEntry, 4> combine_entries = {
+        texture_entry(0, source), texture_entry(1, sharpen_blur_view.get()),
+        buffer_entry(2, sharpen_uniform.get(), 0, sizeof(OpUniform)),
+        texture_entry(3, white_mask_view_.get())};
+    const BindGroupHandle combine =
+        gpu_.create_bind_group(neighborhood_pipeline_.get(), combine_entries);
+    WGPUCommandEncoder encoder = gpu_.begin_commands("export-sharpen");
+    gpu_.encode_fullscreen_pass(encoder, blur_pipeline_.get(), blur.get(), sharpen_blur_view.get());
+    gpu_.encode_fullscreen_pass(encoder, neighborhood_pipeline_.get(), combine.get(),
+                                sharpened_view.get());
+    gpu_.submit(encoder);
+    gpu_.wait_idle();
+    gpu_.raise_pending_error();
+    source = sharpened_view.get();
+  }
+
+  if (!export_pipeline_) {
+    const ShaderModuleHandle shader = gpu_.create_shader(shaders::kExport, "export");
+    export_pipeline_ =
+        gpu_.create_fullscreen_pipeline(shader.get(), WGPUTextureFormat_RGBA16Uint, "export");
+  }
+  const ColorTransform transform = export_color_transform(options.color_space);
+  ExportUniform colors;
+  for (int i = 0; i < 3; ++i) {
+    colors.m0[i] = transform.matrix[i];
+    colors.m1[i] = transform.matrix[3 + i];
+    colors.m2[i] = transform.matrix[6 + i];
+  }
+  colors.params[0] = transform.gamma;
+  const BufferHandle color_uniform =
+      gpu_.create_uniform_buffer(sizeof(ExportUniform), "export-colors");
+  gpu_.write_buffer(color_uniform.get(), 0, &colors, sizeof(colors));
+
+  const TextureHandle target = gpu_.create_texture(
+      out.width, out.height, WGPUTextureFormat_RGBA16Uint,
+      static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc),
+      "export-target");
+  const TextureViewHandle target_view(wgpuTextureCreateView(target.get(), nullptr));
+  const std::array<WGPUBindGroupEntry, 2> entries = {
+      texture_entry(0, source), buffer_entry(1, color_uniform.get(), 0, sizeof(ExportUniform))};
+  const BindGroupHandle bind_group = gpu_.create_bind_group(export_pipeline_.get(), entries);
+  WGPUCommandEncoder encoder = gpu_.begin_commands("export-transform");
+  gpu_.encode_fullscreen_pass(encoder, export_pipeline_.get(), bind_group.get(), target_view.get());
+  gpu_.submit(encoder);
+  gpu_.wait_idle();
+  gpu_.raise_pending_error();
+
+  std::vector<uint8_t> rgba(static_cast<size_t>(out.width) * out.height * 8);
+  gpu_.read_texture(target.get(), out.width, out.height, 8, rgba);
+
+  Rgb16Image image;
+  image.width = out.width;
+  image.height = out.height;
+  image.pixels.resize(image.expected_size());
+  const auto* source_values = reinterpret_cast<const uint16_t*>(rgba.data());
+  for (size_t pixel = 0; pixel < static_cast<size_t>(out.width) * out.height; ++pixel) {
+    image.pixels[pixel * 3] = source_values[pixel * 4];
+    image.pixels[(pixel * 3) + 1] = source_values[(pixel * 4) + 1];
+    image.pixels[(pixel * 3) + 2] = source_values[(pixel * 4) + 2];
+  }
+  return image;
 }
 
 }  // namespace latent

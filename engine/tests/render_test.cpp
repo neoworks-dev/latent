@@ -7,6 +7,7 @@
 // (1) is the contract the whole panel rests on: adding an op must not change the picture
 // until a slider moves. (2) is what stops (1) from being satisfied by an op that does
 // nothing at all. The test skips itself when no adapter is available.
+#include "generative/generative.h"
 #include "ops/op.h"
 #include "ops/registry.h"
 #include "pipeline/renderer.h"
@@ -150,6 +151,10 @@ TEST_CASE("every op is a no-op at its defaults and changes the frame when it is 
     const Stack defaults = {make_op(definition.name, nlohmann::json::object())};
     REQUIRE(fixture.render(defaults) == empty);
 
+    // A generative op is a cached raster, not a formula: no value of `prompt` or `seed`
+    // changes a pixel, only a generative.run that produced a result does. Its composite is
+    // asserted in tests/generative_render_test.cpp instead.
+    if (is_generative_op(definition.name)) continue;
     const auto strong = strong_values().find(definition.name);
     REQUIRE(strong != strong_values().end());
     const Stack edited = {make_op(definition.name, strong->second)};
@@ -159,6 +164,7 @@ TEST_CASE("every op is a no-op at its defaults and changes the frame when it is 
   // The whole set at once still renders, and is not accidentally the neutral frame.
   Stack everything;
   for (const OpDefinition& definition : op_definitions()) {
+    if (is_generative_op(definition.name)) continue;
     everything.push_back(make_op(definition.name, strong_values().at(definition.name)));
   }
   REQUIRE(fixture.render(everything) != empty);
@@ -210,4 +216,45 @@ TEST_CASE("crop changes the image rect inside the view") {
   fixture.render(Stack{make_op("rotate", {{"value", 90}})});
   const ViewGeometry turned = fixture.renderer->view_geometry(1);
   REQUIRE(turned.content_width < turned.content_height);
+}
+
+TEST_CASE("the geometry bypass renders the whole image while a crop is on the stack") {
+  Fixture fixture;
+  try {
+    fixture.renderer = std::make_unique<Renderer>(16384);
+  } catch (const std::exception& error) {
+    SKIP(std::string("no GPU adapter: ") + error.what());
+  }
+  fixture.renderer->load_photo(1, synthetic_raw());
+  fixture.renderer->open_view(1, 1, kWidth, kHeight);
+  fixture.frame.resize(static_cast<size_t>(kWidth) * kHeight * 4);
+
+  const uint64_t uncropped = fixture.render(Stack{});
+  const ViewGeometry full = fixture.renderer->view_geometry(1);
+
+  const Stack cropped_stack = {make_op(
+      "crop", {{"left", 0.3}, {"top", 0.2}, {"right", 0.6}, {"bottom", 0.9}, {"angle", 7}})};
+  REQUIRE(fixture.render(cropped_stack) != uncropped);
+  REQUIRE(fixture.renderer->view_geometry(1).content_width < full.content_width);
+
+  // The crop tool's frame: same stack, whole image. The rect covers it and the pixels are
+  // the ones an empty stack renders, straighten included.
+  fixture.renderer->render(1, cropped_stack, fixture.frame, 0, true);
+  const ViewGeometry bypassed = fixture.renderer->view_geometry(1);
+  REQUIRE(bypassed.content_x == full.content_x);
+  REQUIRE(bypassed.content_y == full.content_y);
+  REQUIRE(bypassed.content_width == full.content_width);
+  REQUIRE(bypassed.content_height == full.content_height);
+  REQUIRE(hash_of(fixture.frame) == uncropped);
+
+  // Rotate is not the crop's: it moves the whole image and survives the bypass.
+  Stack turned_stack = cropped_stack;
+  turned_stack.push_back(make_op("rotate", {{"value", 90}}));
+  fixture.renderer->render(1, turned_stack, fixture.frame, 0, true);
+  const ViewGeometry turned = fixture.renderer->view_geometry(1);
+  REQUIRE(turned.content_width < turned.content_height);
+
+  // And leaving the tool goes back to the cropped frame rather than keeping the bypass.
+  REQUIRE(fixture.render(cropped_stack) != uncropped);
+  REQUIRE(fixture.renderer->view_geometry(1).content_width < full.content_width);
 }

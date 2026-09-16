@@ -7,6 +7,7 @@
 // rasterises to zero and the op does nothing.
 #pragma once
 
+#include "ops/geometry.h"
 #include "ops/op.h"
 
 #include <cstdint>
@@ -37,12 +38,27 @@ enum class MaskKind : uint8_t {
 
 enum class MaskMode : uint8_t { Add, Subtract, Intersect };
 
+// Which space a mask's coordinates are normalised over (protocol Mask.space).
+//
+//   Image    0..1 over the decoded photo, before crop, straighten, rotate, flip and the
+//            Transform sliders. The only space this engine writes: a mask painted on the
+//            subject stays on the subject when the geometry moves afterwards, which is
+//            what Lightroom does.
+//   Content  0..1 over the developed image as a view shows it. What every mask written
+//            before this change holds; `migrate_mask_space` converts one on load and
+//            nothing else in the engine ever produces one.
+//
+// An absent `space` on the wire means Image: a client that has not been updated is a
+// client that never applied geometry either, and there the two spaces coincide.
+enum class MaskSpace : uint8_t { Image, Content };
+
 // ready / stale rasterise; pending and failed contribute nothing until mask.detect lands.
 enum class MaskState : uint8_t { Ready, Pending, Stale, Failed };
 
 std::string_view mask_kind_name(MaskKind kind);
 std::string_view mask_mode_name(MaskMode mode);
 std::string_view mask_state_name(MaskState state);
+std::string_view mask_space_name(MaskSpace space);
 
 // True for the kinds that need a model run (mask.detect): subject, sky, background,
 // objects, people, text, depth. The rest rasterise inline from their params.
@@ -52,6 +68,7 @@ bool mask_kind_is_ai(MaskKind kind);
 MaskKind mask_kind_from_name(std::string_view name);
 MaskMode mask_mode_from_name(std::string_view name);
 MaskState mask_state_from_name(std::string_view name);
+MaskSpace mask_space_from_name(std::string_view name);
 
 // One validated component: defaults filled in, every number inside its documented range.
 struct MaskComponent {
@@ -70,6 +87,7 @@ struct MaskComponent {
 
 struct Mask {
   std::vector<MaskComponent> components;
+  MaskSpace space = MaskSpace::Image;
 };
 
 // Validates and fills in defaults. Throws OpError for a duplicate id, an unknown kind or
@@ -87,8 +105,23 @@ const MaskComponent* find_component(const Mask& mask, std::string_view component
 
 // Cache key: sha256 over the canonical JSON plus the raster size. A mask whose JSON and
 // proxy size are unchanged reuses its raster, which is what keeps a masked slider drag
-// off the rasteriser (only the blend runs).
+// off the rasteriser (only the blend runs). The caller folds the geometry stage into
+// `canonical` (pipeline/renderer.cpp), because a mask in image space rasterises into view
+// pixels and a crop, a rotate or a zoom moves every one of them.
 std::string mask_hash(const nlohmann::json& canonical, uint32_t width, uint32_t height);
+
+// ---- migration ----------------------------------------------------------------------
+// Masks written before image space hold coordinates normalised over the content rect. This
+// walks a loaded stack, converts every mask that has not declared its space through the
+// stack's own geometry, and marks it `image`. Idempotent: a mask already in image space is
+// left alone.
+//
+// Points convert exactly. Scalars — a radial's radii, a brush's diameter — have no exact
+// image-space twin once a straighten or a keystone is in play, so they are scaled by the
+// map's local linear factor at the shape's own centre. Best effort, and only ever applied
+// once per sidecar.
+void migrate_mask_space(Stack& stack, uint32_t photo_width, uint32_t photo_height);
+nlohmann::json migrate_mask_space(const nlohmann::json& mask, const GeometryMap& map);
 
 // ---- brush strokes ------------------------------------------------------------------
 // The engine owns the stroke list: the UI appends to it with mask.stroke and never sends
@@ -106,7 +139,8 @@ struct StrokePoint {
 
 struct BrushStroke {
   bool erase = false;
-  // Diameter as a fraction of the content rect's long edge.
+  // Diameter as a fraction of the *image's* long edge, like every other mask coordinate.
+  // A crop does not change how wide a painted stroke is on the subject.
   double size = 0.08;
   double flow = 100;
   std::vector<StrokePoint> points;

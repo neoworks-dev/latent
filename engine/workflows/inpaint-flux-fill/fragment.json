@@ -1,0 +1,269 @@
+{
+ "_fragment": {
+  "name": "inpaint-flux-fill",
+  "description": "Flux.1 Fill Dev inpainting, decomposed from ComfyUI's flux_fill_inpaint_example template. The mask port is retyped MASK so the composer puts an ImageToMask behind its loader: Latent uploads an 8-bit grey PNG, not an image with an alpha channel. Rebuild with `comfy workflow compose`; never hand-edit the compiled graph.",
+  "terminal": false,
+  "source": "flux-template.json",
+  "inputs": {
+   "inpaintmodelconditioning_pixels": {
+    "type": "IMAGE",
+    "binds": "11.pixels"
+   },
+   "inpaintmodelconditioning_mask": {
+    "type": "MASK",
+    "binds": "11.mask"
+   }
+  },
+  "outputs": {
+   "image": {
+    "type": "IMAGE",
+    "from": "10",
+    "port": 0
+   }
+  },
+  "params": {
+   "load_clip_dual_clip_name1": {
+    "type": "STRING",
+    "binds": "3.clip_name1",
+    "default": "clip_l.safetensors"
+   },
+   "load_clip_dual_clip_name2": {
+    "type": "STRING",
+    "binds": "3.clip_name2",
+    "default": "t5xxl_fp16.safetensors"
+   },
+   "load_clip_dual_type": {
+    "type": "STRING",
+    "binds": "3.type",
+    "default": "flux"
+   },
+   "load_clip_dual_device": {
+    "type": "STRING",
+    "binds": "3.device",
+    "default": "default"
+   },
+   "fluxguidance_guidance": {
+    "type": "INT",
+    "binds": "4.guidance",
+    "default": 30
+   },
+   "load_vae_vae_name": {
+    "type": "STRING",
+    "binds": "5.vae_name",
+    "default": "ae.safetensors"
+   },
+   "load_diffusion_model_unet_name": {
+    "type": "STRING",
+    "binds": "6.unet_name",
+    "default": "flux1-fill-dev.safetensors"
+   },
+   "load_diffusion_model_weight_dtype": {
+    "type": "STRING",
+    "binds": "6.weight_dtype",
+    "default": "default"
+   },
+   "clip_text_encode_positive_prompt_text": {
+    "type": "STRING",
+    "binds": "8.text",
+    "default": "anime girl with massive fennec ears blonde hair blue eyes wearing a pink shirt"
+   },
+   "differential_diffusion_strength": {
+    "type": "INT",
+    "binds": "9.strength",
+    "default": 1
+   },
+   "inpaintmodelconditioning_noise_mask": {
+    "type": "BOOLEAN",
+    "binds": "11.noise_mask",
+    "default": true
+   },
+   "ksampler_seed": {
+    "type": "INT",
+    "binds": "12.seed",
+    "default": 190664687740330
+   },
+   "ksampler_steps": {
+    "type": "INT",
+    "binds": "12.steps",
+    "default": 20
+   },
+   "ksampler_cfg": {
+    "type": "INT",
+    "binds": "12.cfg",
+    "default": 1
+   },
+   "ksampler_sampler_name": {
+    "type": "STRING",
+    "binds": "12.sampler_name",
+    "default": "euler"
+   },
+   "ksampler_scheduler": {
+    "type": "STRING",
+    "binds": "12.scheduler",
+    "default": "normal"
+   },
+   "ksampler_denoise": {
+    "type": "INT",
+    "binds": "12.denoise",
+    "default": 1
+   }
+  }
+ },
+ "3": {
+  "inputs": {
+   "clip_name1": "clip_l.safetensors",
+   "clip_name2": "t5xxl_fp16.safetensors",
+   "type": "flux",
+   "device": "default"
+  },
+  "class_type": "DualCLIPLoader",
+  "_meta": {
+   "title": "Load CLIP (Dual)"
+  }
+ },
+ "4": {
+  "inputs": {
+   "guidance": 30,
+   "conditioning": [
+    "8",
+    0
+   ]
+  },
+  "class_type": "FluxGuidance",
+  "_meta": {
+   "title": "FluxGuidance"
+  }
+ },
+ "5": {
+  "inputs": {
+   "vae_name": "ae.safetensors"
+  },
+  "class_type": "VAELoader",
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "6": {
+  "inputs": {
+   "unet_name": "flux1-fill-dev.safetensors",
+   "weight_dtype": "default"
+  },
+  "class_type": "UNETLoader",
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "7": {
+  "inputs": {
+   "conditioning": [
+    "8",
+    0
+   ]
+  },
+  "class_type": "ConditioningZeroOut",
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "8": {
+  "inputs": {
+   "text": "anime girl with massive fennec ears blonde hair blue eyes wearing a pink shirt",
+   "clip": [
+    "3",
+    0
+   ]
+  },
+  "class_type": "CLIPTextEncode",
+  "_meta": {
+   "title": "CLIP Text Encode (Positive Prompt)"
+  }
+ },
+ "9": {
+  "inputs": {
+   "strength": 1,
+   "model": [
+    "6",
+    0
+   ]
+  },
+  "class_type": "DifferentialDiffusion",
+  "_meta": {
+   "title": "Differential Diffusion"
+  }
+ },
+ "10": {
+  "inputs": {
+   "samples": [
+    "12",
+    0
+   ],
+   "vae": [
+    "5",
+    0
+   ]
+  },
+  "class_type": "VAEDecode",
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "11": {
+  "inputs": {
+   "noise_mask": true,
+   "positive": [
+    "4",
+    0
+   ],
+   "negative": [
+    "7",
+    0
+   ],
+   "vae": [
+    "5",
+    0
+   ],
+   "pixels": [
+    "2",
+    0
+   ],
+   "mask": [
+    "2",
+    1
+   ]
+  },
+  "class_type": "InpaintModelConditioning",
+  "_meta": {
+   "title": "InpaintModelConditioning"
+  }
+ },
+ "12": {
+  "inputs": {
+   "seed": 190664687740330,
+   "steps": 20,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "normal",
+   "denoise": 1,
+   "model": [
+    "9",
+    0
+   ],
+   "positive": [
+    "11",
+    0
+   ],
+   "negative": [
+    "11",
+    1
+   ],
+   "latent_image": [
+    "11",
+    2
+   ]
+  },
+  "class_type": "KSampler",
+  "_meta": {
+   "title": "KSampler"
+  }
+ }
+}

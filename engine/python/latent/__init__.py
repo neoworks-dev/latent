@@ -7,4 +7,4 @@ package from outside the daemon — the `latent mcp` stdio shim is the one case 
 not import anything that exists solely in the engine.
 """
 
-__all__ = ["mcp_server", "stdio_shim"]
+__all__ = ["_generative", "merge", "mcp_server", "stdio_shim"]

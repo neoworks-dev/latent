@@ -40,6 +40,7 @@ const panelOfSection: Record<NonNullable<OpDefinition["section"]>, OpDefinition[
   Detail: "detail",
   Optics: "optics",
   Geometry: "geometry",
+  Generative: "generative",
 };
 
 /** An op as the current engine describes it: a `section` and a place inside it. */

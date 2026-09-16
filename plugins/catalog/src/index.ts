@@ -1,6 +1,7 @@
 // The catalog: a filmstrip at the bottom, folders and collections on the left, and a job
 // status line in the footer. Rows, ratings, flags and thumbnails all belong to the engine —
 // this plugin lists, selects and asks; it never stores an edit.
+import type { MergeKind } from "@latent/protocol";
 import type { Context, Plugin } from "@neoworks/extension-system";
 import { catalogShortcut } from "./catalog";
 import Filmstrip from "./Filmstrip.svelte";
@@ -14,7 +15,20 @@ declare module "@neoworks/extension-system" {
   interface Context {
     catalog: CatalogState;
   }
+
+  interface Events {
+    /**
+     * The library asked for these photos to be merged. Declared and emitted here, handled
+     * by whoever owns Photo Merge: an event keeps the dependency edge catalog ← merge, so
+     * the catalog never imports the plugin that draws the dialog. With no handler loaded
+     * the control is inert, the same way Lightroom's menu item is when nothing can run it.
+     */
+    "catalog/merge"(kind: MergeKind, photoIds: number[]): void;
+  }
 }
+
+// The shape behind `ctx.catalog`, for a plugin that injects it and holds a reference.
+export type { CatalogState };
 
 export const catalogPlugin: Plugin.Object<void> = {
   name: "catalog",

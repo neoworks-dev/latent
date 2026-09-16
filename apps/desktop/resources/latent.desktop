@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Latent
+Comment=GPU raw photo editor
+Exec=AppRun %F
+Icon=latent
+Terminal=false
+Categories=Graphics;Photography;
+MimeType=image/x-sony-arw;image/x-fuji-raf;image/x-nikon-nef;image/x-canon-cr2;image/x-canon-cr3;image/x-adobe-dng;image/x-olympus-orf;image/x-panasonic-rw2;image/x-pentax-pef;

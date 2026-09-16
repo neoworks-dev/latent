@@ -123,6 +123,8 @@ describe("additive guarantees", () => {
       "curve",
       "hsl",
       "toggle",
+      // A generative prompt is free text: no generated control holds one.
+      "text",
     ]);
     expect(definition("OpParamDisplay").properties?.tint?.enum).toEqual([
       "temperature",
@@ -137,6 +139,7 @@ describe("additive guarantees", () => {
       "Detail",
       "Optics",
       "Geometry",
+      "Generative",
     ]);
   });
 

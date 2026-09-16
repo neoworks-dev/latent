@@ -1,6 +1,7 @@
 // Masks on the GPU: the combine fold, and the blend an op does with the result. Renders a
 // flat synthetic photo through the real pass chain, so the numbers below are the shader's
 // and not a CPU model of it. Skips itself when no adapter is available.
+#include "ops/geometry.h"
 #include "ops/mask.h"
 #include "ops/op.h"
 #include "ops/registry.h"
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -218,4 +220,130 @@ TEST_CASE("a cached mask survives a render and a resize rebuilds it") {
   fixture->frame.resize(static_cast<size_t>(kSize) * kSize * 16);
   fixture->raster.resize(static_cast<size_t>(kSize) * kSize * 4);
   CHECK_THAT(fixture->coverage(first), Catch::Matchers::WithinAbs(0.5, 0.02));
+}
+
+namespace {
+
+// A hard-edged disc at a named point of the *image*. Feather 0 so the raster's centroid is
+// the centre and not a weighted smear.
+nlohmann::json disc(const std::string& id, double x, double y, double radius) {
+  return {{"id", id},
+          {"kind", "radial"},
+          {"mode", "add"},
+          {"feather", 0},
+          {"params", {{"center", {x, y}}, {"radius", {radius, radius}}}}};
+}
+
+Op geometry_op(const std::string& name, const nlohmann::json& params) {
+  Op op;
+  op.id = name + "00001";
+  op.name = name;
+  op.params = params;
+  return op;
+}
+
+}  // namespace
+
+TEST_CASE("a mask stays on the same image pixels when the geometry moves") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  // Where the mask is, in image coordinates. Inside the crop below on every axis, so the
+  // whole disc stays visible and the centroid is comparable.
+  constexpr double kCentreX = 0.35;
+  constexpr double kCentreY = 0.6;
+  const Op masked = masked_exposure({disc("m", kCentreX, kCentreY, 0.12)}, 1.0, 100);
+
+  // The raster's centre of mass, carried back through the render's own geometry matrix.
+  // If image space works, this is the same point whatever is in front of the mask.
+  const auto centroid = [&](const Stack& stack) {
+    fixture->coverage(stack);
+    const GeometryMap map = fixture->renderer->view_map(1);
+    double sum_x = 0;
+    double sum_y = 0;
+    double weight = 0;
+    for (uint32_t y = 0; y < kSize; ++y) {
+      for (uint32_t x = 0; x < kSize; ++x) {
+        const double value = fixture->raster[(static_cast<size_t>(y) * kSize) + x] / 255.0;
+        if (value <= 0.5) continue;
+        sum_x += x + 0.5;
+        sum_y += y + 0.5;
+        weight += 1;
+      }
+    }
+    REQUIRE(weight > 4);
+    return mat3_apply(map.view_to_image, sum_x / weight, sum_y / weight);
+  };
+
+  const std::array<double, 2> plain = centroid({masked});
+  CHECK_THAT(plain[0], Catch::Matchers::WithinAbs(kCentreX, 0.02));
+  CHECK_THAT(plain[1], Catch::Matchers::WithinAbs(kCentreY, 0.02));
+
+  // A crop that keeps the disc: it now sits elsewhere in the frame, and on the same pixels
+  // of the photo. Content space would have left it where it was on screen instead.
+  const Stack cropped = {
+      geometry_op("crop", {{"left", 0.1}, {"top", 0.3}, {"right", 0.7}, {"bottom", 0.95}}), masked};
+  const std::array<double, 2> after_crop = centroid(cropped);
+  CHECK_THAT(after_crop[0], Catch::Matchers::WithinAbs(kCentreX, 0.02));
+  CHECK_THAT(after_crop[1], Catch::Matchers::WithinAbs(kCentreY, 0.02));
+
+  // A quarter turn, a mirror, and a Transform straighten: each moves every view pixel, and
+  // none of them moves the mask off the photo.
+  const Stack turned = {geometry_op("rotate", {{"value", 90.0}}), masked};
+  const std::array<double, 2> after_rotate = centroid(turned);
+  CHECK_THAT(after_rotate[0], Catch::Matchers::WithinAbs(kCentreX, 0.03));
+  CHECK_THAT(after_rotate[1], Catch::Matchers::WithinAbs(kCentreY, 0.03));
+
+  const Stack mirrored = {geometry_op("flip", {{"horizontal", true}}), masked};
+  const std::array<double, 2> after_flip = centroid(mirrored);
+  CHECK_THAT(after_flip[0], Catch::Matchers::WithinAbs(kCentreX, 0.03));
+  CHECK_THAT(after_flip[1], Catch::Matchers::WithinAbs(kCentreY, 0.03));
+
+  const Stack skewed = {geometry_op("transform", {{"rotate", 12.0}}), masked};
+  const std::array<double, 2> after_transform = centroid(skewed);
+  CHECK_THAT(after_transform[0], Catch::Matchers::WithinAbs(kCentreX, 0.03));
+  CHECK_THAT(after_transform[1], Catch::Matchers::WithinAbs(kCentreY, 0.03));
+}
+
+TEST_CASE("the mask cache is rebuilt when the geometry moves it") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  // A half of the image, and a crop that shows only the other half: the mask JSON has not
+  // changed, so a cache keyed on it alone would hand back the stale raster and the op
+  // would still be applied to half the frame.
+  const nlohmann::json right = half_plane("r", "add", 1.0);
+  const Op masked = masked_exposure({right}, 1.0, 100);
+  CHECK_THAT(fixture->coverage({masked}), Catch::Matchers::WithinAbs(0.5, 0.03));
+  CHECK_THAT(fixture->coverage({geometry_op("crop", {{"right", 0.5}}), masked}),
+             Catch::Matchers::WithinAbs(0.0, 0.03));
+  CHECK_THAT(fixture->coverage({geometry_op("crop", {{"left", 0.5}}), masked}),
+             Catch::Matchers::WithinAbs(1.0, 0.03));
+  // And back: the first key is still the first raster.
+  CHECK_THAT(fixture->coverage({masked}), Catch::Matchers::WithinAbs(0.5, 0.03));
+}
+
+TEST_CASE("a zoomed view keeps the mask on the subject") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  const Op masked = masked_exposure({disc("m", 0.35, 0.6, 0.12)}, 1.0, 100);
+  const double fitted = fixture->coverage({masked});
+
+  Viewport viewport;
+  viewport.scale = 2;
+  viewport.center_x = 0.35;
+  viewport.center_y = 0.6;
+  viewport.fit = false;
+  fixture->renderer->set_viewport(1, viewport);
+  fixture->coverage({masked});
+
+  // Centred on the disc at 2x, it covers four times the share of the visible image, and the
+  // matrix still names the point it is centred on as the middle of the frame.
+  const GeometryMap map = fixture->renderer->view_map(1);
+  const std::array<double, 2> centre = mat3_apply(map.image_to_view, 0.35, 0.6);
+  CHECK_THAT(centre[0], Catch::Matchers::WithinAbs(kSize / 2.0, 1.5));
+  CHECK_THAT(centre[1], Catch::Matchers::WithinAbs(kSize / 2.0, 1.5));
+  CHECK(map.content.width == fixture->renderer->view_map(1).content.width);
+  REQUIRE(fitted > 0.01);
 }
