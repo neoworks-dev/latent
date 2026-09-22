@@ -185,9 +185,12 @@ Anything bigger than one simple change runs this loop:
    like, same shape as the existing bodies. Label it: one `type:`, one or more `area:`, one
    `priority:`, `status:` only if it is blocked or unreproduced.
 2. **Branch off `main`**, named `<issue>-<slug>` (`31-job-queue`). Never work on `main`.
-3. **PR to `main`** when the work is verified — every check in _Verification_ green, and a
-   screenshot for visual work. Body ends with `Closes #<issue>`, so the merge closes it.
-4. Merge only after the checks pass. Never merge unverified into `main`.
+3. **Draft PR up front.** First commit, `git push -u`, `gh pr create --draft` against
+   `main` — plan in the body, ending `Closes #<issue>`, so the merge closes it. Commit
+   locally while working; push once at the end.
+4. **Ready when verified** — every check in _Verification_ green, and a screenshot for
+   visual work. Push, update the body with what changed + how verified, `gh pr ready`.
+5. Merge only after the checks pass. Never merge unverified into `main`.
 
 One simple change — typo, one-file fix, a comment — skips the issue and goes on a branch as
 asked. Splitting a large ask into several issues is fine and usually right; say which ones.
