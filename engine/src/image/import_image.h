@@ -23,6 +23,11 @@ bool is_rendered_extension(const std::string& path);
 // lives in latent_merge, one library up.
 bool is_photo_extension(const std::string& path);
 
+// What a folder scan or the watcher imports: a photo extension outside any `*.latent.d/`.
+// Older builds wrote mask rasters, depth maps and generative patches there, beside the photo,
+// and those PNGs are not photos (ops/mask.h, raster_dir_for).
+bool is_importable_photo(const std::string& path);
+
 // PNG or JPEG to the 16-bit linear RGBA `decode_raw` produces. The file's transfer function
 // is undone, its ICC profile (sRGB when it carries none) is transformed onto the working
 // space's linear sRGB primaries, EXIF orientation is baked into the pixels the way LibRaw

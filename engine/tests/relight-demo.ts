@@ -112,7 +112,6 @@ await shot("rays", [
 
 const sidecar = `${photoPath}.latent`;
 if (existsSync(sidecar)) await Bun.file(sidecar).delete();
-rmSync(`${photoPath}.latent.d`, { recursive: true, force: true });
 client.close();
 engine.process.kill("SIGTERM");
 await engine.process.exited;

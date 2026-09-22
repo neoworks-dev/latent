@@ -77,8 +77,14 @@ mirror Lightroom 1:1.
   `GenerativeBackend`. ComfyUI only via `comfy` CLI (`~/.local/bin/comfy`, skill at
   `~/.claude/skills/comfy`). Graphs in `engine/workflows/`: fragments + blueprint, `comfy
   workflow compose`; compiled JSON is a template, substitute by node id at runtime.
+- `<photo>.latent` sidecar sits beside the photo; every raster it names (masks, stroke
+  mirrors, depth, generative patches) lives in `$XDG_DATA_HOME/latent/rasters/<sha256>/`
+  (`raster_dir_for(photo.hash)`, `engine/src/ops/mask.h`), keyed by the file's content hash
+  so a move outside the app orphans nothing. Never write beside the photo: older builds did
+  (`<photo>.latent.d/`), the scan imported those PNGs as photos (#36); open/export migrate
+  them. Test harness pins `XDG_DATA_HOME` to its scratch dir.
 - Relight (`PROMPT.md` §3.8) needs the photo's depth map: `depth.estimate` → Depth Anything
-  V2 Small → `<photo>.latent.d/depth.png`, **16-bit** (0 far / 65535 near), image space like
+  V2 Small → `depth.png` in the raster dir, **16-bit** (0 far / 65535 near), image space like
   a mask raster but uploaded at its own size as `r16uint` and filtered in the shader — 8 bits
   terraces a sky and the shadow march draws a contour on every terrace, and a nearest-
   neighbour resample blocks it. An 8-bit map from an older build reads as absent.

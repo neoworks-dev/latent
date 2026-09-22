@@ -44,7 +44,7 @@ struct Op {
   bool is_group() const { return name == kGroupOpName; }
   // Generative ops only (PROMPT.md 3.5). A generated raster cannot be recomputed from its
   // parameters, so the op carries the pixels it produced and a hash of what produced them:
-  // `result` is a PNG path relative to `<photo>.latent.d/`, `result_rect` is the crop's
+  // `result` is a PNG path relative to raster_dir_for, `result_rect` is the crop's
   // [x0, y0, x1, y1] normalised over the content rect, and `input_hash` is what
   // generative_input_hash() returned when the job ran. All three are empty on every other
   // op, and none of them is a param — a param is something the user sets.

@@ -58,7 +58,7 @@ constexpr uint32_t kMaskDetectInputSize = 1024;
 // What the depth model is shown, and what its map is cached at. Depth Anything squashes
 // whatever it is given into 518x518, so a larger render buys nothing but the resample.
 constexpr uint32_t kDepthInputSize = 1024;
-// The depth map's cache file inside `<photo>.latent.d/`. One per photo: the map describes
+// The depth map's cache file inside the photo's raster dir. One per photo: the map describes
 // the scene, so no edit can make it stale (ai/depth.h).
 constexpr std::string_view kDepthCacheName = "depth.png";
 // LTHM carries the photo id in a u32 (protocol/frames.md); a larger rowid cannot be
@@ -413,22 +413,27 @@ std::vector<std::string> collect_importable_files(const std::vector<std::string>
   std::error_code error;
   for (const std::string& path : paths) {
     if (std::filesystem::is_regular_file(path, error)) {
-      if (is_photo_extension(path)) files.push_back(path);
+      if (is_importable_photo(path)) files.push_back(path);
       continue;
     }
     if (!std::filesystem::is_directory(path, error)) continue;
     const auto options = std::filesystem::directory_options::skip_permission_denied;
     if (!recursive) {
       for (const auto& entry : std::filesystem::directory_iterator(path, options, error)) {
-        if (entry.is_regular_file(error) && is_photo_extension(entry.path().string())) {
+        if (entry.is_regular_file(error) && is_importable_photo(entry.path().string())) {
           files.push_back(entry.path().string());
         }
       }
       continue;
     }
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(path, options, error)) {
-      if (entry.is_regular_file(error) && is_photo_extension(entry.path().string())) {
-        files.push_back(entry.path().string());
+    for (auto entry = std::filesystem::recursive_directory_iterator(path, options, error);
+         entry != std::filesystem::recursive_directory_iterator(); entry.increment(error)) {
+      if (entry->is_directory(error) && is_legacy_raster_dir(entry->path().string())) {
+        entry.disable_recursion_pending();
+        continue;
+      }
+      if (entry->is_regular_file(error) && is_importable_photo(entry->path().string())) {
+        files.push_back(entry->path().string());
       }
     }
   }
@@ -799,6 +804,8 @@ void Server::finish_photo_open(const std::string& path, const std::shared_ptr<De
     std::fflush(stdout);
 
     const PhotoState& opened = photos_.at(photo_id);
+    // Rasters written before the store sat beside the photo; they move on first open.
+    migrate_legacy_raster_dir(path, hash);
     // The sidecar names AI rasters by path; without them a `ready` component would render
     // as "select everything" instead of what the model found.
     load_mask_rasters(opened);
@@ -1300,7 +1307,7 @@ void Server::arm_folder_watches() {
 void Server::on_watched_files(std::vector<std::string> paths) {
   std::vector<std::string> photos;
   for (std::string& path : paths) {
-    if (is_photo_extension(path)) photos.push_back(std::move(path));
+    if (is_importable_photo(path)) photos.push_back(std::move(path));
   }
   if (photos.empty()) return;
   // The watcher runs on its own thread; the job ids and the job table are the server
@@ -1766,7 +1773,7 @@ void Server::finish_mask_detect(int64_t photo_id, const std::string& op_id,
     const std::string relative = mask_raster_relative_path(
         component_id, detect_raster_hash(*component, result.model, photo.hash));
     try {
-      write_gray_png(sidecar_dir_for(photo.path) + "/" + relative, result.raster);
+      write_gray_png(raster_dir_for(photo.hash) + "/" + relative, result.raster);
     } catch (const std::exception& failure) {
       warn(std::string("mask raster not cached on disk: ") + failure.what(), photo.id);
     }
@@ -1898,7 +1905,7 @@ void Server::finish_depth_estimate(int64_t photo_id, int64_t job_id, const Depth
   const PhotoState& photo = found->second;
   const std::string relative(kDepthCacheName);
   try {
-    write_gray16_png(sidecar_dir_for(photo.path) + "/" + relative, result.map);
+    write_gray16_png(raster_dir_for(photo.hash) + "/" + relative, result.map);
   } catch (const std::exception& failure) {
     warn(std::string("depth map not cached on disk: ") + failure.what(), photo.id);
   }
@@ -1930,7 +1937,7 @@ nlohmann::json Server::handle_depth_preview(const nlohmann::json& params, Peer* 
     throw RpcError(kInvalidParams, "this photo has no depth map; run depth.estimate first");
   }
   const std::optional<Gray16Image> stored =
-      read_gray16_png(sidecar_dir_for(photo.path) + "/" + std::string(kDepthCacheName));
+      read_gray16_png(raster_dir_for(photo.hash) + "/" + std::string(kDepthCacheName));
   if (!stored.has_value()) {
     throw RpcError(kEngineFailure, "the depth map is in memory but not on disk");
   }
@@ -1956,7 +1963,7 @@ nlohmann::json Server::handle_depth_preview(const nlohmann::json& params, Peer* 
 void Server::load_depth_map(const PhotoState& photo) {
   try {
     std::optional<Gray16Image> map =
-        read_gray16_png(sidecar_dir_for(photo.path) + "/" + std::string(kDepthCacheName));
+        read_gray16_png(raster_dir_for(photo.hash) + "/" + std::string(kDepthCacheName));
     if (!map.has_value()) return;
     renderer_.put_depth_map(photo.id, std::string(kDepthCacheName), std::move(*map));
   } catch (const std::exception& error) {
@@ -1974,7 +1981,7 @@ void Server::load_mask_rasters(const PhotoState& photo) {
       if (relative.empty()) continue;
       try {
         std::optional<GrayImage> raster =
-            read_gray_png(sidecar_dir_for(photo.path) + "/" + relative);
+            read_gray_png(raster_dir_for(photo.hash) + "/" + relative);
         if (!raster.has_value()) continue;
         renderer_.put_mask_raster(photo.id, component.id, relative, std::move(*raster));
       } catch (const std::exception& error) {
@@ -2256,7 +2263,7 @@ void Server::save_sidecar(PhotoState& photo) {
       const nlohmann::json& params = component["params"];
       const std::string relative = params.value(std::string(kBrushStrokePathKey), std::string());
       if (relative.empty()) continue;
-      const std::string path = sidecar_dir_for(photo.path) + "/" + relative;
+      const std::string path = raster_dir_for(photo.hash) + "/" + relative;
       try {
         std::error_code failure;
         std::filesystem::create_directories(std::filesystem::path(path).parent_path(), failure);
@@ -2594,9 +2601,14 @@ Rgb16Image Server::render_one_export(const ExportTarget& target,
   // server thread has a socket to answer. Only the upload and the render hop over.
   const DecodedRaw raw = decode_raw(target.source_path);
   Stack stack;
+  std::string photo_hash;
   const std::optional<Sidecar> sidecar = read_sidecar(sidecar_path_for(target.source_path));
   if (sidecar.has_value()) {
     stack = sidecar->stack;
+    // The sidecar's hash is the file's, so the rasters are found without hashing 24 MP.
+    photo_hash = sidecar->source_hash;
+    if (photo_hash.empty()) photo_hash = sha256_file_hex(target.source_path);
+    migrate_legacy_raster_dir(target.source_path, photo_hash);
     // The same two migrations photo.open runs, so an export of a photo nobody opened
     // renders the file the way the editor would (PROMPT.md 3.7).
     migrate_mask_space(stack, raw.width, raw.height);
@@ -2613,8 +2625,7 @@ Rgb16Image Server::render_one_export(const ExportTarget& target,
       if (!mask_kind_is_ai(component.kind)) continue;
       const std::string relative = component.params.value("raster", std::string());
       if (relative.empty()) continue;
-      std::optional<GrayImage> raster =
-          read_gray_png(sidecar_dir_for(target.source_path) + "/" + relative);
+      std::optional<GrayImage> raster = read_gray_png(raster_dir_for(photo_hash) + "/" + relative);
       if (raster.has_value()) rasters.emplace_back(component.id, std::move(*raster));
     }
   });
@@ -2989,7 +3000,7 @@ void Server::finish_generative(int64_t photo_id, const std::string& op_id, int64
   }
 
   const std::string relative = generative_result_relative_path(op_id);
-  const std::string path = sidecar_dir_for(photo.path) + "/" + relative;
+  const std::string path = raster_dir_for(photo.hash) + "/" + relative;
   try {
     write_file(path, result.png);
   } catch (const std::exception& error) {
@@ -3018,7 +3029,7 @@ void Server::load_generative_results(const PhotoState& photo) {
     if (!is_generative_op(op.name) || op.result.empty()) continue;
     try {
       const std::optional<Rgb8Image> image =
-          read_rgb_png(sidecar_dir_for(photo.path) + "/" + op.result);
+          read_rgb_png(raster_dir_for(photo.hash) + "/" + op.result);
       if (!image.has_value()) continue;
       renderer_.put_generative_result(photo.id, op.id, op.result, *image);
     } catch (const std::exception& error) {

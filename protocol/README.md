@@ -152,7 +152,7 @@ export never leaves a half-written image where a whole one is expected.
 `generative_fill` and `remove` are cached rasters, not formulas (PROMPT.md §3.5). Three
 engine-owned fields ride along on `Op`:
 
-- `result` — the PNG the last run produced, relative to `<photo>.latent.d/`.
+- `result` — the PNG the last run produced, relative to the photo's raster dir, `$XDG_DATA_HOME/latent/rasters/<sha256>/`.
 - `resultRect` — `[x0, y0, x1, y1]` of that PNG inside the content rect, 0..1. The crop's
   bounding box after it was snapped to a multiple of eight pixels.
 - `inputHash` — sha256 over the ops that produced the crop, the op's mask and the op's
