@@ -1,0 +1,47 @@
+{
+  "152": {
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "load crop.png"
+    },
+    "inputs": {
+      "image": "inputs/crop.png"
+    }
+  },
+  "101": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "4x-UltraSharp.pth"
+    }
+  },
+  "102": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": [
+        "101",
+        0
+      ],
+      "image": [
+        "152",
+        0
+      ]
+    }
+  },
+  "203": {
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "save composed final (image)"
+    },
+    "inputs": {
+      "images": [
+        "102",
+        0
+      ],
+      "filename_prefix": "outputs/latent-upscale"
+    }
+  },
+  "_meta": {
+    "schema": "compose/1",
+    "blueprint": "engine/workflows/upscale/blueprint.yaml"
+  }
+}

@@ -70,6 +70,9 @@
         "op.remove",
         "history.undo",
         "history.redo",
+        "history.list",
+        "history.jump",
+        "history.revertOp",
         "view.open",
         "view.close",
         "view.render",
@@ -86,12 +89,17 @@
         "catalog.thumbnails",
         "catalog.remove",
         "job.cancel",
+        "preview.prioritize",
         "merge.hdr",
         "merge.panorama",
         "merge.hdrPanorama",
+        "merge.starTrail",
         "merge.preview",
         "mask.preview",
         "mask.detect",
+        "depth.estimate",
+        "depth.status",
+        "depth.preview",
         "generative.run",
         "generative.status",
         "mask.stroke",
@@ -100,8 +108,10 @@
         "engine.log",
         "catalog.changed",
         "job.progress",
+        "photo.resolution",
         "python.output",
-        "python.finished"
+        "python.finished",
+        "depth.changed"
       ]
     },
     "NotificationName": {
@@ -112,8 +122,10 @@
         "engine.log",
         "catalog.changed",
         "job.progress",
+        "photo.resolution",
         "python.output",
-        "python.finished"
+        "python.finished",
+        "depth.changed"
       ]
     },
     "PhotoId": {
@@ -130,7 +142,7 @@
       "minLength": 1
     },
     "Op": {
-      "description": "One entry of the op-stack. `op` names a definition from ops.describe; `params` validates against that definition's schema.",
+      "description": "One entry of the op-stack. `op` names a definition from ops.describe; `params` validates against that definition's schema. The reserved name `\"group\"` is the exception: it has no definition and no params, and is a layer — one mask, one opacity, and the adjustments under them in `ops` (PROMPT.md 3.7).",
       "type": "object",
       "required": [
         "id",
@@ -150,6 +162,13 @@
           "type": "object",
           "additionalProperties": true
         },
+        "ops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Op"
+          },
+          "description": "Groups only, and always present on one (empty included): the adjustments that share this layer's mask, in the user's order. They render as one branch off the group's input and are blended back through the mask once, so a feathered edge is crossed once however many adjustments the layer holds. A child is a develop op — no geometry, no generative op, no nested group — and carries only `enabled`: `mask` and `opacity` belong to the group."
+        },
         "mask": {
           "$ref": "#/definitions/Mask"
         },
@@ -157,7 +176,7 @@
           "type": "number",
           "minimum": 0,
           "maximum": 100,
-          "description": "Layer opacity 0–100; absent means 100. The op's output is mixed into its input by opacity × mask."
+          "description": "Layer opacity 0–100; absent means 100. The op's output is mixed into its input by opacity × mask; on a group it scales the whole layer."
         },
         "enabled": {
           "type": "boolean"
@@ -176,6 +195,13 @@
           "maxItems": 4,
           "items": { "type": "number" },
           "description": "Generative ops only: `[x0, y0, x1, y1]` of `result` inside the content rect, normalised 0..1 — where the crop was cut from and where the composite puts it back. Engine-owned."
+        },
+        "ops": {
+          "description": "Groups only (`op` is `group`): the adjustments under this group's mask, in the user's order. They render as one branch off the group's input and are blended back through the mask once. A child carries `enabled` and its params; `mask` and `opacity` belong to the group, and a group is never a child of a group.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Op"
+          }
         },
         "stale": {
           "type": "boolean",
@@ -202,7 +228,7 @@
     },
     "MaskComponentKind": {
       "type": "string",
-      "description": "Mirrors Lightroom's Masking panel. AI kinds (subject, sky, background, objects, people, text) rasterise through mask.detect as a job; the rest rasterise inline from their params.",
+      "description": "Mirrors Lightroom's Masking panel, plus the two kinds Lightroom has no answer for. Detected kinds (subject, sky, background, objects, people, text, depth, trails) rasterise through mask.detect as a job; the rest rasterise inline from their params. `depth` is the odd one: its raster is the scene's depth map rather than a selection, and `params.range` bands it in the shader, so moving the range is a slider and not another model run. `trails` is the other: it runs a line detector rather than a model, so it needs nothing from the model store, and because its raster is derived from the frame and its seed stroke alone, the same component detects the aircraft trails in every photo it is copied to.",
       "enum": [
         "subject",
         "sky",
@@ -215,7 +241,8 @@
         "radial",
         "luminance",
         "color",
-        "depth"
+        "depth",
+        "trails"
       ]
     },
     "MaskComponent": {
@@ -243,7 +270,7 @@
         "params": {
           "type": "object",
           "additionalProperties": true,
-          "description": "Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched."
+          "description": "Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. trails: {seed:[[x,y]] — the stroke drawn along one aircraft trail, which is what the detector measures every other streak against; a path and not a box, because a trail is a line and a box around a diagonal one is mostly sky. At most 256 points, thinned by the client — plus sensitivity 0–100 (how much dimmer than the seed a streak may be), minLength 1–100 (shortest streak kept, as a percentage of the long edge) and grow 0–100 (margin drawn around each streak, as a percentage of a two-hundredth of the long edge — a trail is two or three pixels wide and the mask is meant to hug it). AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched."
         },
         "state": {
           "type": "string",
@@ -318,6 +345,70 @@
       "required": ["jobId"],
       "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
     },
+    "DepthEstimateParams": {
+      "type": "object",
+      "required": ["photoId"],
+      "additionalProperties": false,
+      "properties": { "photoId": { "$ref": "#/definitions/PhotoId" } },
+      "description": "Runs monocular depth estimation over the photo (PROMPT.md 3.8) and caches the map as `<photo>.latent.d/depth.png`. Ticks job.progress with kind \"depth\" and publishes depth.changed when it lands. The map belongs to the photo rather than to the stack — it is not edit state, it costs no undo step, and no slider can make it stale — so re-running it is always an explicit ask. A `relight` op renders nothing until one exists, and a `depth` mask component contributes nothing."
+    },
+    "DepthEstimateResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
+    "DepthStatusParams": {
+      "type": "object",
+      "required": ["photoId"],
+      "additionalProperties": false,
+      "properties": { "photoId": { "$ref": "#/definitions/PhotoId" } },
+      "description": "Whether the photo has a depth map right now. A UI asks this when it opens a photo; after that depth.changed says when one lands."
+    },
+    "DepthStatusResult": {
+      "type": "object",
+      "required": ["photoId", "ready"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "ready": { "type": "boolean" },
+        "model": {
+          "type": "string",
+          "description": "What produced the map. Absent when there is none."
+        }
+      }
+    },
+    "DepthPreviewParams": {
+      "type": "object",
+      "required": ["photoId"],
+      "additionalProperties": false,
+      "properties": { "photoId": { "$ref": "#/definitions/PhotoId" } },
+      "description": "Sends the photo's depth map as one LDPT binary frame on the calling socket (protocol/frames.md), then answers with its size. A photo with no map is a -32602 error."
+    },
+    "DepthPreviewResult": {
+      "type": "object",
+      "required": ["photoId", "width", "height"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "model": {
+          "type": "string",
+          "description": "What produced the map — the model's store name, or the stub."
+        }
+      },
+      "description": "The LDPT frame's own size. Unlike a mask preview this is image space and has no letterbox: 0..1 over the uncropped photo, so a client draws it through `imageTransform` like any other mask coordinate."
+    },
+    "DepthChangedParams": {
+      "type": "object",
+      "required": ["photoId", "ready"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "ready": { "type": "boolean" },
+        "model": { "type": "string" },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" }
+      },
+      "description": "Broadcast when a depth.estimate job lands. Not a stack change — nothing in the op-stack moved — but every relight op on the photo starts rendering, so a client re-renders its view."
+    },
     "GenerativeRunParams": {
       "type": "object",
       "required": ["photoId", "opId"],
@@ -326,7 +417,7 @@
         "photoId": { "$ref": "#/definitions/PhotoId" },
         "opId": { "$ref": "#/definitions/OpId" }
       },
-      "description": "Runs one generative op (PROMPT.md 3.5). The engine renders the ops below it, crops the op's mask bounding box plus padding to at most 1536 px on the long edge, hands the crop and the mask to the backend, and stores the result as `Op.result`. Ticks job.progress with kind \"generative\" and publishes stack.changed when it lands. Nothing else ever starts a run: an op whose `stale` is true keeps rendering its last result until this is called again. An op that is not generative, or has no mask, is a -32602 error."
+      "description": "Runs one generative op (PROMPT.md 3.5). The engine renders the ops below it, crops the op's mask bounding box plus padding to at most 1536 px on the long edge, hands the crop and the mask to the backend, and stores the result as `Op.result`. Ticks job.progress with kind \"generative\" and publishes stack.changed when it lands. Nothing else ever starts a run: an op whose `stale` is true keeps rendering its last result until this is called again. An op that is not generative is a -32602 error, and so is a masked generative op with no mask. `denoise` and `upscale` are the whole-frame ops (issues #51, #52): they take no mask, the whole frame goes to the backend, and `upscale`'s raster comes back larger than the photo — every coordinate on the wire stays normalised over the uncropped photo regardless."
     },
     "GenerativeRunResult": {
       "type": "object",
@@ -375,7 +466,7 @@
             "required": ["name", "task", "ready"],
             "properties": {
               "name": { "type": "string" },
-              "task": { "type": "string", "enum": ["fill", "remove"] },
+              "task": { "type": "string", "enum": ["fill", "remove", "denoise", "upscale"] },
               "label": { "type": "string" },
               "ready": {
                 "type": "boolean",
@@ -604,7 +695,7 @@
         },
         "maskable": {
           "type": "boolean",
-          "description": "The op accepts `mask` and `opacity` (every develop op). Geometry ops and generative ops that own their region are not maskable; absent = false."
+          "description": "The op accepts `mask` and `opacity` (every develop op). Geometry ops, generative ops that own their region, and the whole-frame `denoise`/`upscale` are not maskable; absent = false."
         },
         "panel": {
           "type": "string",
@@ -615,7 +706,9 @@
             "detail",
             "optics",
             "geometry",
-            "generative"
+            "generative",
+            "enhance",
+            "relight"
           ]
         },
         "label": {
@@ -630,6 +723,7 @@
       }
     },
     "Histogram": {
+      "description": "256 bins per channel over the 8-bit display pixels, plus the share of pixels at either end. On ViewRenderResult it is counted over the image rect of the frame that was just sent, letterbox excluded, so it belongs to those pixels; on StackGetResult it comes from whatever frame the view last drew, which is one render behind the edit that is being answered.",
       "type": "object",
       "required": [
         "bins",
@@ -784,6 +878,10 @@
           "type": "boolean",
           "description": "True when an existing .latent sidecar was read and its stack restored."
         },
+        "depthReady": {
+          "type": "boolean",
+          "description": "True when `<photo>.latent.d/depth.png` was there and is loaded. False means a relight op would render nothing until depth.estimate is called."
+        },
         "catalog": {
           "$ref": "#/definitions/CatalogPhoto"
         }
@@ -840,6 +938,14 @@
         },
         "histogram": {
           "$ref": "#/definitions/Histogram"
+        },
+        "historyIndex": {
+          "type": "integer",
+          "description": "Which snapshot of the undo stack this is, counting the photo's opening state as 0. `revision` is a change counter that advances on every write, transient drag ticks included; this counts undo steps, so a slider drag moves it by one however many frames it took."
+        },
+        "historyDepth": {
+          "type": "integer",
+          "description": "How many snapshots the undo stack holds, the opening state included, so `historyIndex + 1 == historyDepth` means nothing is left to redo."
         }
       }
     },
@@ -856,6 +962,11 @@
         },
         "stack": {
           "$ref": "#/definitions/Stack"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "What to call this step in the history list, when the caller knows something the diff cannot see: `Golden hour applied`, `Settings pasted`. Absent means the step is named after what it changed."
         }
       }
     },
@@ -883,7 +994,11 @@
         },
         "index": {
           "type": "integer",
-          "description": "Insert position; end of stack when omitted."
+          "description": "Insert position; end of stack — or of the group named by `parentId` — when omitted."
+        },
+        "parentId": {
+          "$ref": "#/definitions/OpId",
+          "description": "Add the op inside this group instead of at the top level, so it shares that layer's mask (PROMPT.md 3.7). The group's own `mask` and `opacity` win: both are ignored on the child. -32602 when the id is not a group, or when the op cannot sit in one."
         },
         "transient": {
           "type": "boolean",
@@ -899,7 +1014,23 @@
       }
     },
     "OpAddResult": {
-      "$ref": "#/definitions/StackGetResult"
+      "description": "The stack after the add, and the id the engine gave the new op \u2014 a caller that added into a group cannot find it by position.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/StackGetResult"
+        },
+        {
+          "type": "object",
+          "required": [
+            "opId"
+          ],
+          "properties": {
+            "opId": {
+              "$ref": "#/definitions/OpId"
+            }
+          }
+        }
+      ]
     },
     "OpUpdateParams": {
       "type": "object",
@@ -972,6 +1103,188 @@
       "$ref": "#/definitions/StackGetParams"
     },
     "HistoryRedoResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "HistoryChange": {
+      "description": "One parameter this step moved. `from` and `to` are the parameter's own values, so the UI formats them with the spec ops.describe gave the control. A value that is not a scalar - a curve's point list - is reported as a change with neither, since a list of points is nothing a history row can show.",
+      "type": "object",
+      "required": [
+        "param"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "param": {
+          "type": "string",
+          "minLength": 1
+        },
+        "from": {
+          "type": [
+            "number",
+            "string",
+            "boolean"
+          ]
+        },
+        "to": {
+          "type": [
+            "number",
+            "string",
+            "boolean"
+          ]
+        }
+      }
+    },
+    "HistoryEntry": {
+      "description": "One op inside a `batch` step, described exactly as a step of its own would be. `opId` is what history.revertOp takes to put this one op back to what it was before the step, leaving the rest of the batch where it is.",
+      "type": "object",
+      "required": [
+        "kind",
+        "op",
+        "opId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "add",
+            "remove",
+            "update",
+            "mask"
+          ]
+        },
+        "op": {
+          "type": "string"
+        },
+        "opId": {
+          "$ref": "#/definitions/OpId"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HistoryChange"
+          }
+        }
+      }
+    },
+    "HistoryStep": {
+      "description": "One snapshot of the undo stack, described by what it changed from the snapshot before it. Index 0 is the state the photo opened in, so its kind is `initial` and it has no changes. A drag is one step: the engine replaces the snapshot in place while it runs (StackGetResult.historyIndex).",
+      "type": "object",
+      "required": [
+        "index",
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "initial",
+            "add",
+            "remove",
+            "update",
+            "mask",
+            "reorder",
+            "batch"
+          ]
+        },
+        "op": {
+          "type": "string",
+          "description": "The op this step is about, by name: `exposure`, `group`. Absent on `initial`, `reorder` and `batch`, which are about the stack rather than one entry."
+        },
+        "label": {
+          "type": "string",
+          "description": "What the caller called this step (StackSetParams.label) - `Golden hour applied`. A UI shows it instead of the name it would otherwise derive, because the caller knew something the diff cannot see."
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HistoryEntry"
+          },
+          "description": "`batch` only: the ops this step touched, one each. A preset moves a dozen at once and naming the step after any one of them would be a lie, so they are listed - which is also what lets a UI unfold the row and revert one of them on its own (history.revertOp)."
+        },
+        "opId": {
+          "$ref": "#/definitions/OpId"
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HistoryChange"
+          }
+        }
+      }
+    },
+    "HistoryListParams": {
+      "$ref": "#/definitions/StackGetParams"
+    },
+    "HistoryListResult": {
+      "description": "The whole undo stack of one photo, described. One entry per snapshot, oldest first; `index` is where the cursor sits, the same number StackGetResult.historyIndex carries.",
+      "type": "object",
+      "required": [
+        "entries",
+        "index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HistoryStep"
+          }
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "HistoryJumpParams": {
+      "description": "Moves the undo cursor straight to one snapshot - clicking a row of the history list. Out of range is -32602; the step that is already current is accepted and changes nothing.",
+      "type": "object",
+      "required": [
+        "photoId",
+        "index"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "HistoryJumpResult": {
+      "$ref": "#/definitions/StackGetResult"
+    },
+    "HistoryRevertOpParams": {
+      "description": "Puts one op back to what it was before step `index`, and leaves everything else where it is - unfolding a preset's row and taking back the one adjustment that did not suit the photo. It is an edit, not a cursor move: a new step is committed on top, so the revert itself undoes. -32602 when the step or the op is not there, or when `index` is 0, which has no state before it.",
+      "type": "object",
+      "required": [
+        "photoId",
+        "index",
+        "opId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "photoId": {
+          "$ref": "#/definitions/PhotoId"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "opId": {
+          "$ref": "#/definitions/OpId"
+        }
+      }
+    },
+    "HistoryRevertOpResult": {
       "$ref": "#/definitions/StackGetResult"
     },
     "ViewOpenParams": {
@@ -1064,6 +1377,17 @@
             },
             "centerY": { "type": "number" }
           }
+        },
+        "insets": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What the client floats over the frame — its panels — in frame pixels. A fitted photo is fitted into the view minus these and centred in what is left, so no panel covers it; a zoomed one still fills the whole frame and runs on behind them. Sticky per view like `viewport`, and not edit state. Absent or all-zero is the old behaviour: fit the whole view.",
+          "properties": {
+            "left": { "type": "number", "minimum": 0 },
+            "top": { "type": "number", "minimum": 0 },
+            "right": { "type": "number", "minimum": 0 },
+            "bottom": { "type": "number", "minimum": 0 }
+          }
         }
       }
     },
@@ -1122,7 +1446,8 @@
         },
         "readbackMs": {
           "type": "number"
-        }
+        },
+        "histogram": { "$ref": "#/definitions/Histogram" }
       }
     },
     "PythonRunParams": {
@@ -1337,7 +1662,7 @@
     },
 
     "CatalogImportParams": {
-      "description": "Registers files (or every raw in the given directories) in the catalog and queues thumbnails. Returns immediately; progress arrives as job.progress notifications.",
+      "description": "Registers files (or every photo in the given directories) in the catalog, then queues thumbnails and previews. Returns immediately; progress arrives as job.progress notifications. Idempotent per path — a row that already exists has its metadata refreshed and keeps its rating, flag and importedAt — so calling this again over a folder is how a rescan is spelled. Every directory in `paths` also becomes a watched root: photos that land in it later are catalogued without being asked for, and the watch is remembered across restarts. Single files never start a watch.",
       "type": "object",
       "required": ["paths"],
       "additionalProperties": false,
@@ -1358,7 +1683,40 @@
         "thumbnailJobId": {
           "$ref": "#/definitions/JobId",
           "description": "The thumbnail job the import queues behind itself, reserved up front so a client can follow both from the one result. Its job.progress carries parentJobId = jobId. It always reports, even when the import found nothing or was cancelled — then with total 0. Absent from an engine that does not queue thumbnails."
+        },
+        "previewJobId": {
+          "$ref": "#/definitions/JobId",
+          "description": "The preview job: one full decode per imported photo, scaled into the engine's preview cache so opening any of them later costs a file read instead of a second of LibRaw. Runs on a thread of its own — the app stays usable — and reports job.progress of kind `previews` with parentJobId = jobId. Cancellable like any other job. Absent from an engine that does not prewarm."
         }
+      }
+    },
+    "PreviewPrioritizeParams": {
+      "description": "Photos to decode first. A running preview job takes these out of its queue before anything else, so the photo being looked at is ready ahead of the rest of the import. Naming a photo that is not queued, or that already has a preview, is not an error — the list is a hint. Each call replaces the previous one.",
+      "type": "object",
+      "required": ["photoIds"],
+      "properties": {
+        "photoIds": { "type": "array", "items": { "$ref": "#/definitions/PhotoId" } }
+      }
+    },
+    "PreviewPrioritizeResult": {
+      "type": "object",
+      "required": ["prioritized"],
+      "properties": {
+        "prioritized": {
+          "type": "integer",
+          "description": "How many ids the engine recorded. The hint is kept whether or not a preview job is running."
+        }
+      }
+    },
+    "PhotoResolutionParams": {
+      "description": "A photo the engine opened from its cached preview now has the full-resolution decode behind it. The frame the client holds came off the proxy, so the views of this photo need re-rendering to show the sharp one. Sent only for a photo that was opened from a preview, and only once.",
+      "type": "object",
+      "required": ["photoId", "width", "height", "full"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "width": { "type": "integer" },
+        "height": { "type": "integer" },
+        "full": { "type": "boolean" }
       }
     },
     "CatalogListParams": {
@@ -1409,8 +1767,15 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["path", "count"],
-            "properties": { "path": { "type": "string" }, "count": { "type": "integer" } }
+            "required": ["path", "count", "watched"],
+            "properties": {
+              "path": { "type": "string" },
+              "count": { "type": "integer" },
+              "watched": {
+                "type": "boolean",
+                "description": "A watched root covers this folder, so photos that land in it are catalogued on their own. False means the folder is only as fresh as its last catalog.import over it, which is what a rescan is."
+              }
+            }
           }
         }
       }
@@ -1555,7 +1920,16 @@
         },
         "kind": {
           "type": "string",
-          "enum": ["import", "thumbnails", "export", "mask", "merge", "generative"]
+          "enum": [
+            "import",
+            "thumbnails",
+            "previews",
+            "export",
+            "mask",
+            "merge",
+            "generative",
+            "depth"
+          ]
         },
         "done": { "type": "integer" },
         "total": { "type": "integer" },
@@ -1599,7 +1973,17 @@
       "enum": ["spherical", "cylindrical", "perspective"],
       "description": "Lightroom's Layout projection. `perspective` composes on a flat canvas; `cylindrical` and `spherical` pre-warp each frame around the focal length read from EXIF before composing."
     },
-    "MergeKind": { "type": "string", "enum": ["hdr", "panorama", "hdrPanorama"] },
+    "MergeKind": { "type": "string", "enum": ["hdr", "panorama", "hdrPanorama", "starTrail"] },
+    "MergeTrailBlend": {
+      "type": "string",
+      "enum": ["lighten", "average"],
+      "description": "`lighten` takes the brightest frame per pixel, which is what draws the trails. `average` takes the mean: one long exposure with sqrt(N) less noise and no trails."
+    },
+    "MergeTrailForeground": {
+      "type": "string",
+      "enum": ["lighten", "firstFrame"],
+      "description": "Where the still half of the picture comes from. `lighten` treats it like everything else, so it also collects every frame's hot pixels and any headlight that swept the ground. `firstFrame` keeps frame one there and lets a later frame in only where it is `foregroundThreshold` brighter."
+    },
     "MergeHdrParams": {
       "description": "Merges 2..7 exposure-bracketed photos into one linear 16-bit TIFF, registers it in the catalog and answers its photoId on the job's last job.progress. Tone is the user's job: no auto settings are applied.",
       "type": "object",
@@ -1676,6 +2060,51 @@
       "required": ["jobId"],
       "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
     },
+    "MergeStarTrailParams": {
+      "description": "Stacks 2..500 frames of one night sequence into one linear 16-bit TIFF and registers it in the catalog. The frames are folded in as they decode and dropped again, so the count is bounded by patience rather than by memory. No alignment and no deghosting: a star trail merge assumes a tripod, and registering the frames would straighten the trails.",
+      "type": "object",
+      "required": ["photoIds"],
+      "additionalProperties": false,
+      "properties": {
+        "photoIds": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/PhotoId" },
+          "description": "The sequence in shooting order. Order is what the comet decay and the gap fill read; a lighten stack alone does not care."
+        },
+        "blend": { "$ref": "#/definitions/MergeTrailBlend", "default": "lighten" },
+        "gapFill": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8,
+          "default": 0,
+          "description": "Synthetic sub-frames between each pair, bridging the camera's write time so a trail is a line instead of a dotted one. Each is the later frame pulled back a fraction of the inter-frame shift, which is measured by correlating the two frames' high-passed luminance: a frame whose landscape outweighs its stars correlates at zero shift and the fill does nothing, and near the celestial pole the motion is a rotation that a shift only approximates."
+        },
+        "foreground": { "$ref": "#/definitions/MergeTrailForeground", "default": "lighten" },
+        "foregroundThreshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 2,
+          "description": "How far above frame one a pixel has to be before `foreground: \"firstFrame\"` lets it through, as a percentage of a tenth of the white level. Ignored by the other foreground rule and by `average`."
+        },
+        "decay": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 0,
+          "description": "Comet tails. 0 weights every frame the same; 100 fades the oldest frame 6 stops down, so each trail brightens toward where the star ended up."
+        },
+        "outputPath": {
+          "type": "string",
+          "description": "Absolute path of the TIFF to write. Default: `<first source without extension>-Trails.tif` next to the sources."
+        }
+      }
+    },
+    "MergeStarTrailResult": {
+      "type": "object",
+      "required": ["jobId"],
+      "properties": { "jobId": { "$ref": "#/definitions/JobId" } }
+    },
     "MergePreviewParams": {
       "description": "The same merge at preview size, from the raws' embedded JPEGs instead of a full decode — seconds instead of minutes. Writes a PNG and names it in the job's last job.progress `result`; nothing is written to the catalog.",
       "type": "object",
@@ -1693,6 +2122,11 @@
         "projection": { "$ref": "#/definitions/MergeProjection", "default": "cylindrical" },
         "boundaryWarp": { "type": "integer", "minimum": 0, "maximum": 100, "default": 0 },
         "autoCrop": { "type": "boolean", "default": true },
+        "blend": { "$ref": "#/definitions/MergeTrailBlend", "default": "lighten" },
+        "gapFill": { "type": "integer", "minimum": 0, "maximum": 8, "default": 0 },
+        "foreground": { "$ref": "#/definitions/MergeTrailForeground", "default": "lighten" },
+        "foregroundThreshold": { "type": "number", "minimum": 0, "maximum": 100, "default": 2 },
+        "decay": { "type": "number", "minimum": 0, "maximum": 100, "default": 0 },
         "longEdge": { "type": "integer", "minimum": 128, "maximum": 4096, "default": 1024 }
       }
     },

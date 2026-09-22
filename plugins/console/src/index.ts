@@ -1,9 +1,11 @@
-// The Python console: a bottom pane that ships code to the engine's embedded interpreter
-// and prints what it answers. The UI holds no interpreter and no edit state — a script's
-// effect on the stack arrives as `stack.changed` with source `python`, like any other writer.
+// The Python console: a right-column tab that ships code to the engine's embedded
+// interpreter and prints what it answers. The UI holds no interpreter and no edit state —
+// a script's effect on the stack arrives as `stack.changed` with source `python`, like any
+// other writer.
 import type { Context, Plugin } from "@neoworks/extension-system";
 import Console from "./Console.svelte";
-import { clearsConsole, togglesConsole } from "./console";
+import { clearsConsole, CONSOLE_MODE, togglesConsole } from "./console";
+import ConsoleActions from "./ConsoleActions.svelte";
 import { ConsoleState } from "./state.svelte";
 
 declare module "@neoworks/extension-system" {
@@ -26,15 +28,21 @@ export const consolePlugin: Plugin.Object<void> = {
       ctx.panes.register({
         id: "console",
         title: "Python",
-        region: "bottom",
-        order: 20,
+        // A rail tab of its own rather than a bar across the bottom: a scrollback and a
+        // script box are worth a column, and the footer they used to sit in is the one
+        // strip every other pane has to share.
+        region: "right",
+        mode: CONSOLE_MODE,
+        order: 10,
+        headerActions: ConsoleActions,
         component: Console,
       }),
     );
 
-    // Ctrl+` toggles the pane and Ctrl+L clears it, both while the textarea has focus.
-    // One raw listener, with its inverse.
+    // Ctrl+` switches the rail to the console and back to wherever it was, and Ctrl+L
+    // clears it, both while the textarea has focus. One raw listener, with its inverse.
     ctx.effect(() => {
+      let previousMode = ctx.panes.mode;
       const onKeyDown = (event: KeyboardEvent): void => {
         if (clearsConsole(event)) {
           event.preventDefault();
@@ -43,7 +51,12 @@ export const consolePlugin: Plugin.Object<void> = {
         }
         if (!togglesConsole(event)) return;
         event.preventDefault();
-        state.toggle();
+        if (ctx.panes.mode === CONSOLE_MODE) {
+          ctx.panes.setMode(previousMode);
+          return;
+        }
+        previousMode = ctx.panes.mode;
+        ctx.panes.setMode(CONSOLE_MODE);
       };
       window.addEventListener("keydown", onKeyDown);
       return () => window.removeEventListener("keydown", onKeyDown);

@@ -17,6 +17,15 @@ include(cmake/embed_shaders.cmake)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBRAW REQUIRED IMPORTED_TARGET libraw)
+# libraw[openmp] parallelises demosaic, scale_colors and convert_to_rgb — 983 ms -> 258 ms
+# of a 24 MP decode on 16 cores. Its own .pc file does not mention the runtime, so the
+# static libraw_r.a arrives with undefined GOMP_* symbols and has to be told here.
+#
+# Not find_package(OpenMP): that asks whether *our* compiler can compile OpenMP, and this
+# build is clang without libomp installed. Nothing in engine/ has an omp pragma — only the
+# archive vcpkg built with gcc does, so all that is needed is gcc's runtime beside it.
+find_library(GOMP_LIBRARY NAMES gomp REQUIRED)
+target_link_libraries(PkgConfig::LIBRAW INTERFACE ${GOMP_LIBRARY})
 find_package(PNG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(unofficial-uwebsockets CONFIG REQUIRED)
@@ -24,6 +33,7 @@ find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libjpeg-turbo CONFIG REQUIRED)
 find_package(TIFF REQUIRED)
 find_package(lcms2 CONFIG REQUIRED)
+find_package(unofficial-libexif CONFIG REQUIRED)
 # AVIF is the one export format whose encoder (aom) is a long build. The engine ships
 # JPEG/TIFF16/PNG without it and says so at runtime (src/export/encoder.cpp).
 find_package(libavif CONFIG QUIET)

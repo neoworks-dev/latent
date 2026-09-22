@@ -25,6 +25,7 @@ const kindSuffixes: Record<MergeKind, string> = {
   hdr: "HDR",
   panorama: "Pano",
   hdrPanorama: "HDRPano",
+  starTrail: "Trails",
 };
 
 /** The schema's own photo-count bounds, refused here the way the engine refuses them. */
@@ -32,12 +33,14 @@ const photoCounts: Record<MergeKind, { min: number; max: number }> = {
   hdr: { min: 2, max: 7 },
   panorama: { min: 2, max: 12 },
   hdrPanorama: { min: 4, max: 48 },
+  starTrail: { min: 2, max: 500 },
 };
 
 const methodKinds: Record<string, MergeKind> = {
   "merge.hdr": "hdr",
   "merge.panorama": "panorama",
   "merge.hdrPanorama": "hdrPanorama",
+  "merge.starTrail": "starTrail",
 };
 
 /** Where the mock pretends it wrote the preview PNGs it serves. */
@@ -223,11 +226,13 @@ export class MockMerge {
 function kindLabel(kind: MergeKind): string {
   if (kind === "hdr") return "HDR";
   if (kind === "panorama") return "panorama";
+  if (kind === "starTrail") return "star trails";
   return "HDR panorama";
 }
 
 function kindOf(value: unknown): MergeKind {
   if (value === "hdr" || value === "panorama" || value === "hdrPanorama") return value;
+  if (value === "starTrail") return value;
   throw new Error(`merge.preview needs a kind, got ${String(value)}`);
 }
 
@@ -291,6 +296,11 @@ export function paintMerge(
     const height = Math.round(longEdge * 0.66);
     return { rgba: paintHdr(width, height, sources, options), width, height };
   }
+  if (kind === "starTrail") {
+    const width = longEdge;
+    const height = Math.round(longEdge * 0.66);
+    return { rgba: paintStarTrail(width, height, sources), width, height };
+  }
   const width = longEdge;
   const height = Math.round(longEdge * 0.3);
   return {
@@ -329,6 +339,42 @@ function paintHdr(
         blue = clamp(blue + blob * 0.4, 0, 1);
       }
       writePixel(rgba, (y * width + x) * 4, red, green, blue, 1);
+    }
+  }
+  return rgba;
+}
+
+/** Arcs around the pole over a dark sky, with a black ridge along the bottom: what a lighten
+ *  stack of a night sequence looks like, and nothing like the other two kinds. */
+function paintStarTrail(width: number, height: number, frames: number): Uint8Array {
+  const rgba = new Uint8Array(width * height * 4);
+  const pole = { u: 0.32, v: 0.24 };
+  // One arc per star, each swept by an angle that grows with the number of frames stacked.
+  const sweep = Math.min(1.2, 0.05 * frames);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const u = x / width;
+      const v = y / height;
+      const ridge = 0.78 + 0.06 * Math.sin(u * 7);
+      if (v > ridge) {
+        writePixel(rgba, (y * width + x) * 4, 0.03, 0.03, 0.04, 1);
+        continue;
+      }
+      const radius = Math.hypot(u - pole.u, (v - pole.v) * 0.8);
+      const angle = Math.atan2(v - pole.v, u - pole.u);
+      // A trail is lit where the star's own arc passes: a ring, cut to an arc by the sweep.
+      const ring = Math.abs(((radius * 46) % 1) - 0.5) < 0.06 ? 1 : 0;
+      const along = angle > -sweep && angle < sweep ? 1 : 0;
+      const trail = ring * along;
+      const sky = 0.06 + 0.05 * (1 - v);
+      writePixel(
+        rgba,
+        (y * width + x) * 4,
+        clamp(sky * 0.7 + trail * 0.85, 0, 1),
+        clamp(sky * 0.8 + trail * 0.8, 0, 1),
+        clamp(sky * 1.3 + trail * 0.7, 0, 1),
+        1,
+      );
     }
   }
   return rgba;

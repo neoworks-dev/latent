@@ -83,15 +83,26 @@ export interface ModelOption {
   label: string;
 }
 
+/** The graph an op asks the engine for, the same mapping generative_task() makes in C++. */
+export function taskOf(op: string): string {
+  if (op === "remove") return "remove";
+  if (op === "denoise") return "denoise";
+  if (op === "upscale") return "upscale";
+  return "fill";
+}
+
 export function modelOptions(status: GenerativeStatusResult | null, op: string): ModelOption[] {
   const options: ModelOption[] = [{ value: "", label: "Default for this graph" }];
   if (!status) return options;
-  const task = op === "remove" ? "remove" : "fill";
+  const task = taskOf(op);
   for (const workflow of status.workflows) {
     if (workflow.task !== task) continue;
     const label = workflow.label ?? workflow.name;
     options.push({ value: workflow.name, label: workflow.ready ? label : `${label} (no weights)` });
   }
+  // `models` is the install's checkpoints and diffusion models. An upscale graph loads an
+  // ESRGAN model instead, so naming one of these in it would name a file it cannot load.
+  if (task === "upscale") return options;
   for (const model of status.models ?? []) {
     options.push({ value: model, label: model });
   }

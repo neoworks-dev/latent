@@ -3,7 +3,7 @@
   // toggle buttons rather than a Select: they are modal, one is always on, and the wheel and
   // the bracket keys move the size while the pointer is over the image.
   import { kernelContext } from "@latent/contracts";
-  import { Slider, ValueField } from "@latent/plugin-panels";
+  import { BoxedSlider } from "@latent/plugin-panels";
   import { Button, Tooltip } from "@neoworks-dev/ui";
   import ArrowsOutCardinalIcon from "phosphor-svelte/lib/ArrowsOutCardinalIcon";
   import CircleDashedIcon from "phosphor-svelte/lib/CircleDashedIcon";
@@ -55,47 +55,32 @@
   </div>
 
   {#if masks.tool === "brush"}
-    <div class="flex items-center justify-between gap-2">
-      <span class="text-xs text-muted">Size</span>
-      <ValueField
-        value={sizePercent}
-        spec={brushSizeSpec}
-        range={{ min: 0.5, max: 80, step: 0.5 }}
-        label="Brush size"
-        onInput={(next) => (masks.brushSize = next / 100)}
-        onCommit={(next) => (masks.brushSize = next / 100)}
-      />
-    </div>
-    <Slider
+    <BoxedSlider
       value={sizePercent}
+      spec={brushSizeSpec}
       range={{ min: 0.5, max: 80, step: 0.5 }}
-      label="Brush size"
+      label="Size"
       onInput={(next) => (masks.brushSize = next / 100)}
       onCommit={(next) => (masks.brushSize = next / 100)}
       onReset={() => (masks.brushSize = 0.08)}
     />
-
-    <div class="flex items-center justify-between gap-2">
-      <span class="text-xs text-muted">Feather</span>
-      <ValueField
-        value={masks.brushFeather}
-        spec={featherSpec}
-        range={{ min: 0, max: 100, step: 1 }}
-        label="Brush feather"
-        onInput={(next) => (masks.brushFeather = next)}
-        onCommit={(next) => (masks.brushFeather = next)}
-      />
-    </div>
-    <div class="flex items-center justify-between gap-2">
-      <span class="text-xs text-muted">Flow</span>
-      <ValueField
-        value={masks.brushFlow}
-        spec={flowSpec}
-        range={{ min: 0, max: 100, step: 1 }}
-        label="Brush flow"
-        onInput={(next) => (masks.brushFlow = next)}
-        onCommit={(next) => (masks.brushFlow = next)}
-      />
-    </div>
+    <BoxedSlider
+      value={masks.brushFeather}
+      spec={featherSpec}
+      range={{ min: 0, max: 100, step: 1 }}
+      label="Feather"
+      onInput={(next) => (masks.brushFeather = next)}
+      onCommit={(next) => (masks.brushFeather = next)}
+      onReset={() => (masks.brushFeather = 50)}
+    />
+    <BoxedSlider
+      value={masks.brushFlow}
+      spec={flowSpec}
+      range={{ min: 0, max: 100, step: 1 }}
+      label="Flow"
+      onInput={(next) => (masks.brushFlow = next)}
+      onCommit={(next) => (masks.brushFlow = next)}
+      onReset={() => (masks.brushFlow = 100)}
+    />
   {/if}
 </div>

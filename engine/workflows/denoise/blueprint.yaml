@@ -1,0 +1,10 @@
+output_prefix: outputs/latent-denoise
+pipeline:
+  - fragment: denoise-sdxl
+    alias: denoise
+    inputs:
+      vaeencode_pixels: inputs/crop.png
+    params:
+      ksampler_cfg: 3.0
+      ksampler_denoise: 0.3
+      ksampler_seed: 0

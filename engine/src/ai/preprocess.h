@@ -43,6 +43,10 @@ inline constexpr std::array<float, 3> kImageNetStd{0.229F, 0.224F, 0.225F};
 // are clamped, so a caller can hand over raw probabilities.
 GrayImage plane_to_gray(std::span<const float> plane, uint32_t width, uint32_t height);
 
+// The same at 16 bits, for the depth map: a mask is coverage and tolerates 1/255, a depth
+// map is differentiated and compared against itself and does not (ai/depth.h).
+Gray16Image plane_to_gray16(std::span<const float> plane, uint32_t width, uint32_t height);
+
 float sigmoid(float value);
 
 }  // namespace latent

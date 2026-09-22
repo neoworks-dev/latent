@@ -30,12 +30,21 @@ uint32_t round_extent(double value) {
 // Where a rect of `extent` pixels sits on one axis of a `view` long view. Smaller than the
 // view it is centred, larger it is dragged to `centre` and clamped so the view never shows
 // anything but image on that axis.
-int32_t place(double view, double extent, double centre, bool fit) {
+int32_t place(double view, double extent, double centre, bool fit, double inset_start = 0,
+              double inset_end = 0) {
+  // The client's floating panels take the edges of the view; what is left is the hole the
+  // photo belongs in. Everything below is measured against that hole rather than the view,
+  // so a zoomed rect is dragged until *it* is filled and may run on behind the panels. With
+  // no insets the hole is the view and this is what it always was.
+  const double inner = std::max(1.0, view - inset_start - inset_end);
   // Floor, not round: the letterbox has always put the odd pixel on the right, and a
   // client that computes the same rect from the photo's size has to land on it exactly.
-  if (fit || extent <= view) return static_cast<int32_t>(std::floor((view - extent) / 2.0));
-  const double wanted = (view / 2.0) - (centre * extent);
-  return static_cast<int32_t>(std::lround(std::clamp(wanted, view - extent, 0.0)));
+  if (fit || extent <= inner) {
+    return static_cast<int32_t>(std::floor(inset_start + (inner - extent) / 2.0));
+  }
+  const double wanted = inset_start + (inner / 2.0) - (centre * extent);
+  return static_cast<int32_t>(
+      std::lround(std::clamp(wanted, inset_start + inner - extent, inset_start)));
 }
 
 }  // namespace
@@ -218,12 +227,19 @@ GeometryMap geometry_map(const GeometryParams& params, uint32_t photo_width, uin
   // a zoomed view never shows a letterbox bar it could fill with photo.
   const double view_w = std::max(1U, view_width);
   const double view_h = std::max(1U, view_height);
+  // The box the photo is fitted into: the view minus whatever the client says floats over
+  // it. Zoom multiplies this fit, so the first notch grows the picture that is on screen
+  // instead of jumping to the size it would have had without the panels.
+  const double inner_w = std::max(
+      1.0, view_w - std::max(0.0, viewport.inset_left) - std::max(0.0, viewport.inset_right));
+  const double inner_h = std::max(
+      1.0, view_h - std::max(0.0, viewport.inset_top) - std::max(0.0, viewport.inset_bottom));
   const double content_aspect = (work_width * crop_width) / (work_height * crop_height);
-  double fit_width = view_w;
-  double fit_height = std::max(1.0, view_w / content_aspect);
-  if (fit_height > view_h) {
-    fit_height = view_h;
-    fit_width = std::max(1.0, view_h * content_aspect);
+  double fit_width = inner_w;
+  double fit_height = std::max(1.0, inner_w / content_aspect);
+  if (fit_height > inner_h) {
+    fit_height = inner_h;
+    fit_width = std::max(1.0, inner_h * content_aspect);
   }
   const double zoom = std::clamp(viewport.scale, kMinViewportScale, kMaxViewportScale);
   map.content.width = round_extent(fit_width * zoom);
@@ -233,8 +249,10 @@ GeometryMap geometry_map(const GeometryParams& params, uint32_t photo_width, uin
   if (!viewport.fit) {
     centre = mat3_apply(mat3_inverse(map.content_to_image), viewport.center_x, viewport.center_y);
   }
-  map.content.x = place(view_w, map.content.width, centre[0], viewport.fit);
-  map.content.y = place(view_h, map.content.height, centre[1], viewport.fit);
+  map.content.x = place(view_w, map.content.width, centre[0], viewport.fit,
+                        std::max(0.0, viewport.inset_left), std::max(0.0, viewport.inset_right));
+  map.content.y = place(view_h, map.content.height, centre[1], viewport.fit,
+                        std::max(0.0, viewport.inset_top), std::max(0.0, viewport.inset_bottom));
 
   const Mat3 view_to_content = {1.0 / map.content.width,
                                 0,

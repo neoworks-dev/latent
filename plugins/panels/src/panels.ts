@@ -13,6 +13,7 @@ export const sectionOrder = [
   "Optics",
   "Geometry",
   "Generative",
+  "Enhance",
 ] as const;
 
 /** Headings for an engine that predates `section` and only reports the `panel` key. */
@@ -24,7 +25,18 @@ const legacyLabels: Record<string, string> = {
   optics: "Optics",
   geometry: "Geometry",
   generative: "Generative",
+  enhance: "Enhance",
 };
+
+/**
+ * The section a generated pane draws: the part of `edit:<section>` after the colon. The
+ * Edit column registers one pane per described section so each is its own draggable card.
+ */
+export function sectionOf(paneId: string): string {
+  const colon = paneId.indexOf(":");
+  if (colon < 0) return "";
+  return paneId.slice(colon + 1);
+}
 
 export interface PanelGroup {
   /** The heading lowercased: the fold key and the `data-section` hook. */
@@ -384,8 +396,17 @@ export interface Modifiers {
 }
 
 /**
- * Scrubbing the readout: one step per pixel, ten with Shift, a quarter with Ctrl/Alt.
- * Anchored to the value the drag started from so a round trip lands where it began.
+ * How far the pointer travels to sweep a slider end to end at plain gain. Fixed in pixels
+ * rather than in steps, so every slider scrubs at the same speed whatever its range is —
+ * a step per pixel made Contrast (−100…100, step 1) cross its whole range in 200 px, which
+ * is a twitch, while Exposure's 0.01 step needed 1000 px for the same sweep.
+ */
+const SCRUB_PIXELS_PER_RANGE = 800;
+
+/**
+ * Scrubbing the readout: a sweep of the range per {@link SCRUB_PIXELS_PER_RANGE} pixels,
+ * ten times that with Shift, a quarter of it with Ctrl/Alt. Anchored to the value the drag
+ * started from so a round trip lands where it began.
  */
 export function scrubbedValue(
   start: number,
@@ -393,7 +414,8 @@ export function scrubbedValue(
   range: SliderRange,
   modifiers: Modifiers,
 ): number {
-  return quantize(start + deltaX * range.step * scrubGain(modifiers), range);
+  const perPixel = (range.max - range.min) / SCRUB_PIXELS_PER_RANGE;
+  return quantize(start + deltaX * perPixel * scrubGain(modifiers), range);
 }
 
 function scrubGain(modifiers: Modifiers): number {
@@ -434,6 +456,21 @@ export function trackTint(spec: OpParamSpec): string | null {
 }
 
 /**
+ * One entry by id, wherever it is. A layer's adjustments are one level down (protocol
+ * Op.ops) and are exactly what a control aimed at a mask reads and writes, so a lookup that
+ * only walked the top level would show every masked slider at its default.
+ */
+export function opEntry(stack: Op[], opId: string): Op | undefined {
+  const top = stack.find((candidate) => candidate.id === opId);
+  if (top) return top;
+  for (const entry of stack) {
+    const child = entry.ops?.find((candidate) => candidate.id === opId);
+    if (child) return child;
+  }
+  return undefined;
+}
+
+/**
  * The value the control shows: the engine's stack when the op is in it, else the default.
  * `opId` picks one entry by id — the same op can be in the stack twice, once masked.
  */
@@ -443,9 +480,7 @@ export function paramValue(
   spec: OpParamSpec,
   opId?: string | null,
 ): unknown {
-  const entry = opId
-    ? stack.find((candidate) => candidate.id === opId)
-    : stack.find((candidate) => candidate.op === op.name);
+  const entry = opId ? opEntry(stack, opId) : stack.find((candidate) => candidate.op === op.name);
   if (!entry) return spec.default;
   const value = entry.params[spec.name];
   if (value === undefined) return spec.default;
@@ -463,13 +498,59 @@ function isDefaultValue(value: unknown, spec: OpParamSpec): boolean {
   return Math.abs(value - spec.default) < sliderRange(spec).step / 2;
 }
 
-export function opEdited(stack: Op[], op: OpDefinition): boolean {
-  return op.params.some((spec) => !isDefaultValue(paramValue(stack, op, spec), spec));
+/**
+ * The stack entry the Edit column reads and writes while a mask is selected: that layer's
+ * child with this op name (`ViewerService.maskTarget`). Null while the layer does not hold
+ * the adjustment yet — the write that adds it goes through `setParam`, which the viewer
+ * routes into the layer.
+ */
+export function layerEntryId(stack: Op[], targetId: string | null, name: string): string | null {
+  if (!targetId) return null;
+  const layer = stack.find((entry) => entry.id === targetId);
+  return layer?.ops?.find((child) => child.op === name)?.id ?? null;
+}
+
+/**
+ * What a control shows. `opId` is the entry it was aimed at; without one it is the photo's
+ * own copy of the op — unless a mask is selected, in which case the control belongs to that
+ * mask and a mask that does not hold the adjustment is at the described default. Showing the
+ * photo's value there would be a lie: the next drag writes into the mask, not into it.
+ */
+export function controlValue(
+  stack: Op[],
+  op: OpDefinition,
+  spec: OpParamSpec,
+  opId: string | null,
+  targetId: string | null,
+): unknown {
+  if (opId) return paramValue(stack, op, spec, opId);
+  if (targetId !== null) return spec.default;
+  return paramValue(stack, op, spec);
+}
+
+/** "Mask 2" — how the Edit column names the layer it is writing into. */
+export function maskTargetLabel(stack: Op[], targetId: string | null): string | null {
+  if (!targetId) return null;
+  const index = stack.filter((entry) => entry.op === "group").findIndex((op) => op.id === targetId);
+  if (index < 0) return null;
+  return `Mask ${index + 1}`;
+}
+
+export function opEdited(stack: Op[], op: OpDefinition, targetId: string | null = null): boolean {
+  const entryId = layerEntryId(stack, targetId, op.name);
+  // A mask that does not hold this adjustment is at the defaults, whatever the photo's own
+  // copy of it says.
+  if (targetId !== null && entryId === null) return false;
+  return op.params.some((spec) => !isDefaultValue(paramValue(stack, op, spec, entryId), spec));
 }
 
 /** The section's "edited" dot: does any op in this section differ from its defaults? */
-export function groupEdited(stack: Op[], group: PanelGroup): boolean {
-  return group.ops.some((op) => opEdited(stack, op));
+export function groupEdited(
+  stack: Op[],
+  group: PanelGroup,
+  targetId: string | null = null,
+): boolean {
+  return group.ops.some((op) => opEdited(stack, op, targetId));
 }
 
 /** Every parameter of an op back at its described default — one write per op for a reset. */
@@ -477,25 +558,44 @@ export function defaultParams(op: OpDefinition): Record<string, unknown> {
   return Object.fromEntries(op.params.map((spec) => [spec.name, spec.default]));
 }
 
-/** What the Edit column says about an op that is also a layer: a mask, an opacity, or both. */
+/** What the Edit column says about an op that is also in a mask, or is a layer of its own. */
 export interface LayerBadge {
+  /** The layer to open: the group holding this adjustment, or the op itself. */
   opId: string;
+  /** How many layers hold this adjustment; 0 for an op that is only a layer by opacity. */
+  layers: number;
   components: number;
   opacity: number;
 }
 
 /**
  * The badge for one op of the generated column, or null when the op is an ordinary global
- * adjustment. Opacity only shows when it is below 100, the way Lightroom only shows an
+ * adjustment. An adjustment that is also inside a mask says so and opens that mask, because
+ * the Edit column's copy of it is the *global* one: the two are different stack entries
+ * (PROMPT.md 3.7). Opacity only shows when it is below 100, the way Lightroom only shows an
  * amount that is not full.
  */
 export function layerBadge(stack: Op[], op: OpDefinition): LayerBadge | null {
+  const holders = stack.filter((candidate) =>
+    (candidate.ops ?? []).some((child) => child.op === op.name),
+  );
+  const first = holders[0];
+  if (first) {
+    return {
+      opId: first.id,
+      layers: holders.length,
+      components: first.mask?.components.length ?? 0,
+      opacity: first.opacity ?? 100,
+    };
+  }
+  // No layer holds it: the op itself may still carry an opacity, and a generative op
+  // carries the mask of the region it painted.
   const entry = stack.find((candidate) => candidate.op === op.name);
   if (!entry) return null;
   const components = entry.mask?.components.length ?? 0;
   const opacity = entry.opacity ?? 100;
   if (components === 0 && opacity >= 100) return null;
-  return { opId: entry.id, components, opacity };
+  return { opId: entry.id, layers: 0, components, opacity };
 }
 
 export interface HistoryKeyEvent {

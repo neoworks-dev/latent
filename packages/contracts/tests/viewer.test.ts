@@ -4,13 +4,16 @@ import { describe, expect, test } from "bun:test";
 import {
   applyImageTransform,
   containRect,
+  contentRectFor,
   FIT_VIEWPORT,
+  frameTransform,
   IDENTITY_IMAGE_TRANSFORM,
   type ImageTransform,
   imagePoint,
   invertImageTransform,
   oneToOneScale,
   panViewport,
+  transformImageMatrix,
   type ViewportFrame,
   zoomLabel,
   zoomViewport,
@@ -31,6 +34,7 @@ function frame(
   fitted: ImageTransform,
   scale = 1,
   centre: [number, number] = [0.5, 0.5],
+  insets = { left: 0, top: 0, right: 0, bottom: 0 },
 ): ViewportFrame {
   const originX = 900 / 2 - fitted[0] * scale * centre[0];
   const originY = 600 / 2 - fitted[4] * scale * centre[1];
@@ -56,6 +60,7 @@ function frame(
     frameHeight: 600,
     transform,
     scale,
+    insets,
   };
 }
 
@@ -178,6 +183,57 @@ describe("the viewport", () => {
   });
 });
 
+describe("the frame the client shows before the engine answers", () => {
+  const FITTED_VIEWPORT = FIT_VIEWPORT;
+
+  test("a frame's own viewport predicts the rect the engine already sent", () => {
+    expect(contentRectFor(frame(FITTED), FITTED_VIEWPORT)).toEqual(frame(FITTED).contentRect);
+    const zoomed = { scale: 2, centerX: 0.25, centerY: 0.75, fit: false };
+    const at2 = frame(FITTED, 2, [0.25, 0.75]);
+    expect(contentRectFor(at2, zoomed)).toEqual(at2.contentRect);
+  });
+
+  test("a zoom predicts the rect and the matrix the engine will answer with", () => {
+    const fitted = frame(FITTED);
+    const viewport = zoomViewport(fitted, 2, 450, 300);
+    const predicted = contentRectFor(fitted, viewport);
+    const engine = frame(FITTED, 2, [viewport.centerX, viewport.centerY]);
+    expect(predicted).toEqual(engine.contentRect);
+    // And the matrix a tool draws through follows the same move, so a mask overlay stays on
+    // the photo while the gesture is still only on the client.
+    const moved = transformImageMatrix(
+      frameTransform(fitted, FITTED_VIEWPORT, viewport),
+      fitted.transform,
+    );
+    for (const [index, value] of engine.transform.entries()) {
+      expect(moved[index]).toBeCloseTo(value, 6);
+    }
+  });
+
+  test("the transform is the identity while the viewport has not moved", () => {
+    expect(frameTransform(frame(FITTED), FITTED_VIEWPORT, FITTED_VIEWPORT)).toEqual({
+      scale: 1,
+      x: 0,
+      y: 0,
+    });
+  });
+
+  test("a pan moves the picture and leaves its size alone", () => {
+    const zoomed = frame(FITTED, 2, [0.5, 0.5]);
+    const current = { scale: 2, centerX: 0.5, centerY: 0.5, fit: false };
+    const moved = frameTransform(zoomed, current, panViewport(zoomed, current, -40, 0));
+    expect(moved.scale).toBe(1);
+    expect(moved.x).toBeCloseTo(-40, 0);
+    expect(moved.y).toBe(0);
+  });
+
+  test("a picture the panels leave room for is centred in the hole, not in the frame", () => {
+    const panel = { left: 0, top: 0, right: 300, bottom: 0 };
+    const [x, , width] = contentRectFor(frame(FITTED, 1, [0.5, 0.5], panel), FIT_VIEWPORT);
+    expect(x + width / 2).toBe(300);
+  });
+});
+
 describe("the letterbox", () => {
   test("contain still answers the frame's own rect", () => {
     expect(containRect(1000, 500, 400, 400)).toEqual({ x: 0, y: 100, width: 400, height: 200 });
@@ -189,5 +245,49 @@ describe("the letterbox", () => {
     expect(imagePoint(110, 70, rect)).toEqual({ x: 0.5, y: 0.5 });
     // Outside the image is outside 0..1: a drag that leaves the photo is still a direction.
     expect(imagePoint(0, 0, rect).x).toBeLessThan(0);
+  });
+});
+
+describe("the panels the client floats over the frame", () => {
+  // A 300 px column down the right of a 900 px frame: the hole the photo is placed in is
+  // the left 600 px, so its middle is x = 300 and not x = 450.
+  const PANEL = { left: 0, top: 0, right: 300, bottom: 0 };
+
+  /**
+   * What the engine answers once the insets are in play: a 700×467 picture placed in the
+   * 600 px hole, so it is wider than the hole and 100 px of it run behind the panel.
+   */
+  function overhanging(): ViewportFrame {
+    const width = 700;
+    const height = 467;
+    const originX = -50;
+    const originY = (600 - height) / 2;
+    const transform: ImageTransform = [width, 0, originX, 0, height, originY, 0, 0, 1];
+    return {
+      contentRect: [originX, originY, width, height],
+      frameWidth: 900,
+      frameHeight: 600,
+      transform,
+      scale: width / 600,
+      insets: PANEL,
+    };
+  }
+
+  test("a picture wider than the hole pans, even while it still fits the window", () => {
+    const zoomed = overhanging();
+    const current = { scale: zoomed.scale, centerX: 0.5, centerY: 0.5, fit: false };
+    const panned = panViewport(zoomed, current, -40, 0);
+    // Dragged left, so more of the photo's right half is in the hole.
+    expect(panned.centerX).toBeGreaterThan(0.5);
+    // And it stops once the hole is full, not once the window is.
+    const hard = panViewport(zoomed, current, -5000, 0);
+    expect(hard.centerX).toBeCloseTo(1 - 600 / (2 * 700), 3);
+  });
+
+  test("a zoom keeps the point under the pointer where it is, measured in the hole", () => {
+    // The anchor is the hole's own middle, so the image point under it becomes the centre.
+    const zoomed = zoomViewport(frame(FITTED, 1, [0.5, 0.5], PANEL), 2, 300, 300);
+    expect(zoomed.centerX).toBeCloseTo(1 / 3, 3);
+    expect(zoomed.fit).toBe(false);
   });
 });

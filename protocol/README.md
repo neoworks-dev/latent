@@ -45,13 +45,15 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `photo.close` | `photoId` | — | |
 | `stack.get` | `photoId` | stack + `revision` + undo/redo flags + `histogram?` | Shape reused by every stack write |
 | `stack.set` | `photoId`, `stack` | as `stack.get` | |
-| `op.add` | `photoId`, `op`, `params?`, `index?`, `transient?`, `mask?`, `opacity?` | as `stack.get` | `transient` = first tick of a drag: no snapshot, no sidecar; the drag undoes as one step |
-| `op.update` | `photoId`, `opId`, `params`, `enabled?`, `transient?`, `mask?`, `opacity?` | as `stack.get` | `transient` = mid-drag: no snapshot, no sidecar write. `mask` is a full replacement, `null` clears; a mask on a non-maskable op is dropped with an `engine.log` warning |
-| `op.remove` | `photoId`, `opId` | as `stack.get` | |
+| `op.add` | `photoId`, `op`, `params?`, `index?`, `parentId?`, `transient?`, `mask?`, `opacity?` | as `stack.get`, plus `opId` | `transient` = first tick of a drag: no snapshot, no sidecar; the drag undoes as one step. `op: "group"` adds a layer; `parentId` puts the op under that layer's mask, where its own `mask` and `opacity` are ignored |
+| `op.update` | `photoId`, `opId`, `params`, `enabled?`, `transient?`, `mask?`, `opacity?` | as `stack.get` | `transient` = mid-drag: no snapshot, no sidecar write. `mask` is a full replacement, `null` clears; a mask on a non-maskable op, or a `mask`/`opacity` on an op inside a group, is dropped with an `engine.log` warning. `opId` reaches a group's child as readily as a top-level entry |
+| `op.remove` | `photoId`, `opId` | as `stack.get` | A group goes with the adjustments under it |
 | `history.undo` / `history.redo` | `photoId` | as `stack.get` | Cursor over snapshots, never a pop |
+| `history.list` | `photoId` | `entries[]`, `index` | One row per snapshot, described by its diff from the one before it: `kind`, `op?`, `opId?`, `changes[]` of `{param, from?, to?}`. Values are the parameters' own — the UI formats them with `ops.describe`'s spec — and a non-scalar (a curve) reports a change with neither side |
+| `history.jump` | `photoId`, `index` | as `stack.get` | The cursor straight to one snapshot; out of range is -32602. A drag in flight is rolled back first |
 | `view.open` | `photoId`, `width`, `height` | `viewId` | One canvas, one proxy size |
 | `view.close` | `viewId` | — | |
-| `view.render` | `viewId`, `width?`, `height?`, `geometry?`, `viewport?` | `seq`, size, `contentRect?`, `imageTransform?`, `viewport?`, `renderMs`, `readbackMs`, `revision` | Sends one `LFRM` frame first. `geometry: "full"` renders the uncropped image for the crop tool; `viewport` is zoom and pan |
+| `view.render` | `viewId`, `width?`, `height?`, `geometry?`, `viewport?` | `seq`, size, `contentRect?`, `imageTransform?`, `viewport?`, `renderMs`, `readbackMs`, `revision`, `histogram?` | Sends one `LFRM` frame first. `geometry: "full"` renders the uncropped image for the crop tool; `viewport` is zoom and pan |
 | `python.run` | `code`, `photoId?`, `timeoutMs?` | `ok`, `stdout`, `stderr`, `durationMs`, `value?`, `runId?` | `timeoutMs` default 30000 |
 | `catalog.import` | `paths`, `recursive?` | `jobId`, `thumbnailJobId?` | `recursive` default **true**; progress via `job.progress` |
 | `catalog.list` | filters below | `photos`, `total` | |
@@ -74,6 +76,13 @@ contract: a method missing from either the schema's `MethodName` enum or
 | `mask.stroke` | `photoId`, `opId`, `componentId`, `points`, `erase?`, `size?`, `flow?`, `transient?` | as `stack.get` | Appends a brush segment; the engine owns strokes and rasters. One pointer-down = transient segments + one committed call = one undo step |
 
 ### Mask coordinates
+
+A **layer** is an `Op` named `group`: a mask, an `opacity`, and the adjustments that share
+them in `ops` (PROMPT.md §3.7). It has no params and no definition in `ops.describe`. Its
+children are develop ops — never geometry, never a generative op, never another group — and
+carry `enabled` alone. The layer renders as one branch blended back through the mask once, so
+`mask.preview { opId }` for a layer is the mask every adjustment under it shares. A generative
+op keeps its own `mask`: that region is what a backend painted, not a layer.
 
 Every mask component's coordinates — a gradient's two points, a radial's centre and radii, a
 brush's stroke points and its diameter, an object's box and points — are normalised **0..1
@@ -181,6 +190,12 @@ without changing the frame, and a zoomed viewport makes it *larger* than the fra
 negative origin. Read it as signed numbers. It is optional and additive: a client talking
 to an engine that does not send it falls back to fitting the frame's own aspect into its
 canvas, which is what the rect says whenever nothing is cropped.
+
+`histogram` is counted over the image rect of the frame that just went out — 256 bins per
+channel of the 8-bit display pixels, plus the share of them at either end. `stack.get`
+answers with the same shape, but from whatever frame the view drew last: a stack write is
+answered before the next render, so that copy is one render behind the edit it reports,
+and a panel that wants the histogram of the pixels on screen reads this one.
 
 `imageTransform` is the geometry stage as nine numbers: **image-normalised to view pixel**,
 a row-major 3x3 applied to `(x, y, 1)` with a homogeneous divide.

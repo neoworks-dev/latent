@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <ctime>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <stdexcept>
@@ -13,7 +14,7 @@ namespace latent {
 
 namespace {
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 
 constexpr const char* kSchema = R"(
 CREATE TABLE IF NOT EXISTS photos (
@@ -46,6 +47,10 @@ CREATE TABLE IF NOT EXISTS collection_photos (
   collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
   photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
   PRIMARY KEY (collection_id, photo_id)
+);
+CREATE TABLE IF NOT EXISTS watched_folders (
+  path TEXT PRIMARY KEY,
+  recursive INTEGER NOT NULL DEFAULT 1
 );
 )";
 
@@ -334,10 +339,51 @@ CatalogPage Catalog::list(const CatalogQuery& query) {
 
 std::vector<CatalogFolder> Catalog::folders() {
   const std::lock_guard<std::mutex> lock(mutex_);
+  Statement roots(db_, "SELECT path, recursive FROM watched_folders");
+  std::vector<WatchedFolder> watched;
+  while (roots.step()) {
+    watched.push_back({roots.text(0), roots.integer(1) != 0});
+  }
+
   Statement select(db_, "SELECT folder, COUNT(*) FROM photos GROUP BY folder ORDER BY folder");
   std::vector<CatalogFolder> out;
   while (select.step()) {
-    out.push_back({select.text(0), select.integer(1)});
+    CatalogFolder folder{select.text(0), select.integer(1), false};
+    folder.watched = std::any_of(watched.begin(), watched.end(), [&folder](const WatchedFolder& r) {
+      if (folder.path == r.path) return true;
+      return r.recursive && folder.path.starts_with(r.path + "/");
+    });
+    out.push_back(std::move(folder));
+  }
+  return out;
+}
+
+void Catalog::watch_folder(const std::string& path, bool recursive) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  // A folder imported recursively once stays recursive: the narrower import did not ask
+  // for the subtree to stop being watched.
+  Statement insert(db_,
+                   "INSERT INTO watched_folders (path, recursive) VALUES (?,?) "
+                   "ON CONFLICT(path) DO UPDATE SET "
+                   "recursive = MAX(excluded.recursive, watched_folders.recursive)");
+  insert.bind(1, path);
+  insert.bind(2, static_cast<int64_t>(recursive ? 1 : 0));
+  insert.run();
+}
+
+void Catalog::unwatch_folder(const std::string& path) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Statement remove(db_, "DELETE FROM watched_folders WHERE path = ?");
+  remove.bind(1, path);
+  remove.run();
+}
+
+std::vector<WatchedFolder> Catalog::watched_folders() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Statement select(db_, "SELECT path, recursive FROM watched_folders ORDER BY path");
+  std::vector<WatchedFolder> out;
+  while (select.step()) {
+    out.push_back({select.text(0), select.integer(1) != 0});
   }
   return out;
 }

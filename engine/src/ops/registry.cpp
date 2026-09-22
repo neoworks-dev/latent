@@ -145,8 +145,8 @@ OpDefinition define(std::string name, std::string panel, std::string section, in
 //
 //   Geometry (crop/rotate/flip/transform/lens distortion, folded into the proxy's
 //   sampling pass) → Optics (CA, defringe) → Noise reduction → Tone (WB, the Light
-//   sliders, the curve) → Colour (mixer, vibrance, saturation, grading) → Effects
-//   (texture, clarity, dehaze, vignette) → Sharpening → Grain.
+//   sliders, the curve) → Colour (mixer, vibrance, saturation, grading) → Relight →
+//   Effects (texture, clarity, dehaze, vignette) → Sharpening → Grain.
 //
 // Sharpening and grain are last because everything before them changes the detail they
 // work on; noise reduction is early for the same reason.
@@ -239,12 +239,64 @@ std::vector<OpDefinition> build_definitions() {
   OpParamSpec seed = with_default(slider("seed", "Seed", 0, 999999, 1, ""), 0);
   seed.type = ParamType::Integer;
   const OpParamSpec model = text_field("model", "Model", "");
-  const OpParamSpec backend = choice("backend", "Backend", {"auto", "comfy", "stub"});
+  // `sky` is not a model: it interpolates the surrounding sky across the mask, which is all
+  // an aircraft trail in a night frame needs and needs nothing installed (PROMPT.md 3.9).
+  const OpParamSpec backend = choice("backend", "Backend", {"auto", "comfy", "sky", "stub"});
   definitions.push_back(define("generative_fill", "generative", "Generative", 1,
                                PipelineStage::Generative, "Generative Fill",
                                {text_field("prompt", "Prompt", ""), model, seed, backend}));
   definitions.push_back(define("remove", "generative", "Generative", 2, PipelineStage::Generative,
                                "Remove", {model, seed, backend}));
+
+  // AI denoise and AI upscale (issues #51, #52). Same mechanics as the two above — a
+  // cached raster, an input hash, a run the user asks for — and three differences: they
+  // take no mask, they cover the whole frame, and they render below everything else, so the
+  // rest of the stack develops what the model returned. `denoise` is the only op here whose
+  // strength the graph reads as a sampler setting rather than a blend, and `upscale` is the
+  // one op in the engine that changes how many pixels the photo has.
+  // `onnx` is the local restoration model (SCUNet through onnxruntime, engine/src/ai/
+  // denoise.h), which `auto` picks whenever it is installed: it is trained on noise rather
+  // than asked to re-imagine the frame, and it tiles, so it runs at the photo's own size.
+  definitions.push_back(define("denoise", "enhance", "Enhance", 1, PipelineStage::Denoise,
+                               "AI Denoise",
+                               {unipolar("strength", "Strength", 50), model, seed,
+                                choice("backend", "Backend", {"auto", "onnx", "comfy", "stub"})}));
+  definitions.push_back(define("upscale", "enhance", "Enhance", 2, PipelineStage::Upscale,
+                               "AI Upscale",
+                               {choice("factor", "Factor", {"2x", "4x"}), model,
+                                choice("backend", "Backend", {"auto", "comfy", "stub"})}));
+  // The denoise that needs nothing installed and runs inside the frame budget: an
+  // edge-avoiding à trous wavelet, three levels, luminance and chroma filtered separately
+  // (shaders/blur.wgsl and shaders/neighborhood.wgsl, kind 108). It sits beside AI Denoise
+  // in the Enhance panel because that is the choice a user makes — model or filter — and it
+  // renders at PipelineStage::NoiseReduction, i.e. after the model raster, so the two
+  // compose: the filter cleans up whatever the model left.
+  //
+  // The two Detail-panel noise sliders stay what they were: one small-radius bilateral pass,
+  // the cheap trim. This op is the one that reaches far enough to kill the multi-pixel blobs
+  // high-ISO chroma noise arrives as.
+  definitions.push_back(define("manual_denoise", "enhance", "Enhance", 3,
+                               PipelineStage::NoiseReduction, "Manual Denoise",
+                               {unipolar("luminance", "Luminance", 0),
+                                unipolar("detail", "Detail", 50), unipolar("color", "Color", 0),
+                                unipolar("colorDetail", "Color Detail", 50)}));
+
+  // Relight (PROMPT.md 3.8): a virtual light placed in the scene the depth map describes.
+  // Lightroom has no such tool, so the vocabulary is Luminar's rather than Adobe's, and the
+  // panel is its own — the hand-built column drags the light in the viewer and the sliders
+  // below are the ones ops.describe publishes. Neutral at intensity 0, and the op renders
+  // nothing at all until depth.estimate has given the photo a depth map.
+  definitions.push_back(
+      define("relight", "relight", "Relight", 1, PipelineStage::Relight, "Relight",
+             {with_default(slider("x", "Light x", 0, 1, 0.001, ""), 0.5),
+              with_default(slider("y", "Light y", 0, 1, 0.001, ""), 0.5),
+              unipolar("distance", "Distance (Z)", 50), unipolar("intensity", "Intensity", 40),
+              unipolar("radius", "Reach", 40),
+              tinted(with_default(slider("kelvin", "Colour", 2000, 12000, 50, "K"), 5500), "kelvin",
+                     "temperature"),
+              unipolar("falloff", "Falloff", 50), unipolar("occlusion", "Shadows", 60),
+              unipolar("softness", "Shadow softness", 25), unipolar("rays", "Light rays", 45),
+              unipolar("rayLength", "Ray length", 60), unipolar("rayDecay", "Ray decay", 50)}));
 
   definitions.push_back(
       define("sharpening", "detail", "Detail", 1, PipelineStage::Sharpening, "Sharpening",
@@ -373,6 +425,18 @@ const OpDefinition* find_op_definition(std::string_view name) {
     if (definition.name == name) return &definition;
   }
   return nullptr;
+}
+
+bool is_generative_op(std::string_view name) {
+  const OpDefinition* definition = find_op_definition(name);
+  if (definition == nullptr) return false;
+  return definition->stage == PipelineStage::Generative || is_whole_frame_op(name);
+}
+
+bool is_whole_frame_op(std::string_view name) {
+  const OpDefinition* definition = find_op_definition(name);
+  if (definition == nullptr) return false;
+  return definition->stage == PipelineStage::Denoise || definition->stage == PipelineStage::Upscale;
 }
 
 nlohmann::json describe_ops() {

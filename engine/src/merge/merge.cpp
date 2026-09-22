@@ -43,6 +43,7 @@ bool group_is_a_bracket(const std::vector<double>& offsets) {
 MergeKind merge_kind_from_name(const std::string& name) {
   if (name == "panorama") return MergeKind::Panorama;
   if (name == "hdrPanorama") return MergeKind::HdrPanorama;
+  if (name == "starTrail") return MergeKind::StarTrail;
   return MergeKind::Hdr;
 }
 
@@ -52,6 +53,8 @@ const char* merge_kind_name(MergeKind kind) {
       return "panorama";
     case MergeKind::HdrPanorama:
       return "hdrPanorama";
+    case MergeKind::StarTrail:
+      return "starTrail";
     case MergeKind::Hdr:
       break;
   }
@@ -64,10 +67,16 @@ const char* merge_suffix(MergeKind kind) {
       return "Pano";
     case MergeKind::HdrPanorama:
       return "HDRPano";
+    case MergeKind::StarTrail:
+      return "Trails";
     case MergeKind::Hdr:
       break;
   }
   return "HDR";
+}
+
+bool merge_is_streaming(MergeKind kind) {
+  return kind == MergeKind::StarTrail;
 }
 
 std::vector<std::vector<size_t>> bracket_groups(const std::vector<double>& evs) {

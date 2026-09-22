@@ -2,6 +2,7 @@
   // One icon per mask kind, in one place: the create menu, the component rows and the
   // Layers column all draw the same glyph for the same kind.
   import type { MaskComponentKind } from "@latent/protocol";
+  import AirplaneInFlightIcon from "phosphor-svelte/lib/AirplaneInFlightIcon";
   import CircleDashedIcon from "phosphor-svelte/lib/CircleDashedIcon";
   import CloudIcon from "phosphor-svelte/lib/CloudIcon";
   import GradientIcon from "phosphor-svelte/lib/GradientIcon";
@@ -28,6 +29,7 @@
     linear: GradientIcon,
     radial: CircleDashedIcon,
     luminance: SunIcon,
+    trails: AirplaneInFlightIcon,
     color: PaletteIcon,
     depth: MountainsIcon,
   };

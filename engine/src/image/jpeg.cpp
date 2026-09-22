@@ -51,14 +51,33 @@ std::vector<uint8_t> encode_jpeg(const Rgb8Image& image, int quality) {
 }
 
 Rgb8Image decode_jpeg(std::span<const uint8_t> jpeg) {
+  return decode_jpeg_scaled(jpeg, 0);
+}
+
+Rgb8Image decode_jpeg_scaled(std::span<const uint8_t> jpeg, uint32_t min_long_edge) {
   const TjHandle handle = make_handle(TJINIT_DECOMPRESS);
   if (tj3DecompressHeader(handle.get(), jpeg.data(), jpeg.size()) != 0) {
     fail(handle, "tj3DecompressHeader");
   }
+  const int full_width = tj3Get(handle.get(), TJPARAM_JPEGWIDTH);
+  const int full_height = tj3Get(handle.get(), TJPARAM_JPEGHEIGHT);
+  if (full_width <= 0 || full_height <= 0) throw std::runtime_error("decode_jpeg: empty image");
+
+  // 1/1 unless something smaller still clears the floor, so an unreachable floor — or no
+  // floor at all — decodes the whole image.
+  tjscalingfactor scale{1, 1};
+  int count = 0;
+  const tjscalingfactor* factors = min_long_edge == 0 ? nullptr : tj3GetScalingFactors(&count);
+  const int longest = std::max(full_width, full_height);
+  for (int i = 0; factors != nullptr && i < count; ++i) {
+    if (TJSCALED(longest, factors[i]) < static_cast<int>(min_long_edge)) continue;
+    if (TJSCALED(longest, factors[i]) < TJSCALED(longest, scale)) scale = factors[i];
+  }
+  if (tj3SetScalingFactor(handle.get(), scale) != 0) fail(handle, "tj3SetScalingFactor");
+
   Rgb8Image out;
-  out.width = static_cast<uint32_t>(tj3Get(handle.get(), TJPARAM_JPEGWIDTH));
-  out.height = static_cast<uint32_t>(tj3Get(handle.get(), TJPARAM_JPEGHEIGHT));
-  if (out.width == 0 || out.height == 0) throw std::runtime_error("decode_jpeg: empty image");
+  out.width = static_cast<uint32_t>(TJSCALED(full_width, scale));
+  out.height = static_cast<uint32_t>(TJSCALED(full_height, scale));
   out.pixels.resize(static_cast<size_t>(out.width) * out.height * 3);
   if (tj3Decompress8(handle.get(), jpeg.data(), jpeg.size(), out.pixels.data(), 0, TJPF_RGB) != 0) {
     fail(handle, "tj3Decompress8");

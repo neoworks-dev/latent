@@ -7,7 +7,9 @@ import {
   defaultComponent,
   isAiKind,
   kindSpec,
-  lastMaskedOp,
+  layerLabel,
+  layerOf,
+  layersOf,
   maskShortcut,
   maskSignature,
   type MaskAction,
@@ -36,6 +38,18 @@ function op(id: string, mask?: Mask): Op {
   const entry: Op = { id, op: "exposure", params: {}, enabled: true };
   if (mask) entry.mask = mask;
   return entry;
+}
+
+/** A layer as the engine sends one: a group, its mask, and the adjustments under it. */
+function layer(id: string, components: MaskComponent[], ops: Op[] = []): Op {
+  return {
+    id,
+    op: "group",
+    params: {},
+    enabled: true,
+    ops,
+    mask: { components },
+  };
 }
 
 const key = (overrides: Partial<Parameters<typeof maskShortcut>[0]>): MaskAction | null =>
@@ -88,14 +102,36 @@ describe("component list edits", () => {
     expect(removeComponent({ components: [first] }, "radial1")).toBeUndefined();
   });
 
-  test("the column opens on the last op that carries a mask", () => {
+  test("the panel points at the selected layer, and at the one holding a selected adjustment", () => {
     const stack = [
-      op("op1", { components: [defaultComponent("radial", "radial1")] }),
+      layer("g1", [defaultComponent("radial", "radial1")], [op("child1")]),
       op("op2"),
-      op("op3", { components: [defaultComponent("brush", "brush1")] }),
+      layer("g2", [defaultComponent("brush", "brush1")]),
     ];
-    expect(lastMaskedOp(stack)?.id).toBe("op3");
-    expect(lastMaskedOp([op("op1")])).toBeUndefined();
+    expect(layersOf(stack).map((entry) => entry.id)).toEqual(["g1", "g2"]);
+    // Nothing selected is the photo itself: the Edit column's sliders follow this, so a
+    // mask nobody picked must not catch them.
+    expect(layerOf(stack, null)).toBeUndefined();
+    expect(layerOf(stack, "g1")?.id).toBe("g1");
+    // A child is edited in the layer that holds it, not on its own.
+    expect(layerOf(stack, "child1")?.id).toBe("g1");
+    // An op outside every layer is not a mask selection either.
+    expect(layerOf(stack, "op2")).toBeUndefined();
+    expect(layerOf([op("op1")], null)).toBeUndefined();
+  });
+
+  test("a layer is labelled by its number and the kinds in it", () => {
+    expect(layerLabel(layer("g1", [defaultComponent("radial", "radial1")]), 0)).toBe(
+      "Mask 1 · radial",
+    );
+    expect(
+      layerLabel(
+        layer("g2", [defaultComponent("sky", "sky1"), defaultComponent("brush", "brush1")]),
+        1,
+      ),
+    ).toBe("Mask 2 · sky, brush");
+    // A layer whose mask is still empty is a mask the user is in the middle of making.
+    expect(layerLabel(layer("g3", []), 2)).toBe("Mask 3");
   });
 
   test("the preview signature changes with the mask and with the selection, not with a param", () => {

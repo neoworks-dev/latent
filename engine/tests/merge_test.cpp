@@ -9,11 +9,13 @@
 #include "merge/hdr.h"
 #include "merge/pano.h"
 #include "merge/source_image.h"
+#include "merge/startrail.h"
 
 #include <cmath>
 
 #include <algorithm>
 #include <filesystem>
+#include <stdexcept>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -480,4 +482,201 @@ TEST_CASE("exposure value and focal length come out of the frame metadata", "[me
   CHECK_THAT(focal_pixels(info, 3600), Catch::Matchers::WithinAbs(2400.0, 1e-6));
   info.focal_length_35 = 0;
   CHECK(focal_pixels(info, 3600) == 0.0);
+}
+
+// ---- star trails --------------------------------------------------------------------
+// The fixture is a night sequence: a dark sky carrying a fixed set of stars that all march
+// the same way frame to frame, a static landscape across the bottom, and a per-frame
+// speckle standing in for read noise and hot pixels.
+namespace {
+
+constexpr uint32_t kNightWidth = 160;
+constexpr uint32_t kNightHeight = 120;
+constexpr uint32_t kHorizon = 90;
+constexpr int kStarStep = 6;
+constexpr size_t kStarCount = 48;
+
+struct Star {
+  double x = 0;
+  double y = 0;
+  double brightness = 0;
+};
+
+std::vector<Star> star_catalog() {
+  std::vector<Star> stars;
+  stars.reserve(kStarCount);
+  for (size_t i = 0; i < kStarCount; ++i) {
+    const auto index = static_cast<int64_t>(i);
+    stars.push_back(
+        {8 + hash_at(index, 1) * 100, 6 + hash_at(index, 2) * 70, 0.35 + hash_at(index, 3) * 0.6});
+  }
+  return stars;
+}
+
+void draw_star(LinearImage& frame, const Star& star) {
+  const auto left = static_cast<int>(std::floor(star.x)) - 2;
+  const auto top = static_cast<int>(std::floor(star.y)) - 2;
+  for (int y = top; y <= top + 4; ++y) {
+    for (int x = left; x <= left + 4; ++x) {
+      if (x < 0 || y < 0 || x >= static_cast<int>(frame.width) || y >= static_cast<int>(kHorizon)) {
+        continue;
+      }
+      const double dx = x - star.x;
+      const double dy = y - star.y;
+      const double falloff = std::exp(-((dx * dx) + (dy * dy)) / 0.8);
+      float* pixel = frame.at(static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+      for (int channel = 0; channel < 3; ++channel) {
+        pixel[channel] = std::max(pixel[channel], static_cast<float>(star.brightness * falloff));
+      }
+    }
+  }
+}
+
+// Frame `index` of the sequence. `speckle` scales the per-frame noise, which is what the
+// FirstFrame foreground rule is there to keep out of the ground.
+LinearImage night_frame(const std::vector<Star>& stars, size_t index, double speckle) {
+  LinearImage frame = make_linear(kNightWidth, kNightHeight);
+  for (uint32_t y = 0; y < kNightHeight; ++y) {
+    for (uint32_t x = 0; x < kNightWidth; ++x) {
+      const bool ground = y >= kHorizon;
+      const double base = ground ? 0.04 + 0.03 * octaves_at(x, y) : 0.004;
+      const double noise = speckle * hash_at(static_cast<int64_t>(x + (index * 977)),
+                                             static_cast<int64_t>(y + (index * 131)));
+      float* pixel = frame.at(x, y);
+      for (int channel = 0; channel < 3; ++channel) {
+        pixel[channel] = static_cast<float>(base + noise);
+      }
+    }
+  }
+  for (const Star& star : stars) {
+    draw_star(frame,
+              Star{star.x + static_cast<double>(index * kStarStep), star.y, star.brightness});
+  }
+  return frame;
+}
+
+std::vector<LinearImage> night_sequence(size_t count, double speckle) {
+  const std::vector<Star> stars = star_catalog();
+  std::vector<LinearImage> frames;
+  frames.reserve(count);
+  for (size_t i = 0; i < count; ++i)
+    frames.push_back(night_frame(stars, i, speckle));
+  return frames;
+}
+
+float luma_at(const LinearImage& image, double x, double y) {
+  const auto px = static_cast<uint32_t>(std::lround(x));
+  const auto py = static_cast<uint32_t>(std::lround(y));
+  if (px >= image.width || py >= image.height) return 0;
+  const float* pixel = image.at(px, py);
+  return (pixel[0] + pixel[1] + pixel[2]) / 3.0F;
+}
+
+}  // namespace
+
+TEST_CASE("lighten keeps every position a star has been in", "[merge][startrail]") {
+  const std::vector<Star> stars = star_catalog();
+  const StarTrailOutcome trails =
+      merge_star_trail(night_sequence(5, 0.0), StarTrailOptions{}, kNoProgress);
+  REQUIRE(trails.frames == 5);
+  REQUIRE(trails.image.width == kNightWidth);
+
+  // Every frame's copy of the first star is in the merge at that frame's brightness.
+  const Star& first = stars.front();
+  for (size_t frame = 0; frame < 5; ++frame) {
+    const double x = first.x + static_cast<double>(frame * kStarStep);
+    CHECK(luma_at(trails.image, x, first.y) > first.brightness * 0.8);
+  }
+  // Nothing was added between them: a lighten stack draws a dotted trail, which is what
+  // gap fill is for.
+  CHECK(luma_at(trails.image, first.x + (kStarStep * 0.5), first.y) < 0.05);
+}
+
+TEST_CASE("average keeps one frame's star at one frame's weight", "[merge][startrail]") {
+  const std::vector<Star> stars = star_catalog();
+  StarTrailOptions options;
+  options.blend = TrailBlend::Average;
+  const StarTrailOutcome averaged = merge_star_trail(night_sequence(5, 0.0), options, kNoProgress);
+
+  const Star& first = stars.front();
+  // A star that is in one frame of five comes out at a fifth of its brightness: the mean
+  // is a longer exposure, not a trail.
+  const float peak = luma_at(averaged.image, first.x, first.y);
+  CHECK(peak < first.brightness * 0.35);
+  CHECK(peak > first.brightness * 0.1);
+  // The ground is in every frame, so it survives the mean intact.
+  CHECK(luma_at(averaged.image, 40, 100) > 0.03F);
+}
+
+TEST_CASE("the first-frame foreground keeps the sequence's noise out of the ground",
+          "[merge][startrail]") {
+  const double speckle = 0.02;
+  const LinearImage first = night_frame(star_catalog(), 0, speckle);
+
+  const StarTrailOutcome plain =
+      merge_star_trail(night_sequence(6, speckle), StarTrailOptions{}, kNoProgress);
+  StarTrailOptions gated;
+  gated.foreground = TrailForeground::FirstFrame;
+  gated.foreground_threshold = 25;  // 2.5 % of the white level, well above the speckle
+  const StarTrailOutcome guarded = merge_star_trail(night_sequence(6, speckle), gated, kNoProgress);
+
+  // Lighten takes the brightest speckle any of the six frames had; the gate takes none.
+  double plain_lift = 0;
+  double guarded_lift = 0;
+  for (uint32_t y = kHorizon; y < kNightHeight; ++y) {
+    for (uint32_t x = 0; x < kNightWidth; ++x) {
+      plain_lift += luma_at(plain.image, x, y) - luma_at(first, x, y);
+      guarded_lift += luma_at(guarded.image, x, y) - luma_at(first, x, y);
+    }
+  }
+  CHECK(plain_lift > 0.0);
+  CHECK_THAT(guarded_lift, Catch::Matchers::WithinAbs(0.0, 1e-4));
+
+  // The trails are what the gate is there to let through, and they still are.
+  const Star star = star_catalog().front();
+  CHECK(luma_at(guarded.image, star.x + (3 * kStarStep), star.y) > star.brightness * 0.8);
+}
+
+TEST_CASE("decay fades the older end of every trail", "[merge][startrail]") {
+  const std::vector<Star> stars = star_catalog();
+  StarTrailOptions options;
+  options.decay = 100;
+  const StarTrailOutcome comet = merge_star_trail(night_sequence(5, 0.0), options, kNoProgress);
+
+  const Star& star = stars.front();
+  const float head = luma_at(comet.image, star.x + (4 * kStarStep), star.y);
+  const float tail = luma_at(comet.image, star.x, star.y);
+  // Six stops across the sequence: the oldest frame lands at a sixty-fourth of the newest.
+  CHECK(head > star.brightness * 0.8);
+  CHECK(tail < head * 0.05F);
+  // The ground still comes from the newest frames, so it is not dragged down with the tail.
+  CHECK(luma_at(comet.image, 40, 100) > 0.03F);
+}
+
+TEST_CASE("gap fill draws the star between the frames it was in", "[merge][startrail]") {
+  StarTrailOptions options;
+  options.gap_fill = 3;
+  const StarTrailOutcome filled = merge_star_trail(night_sequence(4, 0.0), options, kNoProgress);
+
+  // The sequence steps the whole sky by kStarStep, and that is what the correlation sees.
+  CHECK_THAT(filled.drift_px, Catch::Matchers::WithinAbs(kStarStep, 1.0));
+  CHECK(filled.match_score > 0.5);
+
+  const Star star = star_catalog().front();
+  // The midpoint between two frames' positions was dark without the fill (the test above)
+  // and is a trail with it.
+  CHECK(luma_at(filled.image, star.x + (kStarStep * 0.5), star.y) > star.brightness * 0.4);
+}
+
+TEST_CASE("a star trail stack refuses what it cannot stack", "[merge][startrail]") {
+  StarTrailStack stack(StarTrailOptions{}, 2, kNoProgress);
+  stack.add(night_frame(star_catalog(), 0, 0.0));
+  CHECK_THROWS_AS(stack.add(make_linear(64, 64)), std::runtime_error);
+  stack.add(night_frame(star_catalog(), 1, 0.0));
+  CHECK_THROWS_AS(stack.add(night_frame(star_catalog(), 2, 0.0)), std::runtime_error);
+  const StarTrailOutcome outcome = stack.finish();
+  CHECK(outcome.frames == 2);
+  CHECK_THROWS_AS(stack.finish(), std::runtime_error);
+  // Two frames is the floor, and one is not a merge.
+  CHECK_THROWS_AS(StarTrailStack(StarTrailOptions{}, 1, kNoProgress), std::runtime_error);
 }

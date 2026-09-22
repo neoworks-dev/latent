@@ -13,12 +13,11 @@ import {
 } from "./console";
 
 /**
- * The Python console's scrollback and whether the pane is open. The code is the engine's
+ * The Python console's scrollback and history. The code is the engine's
  * to run (embedded CPython, PROMPT.md §3.4) — this only ships it and prints what comes
  * back. Nothing it shows is derived locally.
  */
 export class ConsoleState {
-  visible = $state(false);
   /** A call is in flight; a second run would fight it for the streamed output. */
   busy = $state(false);
   /**
@@ -40,7 +39,7 @@ export class ConsoleState {
   history = $state<string[]>([]);
   /** Where the recall sits; `history.length` is the fresh line below the newest entry. */
   historyIndex = $state(0);
-  /** Pane height in pixels, dragged by the handle on the console's top edge. */
+  /** Scrollback height in pixels, dragged by the handle under it. */
   height = $state(220);
 
   /** `photoId:revision` of the last stack change printed; the same one never prints twice. */
@@ -70,10 +69,6 @@ export class ConsoleState {
 
   dispose(): void {
     for (const unsubscribe of this.unsubscribes) unsubscribe();
-  }
-
-  toggle(): void {
-    this.visible = !this.visible;
   }
 
   setHeight(height: number): void {

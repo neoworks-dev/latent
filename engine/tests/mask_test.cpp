@@ -216,3 +216,56 @@ TEST_CASE("the brush rasteriser stamps, joins and erases") {
 
   REQUIRE(mean_level(rasterize_brush({}, 0, 100, 100)) == 0);
 }
+
+TEST_CASE("masks written before groups become a layer of one") {
+  Stack stack;
+  Op exposure;
+  exposure.id = "exp00001";
+  exposure.name = "exposure";
+  exposure.params = {{"value", 1.5}};
+  exposure.mask = one({{"id", "m1"}, {"kind", "radial"}, {"mode", "add"}});
+  exposure.opacity = 60;
+  exposure.enabled = false;
+  stack.push_back(exposure);
+
+  // An unmasked op is already a global adjustment: nothing to lift.
+  Op contrast;
+  contrast.id = "con00001";
+  contrast.name = "contrast";
+  contrast.params = {{"value", 20}};
+  stack.push_back(contrast);
+
+  // A generative op owns the region it painted, so its mask is not a layer's mask.
+  Op fill;
+  fill.id = "gen00001";
+  fill.name = "generative_fill";
+  fill.mask = one({{"id", "m2"}, {"kind", "brush"}, {"mode", "add"}});
+  stack.push_back(fill);
+
+  migrate_mask_groups(stack);
+  REQUIRE(stack.size() == 3);
+
+  const Op& group = stack[0];
+  REQUIRE(group.is_group());
+  REQUIRE(group.id != "exp00001");
+  REQUIRE(group.mask.has_value());
+  REQUIRE(group.opacity == 60);
+  // The op was off, so the layer is off — and the adjustment under it is on, so switching
+  // the layer back on brings back what the sidecar held.
+  REQUIRE(group.enabled == false);
+  REQUIRE(group.ops.size() == 1);
+  REQUIRE(group.ops[0].id == "exp00001");
+  REQUIRE(group.ops[0].enabled == true);
+  REQUIRE(!group.ops[0].mask.has_value());
+  REQUIRE(group.ops[0].opacity == kFullOpacity);
+
+  REQUIRE(stack[1].id == "con00001");
+  REQUIRE(!stack[1].is_group());
+  REQUIRE(stack[2].id == "gen00001");
+  REQUIRE(stack[2].mask.has_value());
+
+  // Idempotent: the sidecar it writes back reads the same way.
+  const nlohmann::json once = stack_to_json(stack);
+  migrate_mask_groups(stack);
+  REQUIRE(stack_to_json(stack) == once);
+}

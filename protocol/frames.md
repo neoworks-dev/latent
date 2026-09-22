@@ -38,6 +38,17 @@ the image sits inside it. A UI that draws the whole raster into the drawn image'
 instead of that sub-rectangle stretches the mask off the photo as soon as a crop changes
 the aspect.
 
+## `LDPT` — depth map (engine → UI)
+
+Same header as `LFRM`; `format` = 2 (r8, 0 = the farthest thing in the photo, 255 = the
+nearest); `viewId` is always 0; `seq` shares `LMSK`'s counter. Sent by `depth.preview`,
+exactly one frame **before** its RPC result.
+
+Unlike `LMSK` this is **not** letterboxed and is not sized to any view: it is the photo's
+own depth map in image space, 0..1 across the uncropped photo (PROMPT.md 3.8), at whatever
+resolution the model produced. A UI draws it through `imageTransform` like any other image
+coordinate, so it lands on the photo under every crop, straighten and zoom.
+
 ## `LTHM` — thumbnail (engine → UI)
 
 Same header as `LFRM` with `viewId` replaced by `photoId` (u32). JPEG bytes follow the

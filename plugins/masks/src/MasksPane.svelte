@@ -1,28 +1,34 @@
 <script lang="ts">
-  // The Masks column, and the tools it draws on the viewer's overlay. The column is only
-  // mounted while the rail is on "masks", so attaching the overlay and the shortcuts here —
+  // The Masks panel, and the tools it draws on the viewer's overlay. It is the rail's
+  // flyout: only mounted while it is open, so attaching the overlay and the shortcuts here —
   // with their inverses — is also what arms and disarms the tools.
+  //
+  // The adjustments of a mask are not drawn here. Selecting a mask aims the Edit column at
+  // it (`ViewerService.maskTarget`), which is why this panel floats beside that column
+  // instead of replacing it: pick the region here, move the sliders there.
   import {
     kernelContext,
     type OverlayMap,
     type OverlayPointer,
     type OverlayRect,
   } from "@latent/contracts";
-  import { GeneratedPanel, ValueField } from "@latent/plugin-panels";
+  import { ValueField } from "@latent/plugin-panels";
   import type { MaskComponentKind } from "@latent/protocol";
   import { Button, Select, Tooltip } from "@neoworks-dev/ui";
   import EyeIcon from "phosphor-svelte/lib/EyeIcon";
   import EyeSlashIcon from "phosphor-svelte/lib/EyeSlashIcon";
-  import PaletteIcon from "phosphor-svelte/lib/PaletteIcon";
+  import ImageIcon from "phosphor-svelte/lib/ImageIcon";
+  import TrashIcon from "phosphor-svelte/lib/TrashIcon";
   import ComponentRow from "./ComponentRow.svelte";
   import KindIcon from "./KindIcon.svelte";
   import {
     coverageLabel,
     groupLabels,
+    kindSpec,
     kindSpecs,
+    layerLabel,
     maskShortcut,
     opacitySpec,
-    tintLabels,
     tintStyle,
   } from "./masks";
   import Toolbar from "./Toolbar.svelte";
@@ -44,41 +50,50 @@
   const viewer = ctx.viewer;
   const panels = ctx.panels;
 
-  const op = $derived(masks.op);
-  const definition = $derived(panels.ops.find((entry) => entry.name === op?.op));
+  const layer = $derived(masks.layer);
+  const layers = $derived(masks.layers);
   const components = $derived(masks.components);
-  const opacity = $derived(op?.opacity ?? 100);
-  // Only ops the engine says take a mask can become layers; geometry ops cannot.
-  const maskable = $derived(
-    viewer.stack.filter((entry) =>
-      panels.ops.some((spec) => spec.name === entry.op && spec.maskable),
-    ),
-  );
+  const adjustments = $derived(masks.adjustments);
+  const opacity = $derived(layer?.opacity ?? 100);
   const createOptions = $derived(
     kindSpecs.map((spec) => ({
       value: spec.kind as string,
       label: `${groupLabels[spec.group]} · ${spec.label}`,
     })),
   );
+  // The kinds a mask is actually built out of, one click each: select the subject, then
+  // brush the rest in. The full list stays a step away in the menu beside them.
+  const quickKinds: MaskComponentKind[] = [
+    "subject",
+    "sky",
+    "brush",
+    "linear",
+    "radial",
+    "objects",
+  ];
 
-  let textKind = $state(false);
+  let textKind = $state<"layer" | "component" | null>(null);
   // Drag and hover live outside reactive state: they change per pointer event and only the
   // overlay canvas cares, so they repaint it instead of re-rendering the column.
   let drag: { start: Point; current: Point } | null = null;
   let hover: Point | null = null;
 
-  function createMask(kind: string): void {
+  // `newLayer` is Lightroom's Create New Mask — a mask of its own, with its own
+  // adjustments. Without it the component would join whichever mask is selected.
+  function createMask(kind: string, newLayer: boolean): void {
     if (kind === "text") {
-      textKind = true;
+      textKind = newLayer ? "layer" : "component";
       return;
     }
-    textKind = false;
-    void masks.createComponent(kind as MaskComponentKind);
+    textKind = null;
+    if (newLayer) void masks.createLayer(kind as MaskComponentKind);
+    else void masks.createComponent(kind as MaskComponentKind);
   }
 
   async function createText(): Promise<void> {
-    const component = await masks.createComponent("text");
-    textKind = false;
+    const component =
+      textKind === "layer" ? await masks.createLayer("text") : await masks.createComponent("text");
+    textKind = null;
     if (component) await masks.detect(component.id, { prompt: masks.textPrompt });
   }
 
@@ -90,8 +105,40 @@
     map: OverlayMap,
   ): void {
     if (rect.width <= 0 || rect.height <= 0) return;
-    if (masks.overlayVisible) drawTint(context, rect);
+    if (masks.overlayVisible) {
+      drawTint(context, rect);
+      drawLiveStroke(context, map);
+    }
     drawTools(context, map);
+  }
+
+  /**
+   * The stroke under the pointer, drawn here rather than waited for: the engine's raster is
+   * a round trip behind the brush, and the whole of that round trip is the frame on the
+   * socket. It is replaced by the engine's own coverage as soon as that lands.
+   */
+  function drawLiveStroke(context: CanvasRenderingContext2D, map: OverlayMap): void {
+    const points = masks.livePoints;
+    const [first] = points;
+    if (!first) return;
+    const { color, alpha } = tintStyle(masks.tint);
+    const at = map.toCanvas(first[0], first[1]);
+    context.save();
+    context.setLineDash([]);
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    context.lineWidth = Math.max(2, masks.brushSize * map.scale);
+    context.strokeStyle = `rgba(${color[0]}, ${color[1]}, ${color[2]}, ${alpha})`;
+    context.beginPath();
+    context.moveTo(at.x, at.y);
+    for (const point of points.slice(1)) {
+      const next = map.toCanvas(point[0], point[1]);
+      context.lineTo(next.x, next.y);
+    }
+    // A press that has not moved yet is a dot, which `stroke` alone would not draw.
+    if (points.length === 1) context.lineTo(at.x + 0.01, at.y);
+    context.stroke();
+    context.restore();
   }
 
   function drawTint(context: CanvasRenderingContext2D, rect: OverlayRect): void {
@@ -355,6 +402,10 @@
   $effect(() => {
     masks.syncPreview();
   });
+
+  // Closing the panel aims the Edit column back at the photo. Nothing else clears the
+  // target, and a slider that writes into a mask has to have that mask on screen.
+  $effect(() => () => masks.selectPhoto());
 </script>
 
 <div
@@ -363,51 +414,78 @@
   data-mask-coverage={masks.coverage.toFixed(4)}
   data-mask-tint={masks.tint}
   data-mask-overlay={masks.overlayVisible}
-  data-mask-op={op?.id ?? ""}
+  data-mask-op={layer?.id ?? ""}
 >
-  {#if !op}
-    <div class="flex flex-col gap-2 px-3 py-3">
-      <p class="text-muted">Select an adjustment or create a mask.</p>
-      {#if maskable.length > 0}
-        <ul class="flex flex-col">
-          {#each maskable as entry (entry.id)}
-            <li>
-              <button
-                type="button"
-                class="w-full rounded-sm px-2 py-1.5 text-left text-xs text-default
-                       transition-colors hover:bg-hover"
-                onclick={() => viewer.selectOp(entry.id)}
-                data-select-op={entry.op}
-              >
-                {panels.ops.find((spec) => spec.name === entry.op)?.label ?? entry.op}
-              </button>
-            </li>
-          {/each}
-        </ul>
-      {:else}
-        <p class="text-faint">Move a slider in the Edit column first.</p>
-      {/if}
-    </div>
-  {:else}
-    <header class="flex items-center gap-1 border-b border-line-faint px-2 py-1.5">
-      <span class="min-w-0 flex-1 truncate font-semibold text-default">
-        {definition?.label ?? op.op}
-      </span>
-      <Tooltip text="Overlay (O)" placement="left">
-        <span data-overlay-toggle={masks.overlayVisible}>
+  <!-- The photo, then every mask of it. Clicking a mask leaves it selected: from then on the
+       Edit column's sliders write into that mask, until the photo row above takes the
+       selection back or the panel is closed. -->
+  <ul class="flex flex-col border-b border-line-faint" data-mask-layers>
+    <li class="flex items-center gap-1 px-1.5 py-0.5">
+      <span class="px-2 text-faint"><ImageIcon size={13} weight="bold" /></span>
+      <button
+        type="button"
+        class="min-w-0 flex-1 truncate rounded-sm px-1 py-1 text-left transition-colors
+               hover:bg-hover"
+        class:text-default={!layer}
+        class:text-muted={Boolean(layer)}
+        data-mask-layer-select="photo"
+        data-selected={!layer}
+        onclick={() => masks.selectPhoto()}
+      >
+        Whole photo
+      </button>
+    </li>
+    {#each layers as entry, index (entry.id)}
+      <li class="flex items-center gap-1 px-1.5 py-0.5" data-mask-layer={entry.id}>
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={entry.enabled ? EyeIcon : EyeSlashIcon}
+          onclick={() => void viewer.setEnabled(entry.id, !entry.enabled)}
+        />
+        <button
+          type="button"
+          class="min-w-0 flex-1 truncate rounded-sm px-1 py-1 text-left transition-colors
+                 hover:bg-hover"
+          class:bg-raised={entry.id === layer?.id}
+          class:text-default={entry.id === layer?.id}
+          class:text-muted={entry.id !== layer?.id}
+          data-mask-layer-select={entry.id}
+          data-selected={entry.id === layer?.id}
+          onclick={() => masks.selectLayer(entry.id)}
+        >
+          {layerLabel(entry, index)}
+        </button>
+        <span class="text-[10px] text-faint tabular-nums">
+          {(entry.ops ?? []).length}
+        </span>
+        <Tooltip text="Delete mask" placement="left">
           <Button
             size="sm"
-            variant={masks.overlayVisible ? "surface" : "ghost"}
-            icon={masks.overlayVisible ? EyeIcon : EyeSlashIcon}
-            onclick={() => masks.toggleOverlay()}
+            variant="ghost"
+            icon={TrashIcon}
+            onclick={() => void masks.removeLayer(entry.id)}
           />
-        </span>
-      </Tooltip>
-      <Tooltip text="Overlay style: {tintLabels[masks.tint]} (Shift+O)" placement="left">
-        <Button size="sm" variant="ghost" icon={PaletteIcon} onclick={() => masks.cycleTint()} />
-      </Tooltip>
-    </header>
+        </Tooltip>
+      </li>
+    {/each}
+  </ul>
 
+  <div class="px-2 py-1.5" data-create-mask>
+    <Select
+      value=""
+      options={createOptions}
+      placeholder="Create new mask"
+      onChange={(value) => createMask(String(value), true)}
+    />
+  </div>
+
+  {#if !layer}
+    <p class="px-3 pb-2 text-faint">
+      A mask is a region and the adjustments inside it. Create one and select it, and the Edit
+      panel's sliders apply to it instead of to the photo.
+    </p>
+  {:else}
     <div class="flex items-center justify-between gap-2 px-3 py-1">
       <span class="text-muted">Opacity</span>
       <ValueField
@@ -415,18 +493,41 @@
         spec={opacitySpec}
         range={{ min: 0, max: 100, step: 1 }}
         label="Layer opacity"
-        onInput={(next) => void viewer.setOpacity(op.id, next, true)}
-        onCommit={(next) => void viewer.setOpacity(op.id, next, false)}
+        onInput={(next) => void viewer.setOpacity(layer.id, next, true)}
+        onCommit={(next) => void viewer.setOpacity(layer.id, next, false)}
       />
     </div>
 
-    <div class="px-2 py-1.5" data-create-mask>
-      <Select
-        value=""
-        options={createOptions}
-        placeholder="Create new mask"
-        onChange={(value) => createMask(String(value))}
-      />
+    <!-- Add to this mask, one click per kind: select the subject, then brush the rest of it
+         in. The menu beside them is the same list in full, for the kinds with no icon here. -->
+    <div class="flex flex-col gap-1 border-t border-line-faint px-2 py-1.5" data-add-component>
+      <div class="flex items-center gap-2">
+        <span class="min-w-0 flex-1 truncate text-[10px] text-faint">Add to this mask</span>
+        <div class="w-28">
+          <Select
+            value=""
+            options={createOptions}
+            placeholder="More…"
+            onChange={(value) => createMask(String(value), false)}
+          />
+        </div>
+      </div>
+      <div class="flex items-center gap-1" role="group" aria-label="Add to this mask">
+        {#each quickKinds as kind (kind)}
+          <Tooltip text={kindSpec(kind).label} placement="top">
+            <button
+              type="button"
+              class="rounded-sm p-1.5 text-muted transition-colors hover:bg-hover
+                     hover:text-default"
+              aria-label={kindSpec(kind).label}
+              data-add-kind={kind}
+              onclick={() => createMask(kind, false)}
+            >
+              <KindIcon {kind} size={14} />
+            </button>
+          </Tooltip>
+        {/each}
+      </div>
     </div>
 
     {#if textKind}
@@ -446,16 +547,25 @@
     <Toolbar />
 
     {#if components.length === 0}
-      <p class="px-3 py-2 text-faint">No mask yet — create one above.</p>
+      <p class="px-3 py-2 text-faint">No region yet — pick one above.</p>
     {:else}
+      <!-- What the mask is made of, bottom-up. Each one adds to, subtracts from or
+           intersects the ones before it, and the line under them is what they come to: one
+           mask, which is the only thing the render ever sees. -->
+      <p class="px-3 pt-2 pb-1 text-[10px] text-faint">Layers of this mask</p>
       <ul class="flex flex-col border-b border-line" data-mask-components>
         {#each components as component, index (component.id)}
           <ComponentRow {component} {index} />
         {/each}
       </ul>
-      <p class="px-3 py-1 text-[10px] text-faint">
-        Mask covers <span data-coverage-label>{coverageLabel(masks.coverage)}</span> of the frame
-        {#if masks.previewing}· updating{/if}
+      <p class="flex items-center gap-1.5 px-3 py-1 text-[10px] text-faint" data-mask-merged>
+        <KindIcon kind={components[0]?.kind ?? "brush"} size={11} />
+        <span>
+          Merged: {components.length}
+          {components.length === 1 ? "layer" : "layers"} covering
+          <span data-coverage-label>{coverageLabel(masks.coverage)}</span> of the frame
+          {#if masks.previewing}· updating{/if}
+        </span>
       </p>
     {/if}
 
@@ -463,13 +573,31 @@
       <p class="px-3 py-1 text-red" data-mask-status>{masks.status}</p>
     {/if}
 
-    <!-- The op's own sliders, so a local adjustment is edited where its mask is. -->
-    <div class="border-t border-line">
-      <div class="flex items-center gap-1.5 px-3 pt-2 pb-1 text-[10px] text-faint">
-        {#if components[0]}<KindIcon kind={components[0].kind} size={11} />{/if}
-        <span>Adjustment</span>
-      </div>
-      <GeneratedPanel opId={op.id} />
+    <!-- What this mask adjusts. The sliders are the Edit column's — moving one there while
+         this mask is selected adds it here — so these rows only say what is in the mask and
+         let it be taken back out. -->
+    <div class="border-t border-line" data-mask-adjustments>
+      <p class="px-3 pt-2 pb-1 text-[10px] text-faint">Adjustments in this mask</p>
+      {#each adjustments as entry (entry.id)}
+        <div class="flex items-center gap-1 px-3 py-0.5" data-mask-adjustment={entry.op}>
+          <span class="min-w-0 flex-1 truncate text-muted">
+            {panels.ops.find((spec) => spec.name === entry.op)?.label ?? entry.op}
+          </span>
+          <Tooltip text="Remove from this mask" placement="left">
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={TrashIcon}
+              onclick={() => void masks.removeAdjustment(entry.id)}
+            />
+          </Tooltip>
+        </div>
+      {/each}
+      {#if adjustments.length === 0}
+        <p class="px-3 pb-2 text-faint">
+          Nothing yet — move a slider in the Edit panel and it lands here.
+        </p>
+      {/if}
     </div>
   {/if}
 </div>

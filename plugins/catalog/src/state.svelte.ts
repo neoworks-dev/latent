@@ -19,22 +19,31 @@ import {
   type SortKey,
 } from "./catalog";
 
-/** Photos per page; the filmstrip shows one page and pages with the arrow buttons. */
-const pageSize = 120;
 const thumbnailSize = 256;
+/**
+ * Thumbnails held in memory at once. `catalog.list` is not paged any more — the panes get
+ * the whole filtered catalog and window it themselves — so the cache is bounded by this
+ * rather than by a page size. Comfortably more than any one viewport asks for, and a key
+ * a pane says it is showing is never evicted whatever the count.
+ */
+const thumbnailCacheSize = 1024;
 
 /**
- * Mirror of the engine's catalog for the panes that draw it: folders, collections, the
- * current page of rows, the selection, and one object URL per thumbnail. Nothing here is
+ * Mirror of the engine's catalog for the panes that draw it: folders, collections, every
+ * row the filter matches, the selection, and one object URL per thumbnail. Nothing here is
  * edit state — ratings, flags and collection membership are engine writes that come back
  * as `catalog.changed`, and the state re-lists.
+ *
+ * `photos` is the whole filtered catalog, not a page of it: the grid and the filmstrip
+ * scroll through all of it and each asks for the thumbnails of the cells it is drawing
+ * (`needThumbnails`). Row metadata for a large library is cheap; a cell and its decode are
+ * not.
  */
 export class CatalogState {
   folders = $state<CatalogFoldersResult["folders"]>([]);
   collections = $state<CatalogCollection[]>([]);
   photos = $state<CatalogPhoto[]>([]);
   total = $state(0);
-  offset = $state(0);
   filter = $state<CatalogFilter>({});
   sort = $state<SortKey>("capturedAt");
   descending = $state(true);
@@ -62,6 +71,8 @@ export class CatalogState {
   private readonly pendingThumbnails = new SvelteMap<string, () => void>();
   /** photoId → the cache key its thumbnail went in under, so a removed row can free it. */
   private readonly thumbnailKeys = new SvelteMap<number, string>();
+  /** Pane id → the cache keys it says it is drawing; eviction leaves those alone. */
+  private readonly shownThumbnails = new SvelteMap<string, SvelteSet<string>>();
   private readonly timers = new SvelteSet<ReturnType<typeof setTimeout>>();
   private readonly unsubscribes: (() => void)[] = [];
 
@@ -78,10 +89,6 @@ export class CatalogState {
       }),
       engine.on("job.progress", (params) => this.trackJob(params)),
     );
-  }
-
-  get pageSize(): number {
-    return pageSize;
   }
 
   get selectedPhotos(): CatalogPhoto[] {
@@ -102,6 +109,7 @@ export class CatalogState {
     for (const url of this.thumbnails.values()) URL.revokeObjectURL(url);
     this.thumbnails.clear();
     this.thumbnailKeys.clear();
+    this.shownThumbnails.clear();
   }
 
   async reload(): Promise<void> {
@@ -110,12 +118,12 @@ export class CatalogState {
       const [folders, collections, listed] = await Promise.all([
         this.engine.call("catalog.folders", {}),
         this.engine.call("catalog.collections", {}),
+        // No limit: the panes window what they draw, so a page here would only be a
+        // second, invisible limit on top of that one.
         this.engine.call("catalog.list", {
           ...this.filter,
           sort: this.sort,
           descending: this.descending,
-          limit: pageSize,
-          offset: this.offset,
         }),
       ]);
       this.folders = folders.folders;
@@ -123,13 +131,11 @@ export class CatalogState {
       this.photos = listed.photos;
       this.total = listed.total;
       this.error = "";
-      // The open photo's row is on the page more often than not; take it from there
-      // rather than asking for it a second time.
+      // The open photo's row is in the list unless the filter excludes it; take it from
+      // there rather than asking for it a second time.
       const openId = this.openRow?.photoId;
       const listedRow = listed.photos.find((photo) => photo.photoId === openId);
       if (listedRow) this.openRow = listedRow;
-      // One batch call for the page that was just listed, not one call per cell.
-      this.requestThumbnails(listed.photos);
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
     }
@@ -137,7 +143,6 @@ export class CatalogState {
 
   setFilter(filter: CatalogFilter): void {
     this.filter = filter;
-    this.offset = 0;
     void this.reload();
   }
 
@@ -145,7 +150,6 @@ export class CatalogState {
   setSort(sort: SortKey, descending: boolean): void {
     this.sort = sort;
     this.descending = descending;
-    this.offset = 0;
     void this.reload();
   }
 
@@ -170,7 +174,6 @@ export class CatalogState {
   /** Typing is not one filter change per keystroke: the list reloads once it stops. */
   setQuery(query: string): void {
     this.filter = { ...this.filter, query };
-    this.offset = 0;
     if (this.queryTimer !== null) {
       clearTimeout(this.queryTimer);
       this.timers.delete(this.queryTimer);
@@ -181,11 +184,27 @@ export class CatalogState {
     }, 200);
   }
 
-  page(delta: number): void {
-    const next = this.offset + delta * pageSize;
-    if (next < 0 || next >= this.total) return;
-    this.offset = next;
-    void this.reload();
+  /**
+   * Moving the selection opens the photo in the filmstrip, where the viewer behind it is
+   * what you are looking at, and does not in the grid, where it is not: a decode per arrow
+   * key is a second of work for a photo nobody asked to see. Enter or a double-click is
+   * how a grid cell is entered.
+   */
+  private openOnSelect(photoId: number): void {
+    this.prioritizePreviews();
+    if (this.gridVisible) return;
+    void this.open(photoId);
+  }
+
+  /**
+   * Tells a running preview job to decode what is selected before the rest of its queue,
+   * so the photo about to be opened is the one that is ready. A hint the engine may have
+   * nothing to do with; the call is fire-and-forget for that reason.
+   */
+  private prioritizePreviews(): void {
+    const photoIds = [...this.selection];
+    if (photoIds.length === 0) return;
+    void this.engine.call("preview.prioritize", { photoIds }).catch(() => {});
   }
 
   /** Click on a thumbnail: selection follows the modifiers, the viewer follows the click. */
@@ -194,7 +213,7 @@ export class CatalogState {
     this.selection = nextSelection(visible, this.selection, this.anchor, photoId, modifiers);
     if (!modifiers.shift) this.anchor = photoId;
     if (modifiers.ctrl || modifiers.shift) return;
-    void this.open(photoId);
+    this.openOnSelect(photoId);
   }
 
   move(delta: number): void {
@@ -203,16 +222,16 @@ export class CatalogState {
     if (photoId === null) return;
     this.selection = [photoId];
     this.anchor = photoId;
-    void this.open(photoId);
+    this.openOnSelect(photoId);
   }
 
-  /** Home/End: the ends of the page the strip is showing. */
+  /** Home/End: the ends of the listed catalog, not of whatever is on screen. */
   moveToEdge(edge: "first" | "last"): void {
     const photo = edge === "first" ? this.photos.at(0) : this.photos.at(-1);
     if (!photo) return;
     this.selection = [photo.photoId];
     this.anchor = photo.photoId;
-    void this.open(photo.photoId);
+    this.openOnSelect(photo.photoId);
   }
 
   /** Opens a photo in the viewer at the size the viewer's canvas already knows. */
@@ -332,12 +351,18 @@ export class CatalogState {
   }
 
   /**
-   * One `catalog.thumbnails` for the whole page: subscribe to every LTHM frame first, ask
-   * once, keep the object URLs. Photos already held or already asked for are skipped, so a
-   * re-list of the same page sends nothing. Every URL is revoked in `dispose`, every
-   * subscription dropped once its frame arrived or the engine said it will not come.
+   * The thumbnails a pane's visible cells need, in one `catalog.thumbnails`: subscribe to
+   * every LTHM frame first, ask once, keep the object URLs. Photos already held or already
+   * asked for are skipped, so the scroll events that do not bring a new cell into reach
+   * send nothing — and it is one call per window, never one per cell.
+   *
+   * `pane` is the caller's id. Two panes draw cells at once (the grid covers the viewer,
+   * the filmstrip stays under it), and each one's window has to survive the other's
+   * eviction pass. Every URL is revoked in `dispose`, every subscription dropped once its
+   * frame arrived or the engine said it will not come.
    */
-  private requestThumbnails(visible: CatalogPhoto[]): void {
+  needThumbnails(pane: string, visible: CatalogPhoto[]): void {
+    this.shownThumbnails.set(pane, new SvelteSet(visible.map((photo) => thumbnailKey(photo))));
     const wanted = missingThumbnails(visible, [
       ...this.thumbnails.keys(),
       ...this.pendingThumbnails.keys(),
@@ -349,6 +374,7 @@ export class CatalogState {
       const unsubscribe = this.engine.onThumbnail(photo.photoId, (_header, jpeg) => {
         this.thumbnails.set(key, URL.createObjectURL(jpeg));
         this.dropPending(key);
+        this.evictThumbnails();
       });
       this.pendingThumbnails.set(key, unsubscribe);
     }
@@ -364,6 +390,28 @@ export class CatalogState {
       .catch(() => {
         for (const photo of wanted) this.dropPending(thumbnailKey(photo));
       });
+  }
+
+  /**
+   * Drops the oldest thumbnails once the cache is over its bound, skipping anything a pane
+   * says it is drawing. A `SvelteMap` keeps insertion order, so the front of it is what was
+   * fetched longest ago — which, scrolling, is what is furthest from the screen.
+   */
+  private evictThumbnails(): void {
+    for (const key of this.thumbnails.keys()) {
+      if (this.thumbnails.size <= thumbnailCacheSize) return;
+      if (this.isShown(key)) continue;
+      const url = this.thumbnails.get(key);
+      if (url) URL.revokeObjectURL(url);
+      this.thumbnails.delete(key);
+    }
+  }
+
+  private isShown(key: string): boolean {
+    for (const keys of this.shownThumbnails.values()) {
+      if (keys.has(key)) return true;
+    }
+    return false;
   }
 
   /** Frees the thumbnails of rows that are gone: the URL, the cache slot, the wait. */

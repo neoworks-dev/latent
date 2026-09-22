@@ -28,6 +28,7 @@ WorkflowBindings bindings_from_json(const nlohmann::json& value) {
   bindings.prompt = value.value("prompt", std::string());
   bindings.seed = value.value("seed", std::string());
   bindings.model = value.value("model", std::string());
+  bindings.strength = value.value("strength", std::string());
   bindings.output = value.value("output", std::string());
   return bindings;
 }
@@ -83,6 +84,7 @@ nlohmann::json fill_workflow(const Workflow& workflow, const WorkflowValues& val
   substitute(graph, workflow.bindings.mask, values.mask, "the mask");
   substitute(graph, workflow.bindings.prompt, values.prompt, "the prompt");
   substitute(graph, workflow.bindings.seed, values.seed, "the seed");
+  substitute(graph, workflow.bindings.strength, values.strength, "the strength");
   if (!values.model.empty()) substitute(graph, workflow.bindings.model, values.model, "the model");
   return graph;
 }

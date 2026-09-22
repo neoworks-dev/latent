@@ -5,6 +5,8 @@ export const FRAME_MAGIC_PREVIEW = "LFRM";
 export const FRAME_MAGIC_THUMBNAIL = "LTHM";
 /** `mask.preview`'s raster: r8 coverage, one byte per pixel, `format` 2. */
 export const FRAME_MAGIC_MASK = "LMSK";
+/** `depth.preview`'s map: r8 nearness in image space, never letterboxed, `format` 2. */
+export const FRAME_MAGIC_DEPTH = "LDPT";
 
 /** Payload encodings, as `format` in the header. */
 export const FRAME_FORMAT_RGBA8 = 0;
@@ -39,7 +41,8 @@ export function parseFrameHeader(buffer: ArrayBuffer): FrameHeader {
   }
   const view = new DataView(buffer);
   const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-  if (magic !== FRAME_MAGIC_PREVIEW && magic !== FRAME_MAGIC_THUMBNAIL && magic !== FRAME_MAGIC_MASK) {
+  const known = [FRAME_MAGIC_PREVIEW, FRAME_MAGIC_THUMBNAIL, FRAME_MAGIC_MASK, FRAME_MAGIC_DEPTH];
+  if (!known.includes(magic)) {
     throw new Error(`unknown binary frame magic ${magic}`);
   }
   return {

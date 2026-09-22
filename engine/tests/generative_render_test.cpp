@@ -199,3 +199,54 @@ TEST_CASE("the ops above a generative op still apply to its pixels") {
   CHECK(after[0] < before[0]);
   CHECK(after[2] < before[2]);
 }
+
+TEST_CASE(
+    "a whole-frame raster covers the frame, and an upscaled one does not resize the preview") {
+  Fixture fixture;
+  try {
+    fixture.renderer = std::make_unique<Renderer>(16384);
+  } catch (const std::exception& error) {
+    SKIP(std::string("no GPU adapter: ") + error.what());
+  }
+  fixture.renderer->load_photo(1, flat_raw());
+  fixture.renderer->open_view(1, 1, kWidth, kHeight);
+  fixture.frame.resize(static_cast<size_t>(kWidth) * kHeight * 4);
+
+  const std::vector<uint8_t> empty = fixture.render(Stack{});
+
+  std::vector<std::string> warnings;
+  Op denoise;
+  denoise.id = "d1";
+  denoise.name = "denoise";
+  denoise.params = normalize_params_for(denoise.name, {{"strength", 50}}, warnings);
+  denoise.result = "generative/d1.png";
+  denoise.result_rect = {0, 0, 1, 1};
+
+  // No mask, so the composite mixes at full coverage over the whole content rect: every
+  // pixel of the frame is the model's, which is what "the raster is the new input" means.
+  fixture.renderer->put_generative_result(1, "d1", "generative/d1.png", magenta(kWidth, kHeight));
+  const std::vector<uint8_t> denoised = fixture.render(Stack{denoise});
+  for (uint32_t y = 0; y < kHeight; y += 8) {
+    for (uint32_t x = 0; x < kWidth; x += 8) {
+      const std::array<uint8_t, 3> texel = pixel_at(denoised, x, y);
+      REQUIRE(texel[0] > texel[1]);
+      REQUIRE(texel[2] > texel[1]);
+    }
+  }
+  CHECK(denoised != empty);
+
+  // An upscale's raster is bigger than the frame it lands in. The preview is proxy
+  // resolution either way, so the composite samples it down and the frame keeps its size —
+  // only render_export renders at the larger one (issue #52).
+  Op upscale;
+  upscale.id = "u1";
+  upscale.name = "upscale";
+  upscale.params = normalize_params_for(upscale.name, {{"factor", "2x"}}, warnings);
+  upscale.result = "generative/u1.png";
+  upscale.result_rect = {0, 0, 1, 1};
+  fixture.renderer->put_generative_result(1, "u1", "generative/u1.png",
+                                          magenta(kWidth * 2, kHeight * 2));
+  const std::vector<uint8_t> enlarged = fixture.render(Stack{upscale});
+  CHECK(enlarged.size() == empty.size());
+  CHECK(enlarged != empty);
+}

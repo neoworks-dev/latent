@@ -145,6 +145,8 @@ export interface Client {
   readonly thumbnails: Frame[];
   /** LMSK rasters, one byte per pixel, newest last. */
   readonly masks: Frame[];
+  /** LDPT depth maps, the same shape but in image space rather than view space. */
+  readonly depths: Frame[];
   frame: Frame | null;
 }
 
@@ -171,11 +173,13 @@ export async function connect(endpoint: string): Promise<Client> {
   const notifications: Notification[] = [];
   const thumbnails: Frame[] = [];
   const masks: Frame[] = [];
+  const depths: Frame[] = [];
   let nextId = 1;
   const client: Client = {
     notifications,
     thumbnails,
     masks,
+    depths,
     frame: null,
     call(method, params = {}) {
       const id = nextId++;
@@ -211,13 +215,13 @@ export async function connect(endpoint: string): Promise<Client> {
         thumbnails.push(frame);
         return;
       }
-      if (magic === "LMSK") {
-        assert(view.getUint32(20, true) === 2, "mask frames must be format 2 (r8)");
+      if (magic === "LMSK" || magic === "LDPT") {
+        assert(view.getUint32(20, true) === 2, `${magic} frames must be format 2 (r8)`);
         assert(
           frame.pixels.length === frame.width * frame.height,
-          "an LMSK body is one byte per pixel",
+          `an ${magic} body is one byte per pixel`,
         );
-        masks.push(frame);
+        (magic === "LMSK" ? masks : depths).push(frame);
         return;
       }
       assert(magic === "LFRM", `unexpected frame magic ${magic}`);

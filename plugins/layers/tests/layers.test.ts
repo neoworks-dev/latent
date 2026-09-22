@@ -3,12 +3,15 @@ import type { Op, OpDefinition } from "@latent/protocol";
 import {
   dropIndex,
   duplicateOp,
+  groupSummary,
+  isGroup,
   layerRows,
   maskSummary,
   opacityOf,
   paramSummary,
   removeOp,
   reorderByDisplay,
+  rowTitle,
   soloed,
   stackIndexOf,
 } from "../src/layers";
@@ -123,5 +126,34 @@ describe("the stack as a layer list", () => {
   test("an op without an opacity is a full-strength layer", () => {
     expect(opacityOf(op("op1"))).toBe(100);
     expect(opacityOf({ ...op("op1"), opacity: 0 })).toBe(0);
+  });
+});
+
+describe("layers that are masks", () => {
+  const group: Op = {
+    id: "g1",
+    op: "group",
+    params: {},
+    enabled: true,
+    mask: { components: [{ id: "sky1", kind: "sky", mode: "add" }] },
+    ops: [op("c1", "exposure", { value: 1 }), op("c2", "clarity", { value: 20 })],
+  };
+  const definitions: OpDefinition[] = [
+    exposure,
+    { name: "clarity", panel: "effects", label: "Clarity", params: [] },
+  ];
+
+  test("a layer is named by what its mask selects, not by the op", () => {
+    expect(isGroup(group)).toBe(true);
+    expect(rowTitle(group, undefined)).toBe("sky");
+    // A layer whose mask is still empty is not nameless.
+    expect(rowTitle({ ...group, mask: undefined }, undefined)).toBe("Mask");
+    // An ordinary adjustment still reads as itself.
+    expect(rowTitle(op("op1"), exposure)).toBe(exposure.label);
+  });
+
+  test("a layer's second line is the adjustments under its mask", () => {
+    expect(groupSummary(group, definitions)).toBe("Exposure · Clarity");
+    expect(groupSummary({ ...group, ops: [] }, definitions)).toBe("no adjustments");
   });
 });

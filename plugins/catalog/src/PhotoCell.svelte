@@ -20,6 +20,7 @@
     selected,
     open,
     cellClass = "",
+    cellStyle = "",
     onselect,
     onactivate,
   }: {
@@ -30,6 +31,8 @@
     /** The photo the viewer currently has open. */
     open: boolean;
     cellClass?: string;
+    /** Inline size for a cell the caller measured: the grid's justified rows. */
+    cellStyle?: string;
     onselect: (event: MouseEvent) => void;
     onactivate: () => void;
   } = $props();
@@ -57,6 +60,7 @@
 <div
   class="group relative overflow-hidden rounded-md border bg-raised outline-none
          transition-colors duration-fast {cellClass}"
+  style={cellStyle}
   class:border-line-faint={!selected && !open}
   class:border-line-strong={open && !selected}
   class:border-action={selected}

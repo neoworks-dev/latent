@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -223,4 +224,57 @@ TEST_CASE("an unknown photo id is reported, not invented") {
   REQUIRE(!catalog->get(4242).has_value());
   REQUIRE(!catalog->set_rating(4242, 3));
   REQUIRE(!catalog->set_flag(4242, "pick"));
+}
+
+TEST_CASE("watched roots survive a reopen and widen but never narrow") {
+  TemporaryCatalog catalog;
+  catalog->watch_folder("/photos/trip", false);
+  REQUIRE(catalog->watched_folders().size() == 1);
+  REQUIRE(catalog->watched_folders().at(0).recursive == false);
+
+  // Importing the same folder recursively widens the watch; importing it flat again
+  // afterwards must not take the subtree back off.
+  catalog->watch_folder("/photos/trip", true);
+  catalog->watch_folder("/photos/trip", false);
+  REQUIRE(catalog->watched_folders().at(0).recursive);
+
+  Catalog reopened(catalog.path());
+  REQUIRE(reopened.watched_folders().at(0).path == "/photos/trip");
+  reopened.unwatch_folder("/photos/trip");
+  REQUIRE(reopened.watched_folders().empty());
+}
+
+TEST_CASE("a folder is watched when a recursive root covers it") {
+  TemporaryCatalog catalog;
+  catalog->register_photo("/photos/trip/a.arw", sample("Sony", 100), false);
+  catalog->register_photo("/photos/other/b.arw", sample("Sony", 100), false);
+  catalog->register_photo("/photos/tripwire/c.arw", sample("Sony", 100), false);
+  catalog->watch_folder("/photos/trip", true);
+
+  const std::vector<CatalogFolder> folders = catalog->folders();
+  REQUIRE(folders.size() == 3);
+  const auto watched = [&folders](const std::string& path) {
+    for (const CatalogFolder& folder : folders) {
+      if (folder.path == path) return folder.watched;
+    }
+    FAIL("folder missing: " + path);
+    return false;
+  };
+  REQUIRE(watched("/photos/trip"));
+  REQUIRE(!watched("/photos/other"));
+  // The root is a path prefix of this one, but not a parent of it.
+  REQUIRE(!watched("/photos/tripwire"));
+}
+
+TEST_CASE("a non-recursive root covers only itself") {
+  TemporaryCatalog catalog;
+  catalog->register_photo("/photos/trip/a.arw", sample("Sony", 100), false);
+  catalog->register_photo("/photos/trip/raw/b.arw", sample("Sony", 100), false);
+  catalog->watch_folder("/photos/trip", false);
+
+  const std::vector<CatalogFolder> folders = catalog->folders();
+  REQUIRE(folders.at(0).path == "/photos/trip");
+  REQUIRE(folders.at(0).watched);
+  REQUIRE(folders.at(1).path == "/photos/trip/raw");
+  REQUIRE(!folders.at(1).watched);
 }

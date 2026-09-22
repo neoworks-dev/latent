@@ -41,17 +41,6 @@ std::string format_timestamp(time_t when) {
   return std::string(buffer.data(), written);
 }
 
-std::string format_shutter(double seconds) {
-  if (seconds <= 0) return {};
-  std::array<char, 32> buffer{};
-  if (seconds >= 1.0) {
-    std::snprintf(buffer.data(), buffer.size(), "%.1f", seconds);
-    return std::string(buffer.data());
-  }
-  std::snprintf(buffer.data(), buffer.size(), "1/%d", static_cast<int>(std::lround(1.0 / seconds)));
-  return std::string(buffer.data());
-}
-
 // LibRaw reports the sensor orientation separately; 5 and 6 are the 90 degree rotations,
 // so the catalog's width/height must swap to match what the viewer shows.
 void apply_flip(int flip, uint32_t& width, uint32_t& height) {
@@ -105,6 +94,17 @@ Rgb8Image half_size_preview(const std::string& path) {
 }
 
 }  // namespace
+
+std::string format_shutter(double seconds) {
+  if (seconds <= 0) return {};
+  std::array<char, 32> buffer{};
+  if (seconds >= 1.0) {
+    std::snprintf(buffer.data(), buffer.size(), "%.1f", seconds);
+    return std::string(buffer.data());
+  }
+  std::snprintf(buffer.data(), buffer.size(), "1/%d", static_cast<int>(std::lround(1.0 / seconds)));
+  return std::string(buffer.data());
+}
 
 bool is_raw_extension(const std::string& path) {
   std::string extension = std::filesystem::path(path).extension().string();

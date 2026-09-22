@@ -34,6 +34,7 @@ enum class MaskKind : uint8_t {
   Luminance,
   Color,
   Depth,
+  Trails,
 };
 
 enum class MaskMode : uint8_t { Add, Subtract, Intersect };
@@ -60,8 +61,10 @@ std::string_view mask_mode_name(MaskMode mode);
 std::string_view mask_state_name(MaskState state);
 std::string_view mask_space_name(MaskSpace space);
 
-// True for the kinds that need a model run (mask.detect): subject, sky, background,
-// objects, people, text, depth. The rest rasterise inline from their params.
+// True for the kinds whose raster is produced by a mask.detect job: subject, sky,
+// background, objects, people, text, depth, trails. The rest rasterise inline from their
+// params. `trails` is the one that runs no model — it is a line detector (ai/trails.h) —
+// but it goes through the same job, cache and staleness path as the rest.
 bool mask_kind_is_ai(MaskKind kind);
 
 // Throw OpError, which the server maps to -32602.
@@ -122,6 +125,13 @@ std::string mask_hash(const nlohmann::json& canonical, uint32_t width, uint32_t 
 // once per sidecar.
 void migrate_mask_space(Stack& stack, uint32_t photo_width, uint32_t photo_height);
 nlohmann::json migrate_mask_space(const nlohmann::json& mask, const GeometryMap& map);
+
+// Masks written before groups sit on the adjustment itself. Each one becomes a group of
+// one: the mask and the opacity move up, the adjustment stays under them, and the rendered
+// result is the same except for where it lands in the pipeline (PipelineStage::Local).
+// Generative ops keep their own mask — it is the region a backend painted, not a layer.
+// Idempotent: a stack that already holds groups is left alone.
+void migrate_mask_groups(Stack& stack);
 
 // ---- brush strokes ------------------------------------------------------------------
 // The engine owns the stroke list: the UI appends to it with mask.stroke and never sends

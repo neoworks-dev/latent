@@ -5,7 +5,13 @@
 // The frame is rgba8 *sRGB* (protocol/frames.md, format 0), so the texture is plain RGBA8
 // and the shader passes the bytes through untouched — an SRGB8_ALPHA8 texture would
 // linearise on sample and wash the image out against an untagged drawing buffer.
-import type { EngineFrame, FrameDrawMarks } from "@latent/contracts";
+import {
+  type EngineFrame,
+  type FrameDrawMarks,
+  type FrameSink,
+  type FrameTransform,
+  IDENTITY_FRAME_TRANSFORM,
+} from "@latent/contracts";
 
 // gl_VertexID spans the clip cube with three vertices, so there is no buffer to bind.
 // Frame rows run top-down and GL texture space runs bottom-up, hence the flipped v.
@@ -17,12 +23,25 @@ void main() {
   gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
+// `view` is the inverse of the client-side zoom and pan: (1/scale, x/width, y/height), so a
+// destination texel asks which source texel it came from. highp because a 32x zoom divides
+// a texture coordinate by 32 and mediump runs out of mantissa well before that.
 const FRAGMENT_SHADER = `#version 300 es
-precision mediump float;
+precision highp float;
 uniform sampler2D frame;
+uniform vec3 view;
 in vec2 texCoord;
 out vec4 color;
-void main() { color = texture(frame, texCoord); }`;
+void main() {
+  vec2 source = (texCoord - view.yz) * view.x;
+  if (any(lessThan(source, vec2(0.0))) || any(greaterThan(source, vec2(1.0)))) {
+    // The engine's own letterbox colour (shaders/display.wgsl): what a gesture uncovers
+    // reads as the bars beside the photo instead of a smeared edge texel.
+    color = vec4(0.08, 0.08, 0.09, 1.0);
+    return;
+  }
+  color = texture(frame, source);
+}`;
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
   const shader = gl.createShader(type);
@@ -56,12 +75,15 @@ function link(gl: WebGL2RenderingContext): WebGLProgram {
   return program;
 }
 
-export class FramePainter {
+export class FramePainter implements FrameSink {
   private gl: WebGL2RenderingContext | null = null;
   private program: WebGLProgram | null = null;
   private texture: WebGLTexture | null = null;
   private textureWidth = 0;
   private textureHeight = 0;
+  private viewLocation: WebGLUniformLocation | null = null;
+  /** The client-side zoom or pan the frame on the GPU is being shown under. */
+  private transform: FrameTransform = IDENTITY_FRAME_TRANSFORM;
 
   constructor(private readonly canvas: HTMLCanvasElement) {
     this.gl = this.createContext();
@@ -82,6 +104,7 @@ export class FramePainter {
     }
     const { width, height } = frame.header;
     this.resize(gl, width, height);
+    this.uploadTransform(gl);
     gl.texSubImage2D(
       gl.TEXTURE_2D,
       0,
@@ -96,6 +119,20 @@ export class FramePainter {
     const uploaded = performance.now();
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     return { drawStarted, uploaded, drawn: performance.now() };
+  }
+
+  /**
+   * Shows the frame already on the GPU somewhere else: the zoom or pan the user has asked
+   * for since it was rendered. One uniform and one draw — no upload, so this costs nothing
+   * next to the 4 MB a fresh frame would — and the engine's own frame replaces it when it
+   * lands, which is what makes the picture sharp again.
+   */
+  setTransform(transform: FrameTransform): void {
+    this.transform = transform;
+    const gl = this.gl;
+    if (!gl || !this.texture || gl.isContextLost()) return;
+    this.uploadTransform(gl);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
   dispose(): void {
@@ -120,8 +157,19 @@ export class FramePainter {
     this.program = link(gl);
     gl.useProgram(this.program);
     gl.uniform1i(gl.getUniformLocation(this.program, "frame"), 0);
+    this.viewLocation = gl.getUniformLocation(this.program, "view");
     gl.activeTexture(gl.TEXTURE0);
     return gl;
+  }
+
+  private uploadTransform(gl: WebGL2RenderingContext): void {
+    const { scale, x, y } = this.transform;
+    gl.uniform3f(
+      this.viewLocation,
+      scale > 0 ? 1 / scale : 1,
+      x / Math.max(1, this.textureWidth),
+      y / Math.max(1, this.textureHeight),
+    );
   }
 
   /** Canvas, texture storage and viewport follow the frame size, never the frame rate. */
@@ -152,6 +200,7 @@ export class FramePainter {
     if (this.program) gl.deleteProgram(this.program);
     this.texture = null;
     this.program = null;
+    this.viewLocation = null;
     this.textureWidth = 0;
     this.textureHeight = 0;
   }
@@ -162,6 +211,7 @@ export class FramePainter {
     this.gl = null;
     this.program = null;
     this.texture = null;
+    this.viewLocation = null;
     this.textureWidth = 0;
     this.textureHeight = 0;
   };

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { nextChrome, shellShortcut, showsRegion, type ShellKeyEvent } from "../src/shell";
+import {
+  nextChrome,
+  PANE_LAYOUT,
+  shellShortcut,
+  showsRegion,
+  viewerSafeArea,
+  type ShellKeyEvent,
+} from "../src/shell";
 
 function key(overrides: Partial<ShellKeyEvent> = {}): ShellKeyEvent {
   return {
@@ -51,5 +58,48 @@ describe("chrome", () => {
     expect(showsRegion("sides", "right")).toBe(true);
     expect(showsRegion("none", "right")).toBe(false);
     expect(showsRegion("none", "center")).toBe(true);
+  });
+});
+
+describe("the viewer's safe area", () => {
+  test("is the window minus the cards that float over it", () => {
+    const { gutter, left, right, rail } = PANE_LAYOUT;
+    expect(viewerSafeArea("all", true, 96)).toEqual({
+      left: gutter * 2 + left,
+      top: gutter,
+      right: gutter * 3 + right + rail,
+      bottom: gutter * 2 + 96,
+    });
+  });
+
+  test("a hidden card leaves only the gutter behind", () => {
+    const { gutter, right, rail } = PANE_LAYOUT;
+    // Tab: the left column and the filmstrip go, the right one stays.
+    expect(viewerSafeArea("sides", true, 96)).toEqual({
+      left: gutter,
+      top: gutter,
+      right: gutter * 3 + right + rail,
+      bottom: gutter,
+    });
+    // Shift+Tab: nothing floats, so the fitted photo has the whole window but the gutter.
+    expect(viewerSafeArea("none", true, 96)).toEqual({
+      left: gutter,
+      top: gutter,
+      right: gutter,
+      bottom: gutter,
+    });
+    // No pane registered for the left region at all.
+    expect(viewerSafeArea("all", false, 96).left).toBe(gutter);
+    // A footer that has not been measured yet is not a gap to keep clear.
+    expect(viewerSafeArea("all", true, 0).bottom).toBe(gutter);
+  });
+
+  test("an open rail flyout takes its own width off the right", () => {
+    const { gutter, right, rail, flyout } = PANE_LAYOUT;
+    expect(viewerSafeArea("all", true, 96, true).right).toBe(
+      gutter * 3 + right + rail + flyout + gutter,
+    );
+    // The flyout hangs off the rail, so hiding the rail hides it too.
+    expect(viewerSafeArea("none", true, 96, true).right).toBe(gutter);
   });
 });

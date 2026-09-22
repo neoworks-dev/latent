@@ -17,6 +17,11 @@ inline constexpr std::string_view kSam2Model = "sam2-hiera-base-plus";
 inline constexpr std::string_view kFlorenceModel = "florence-2-base";
 inline constexpr std::string_view kBiRefNetModel = "birefnet-lite";
 inline constexpr std::string_view kSegFormerModel = "segformer-b2-ade20k";
+// Not a mask model: monocular depth for the relight op and the `depth` mask kind.
+inline constexpr std::string_view kDepthModel = "depth-anything-v2-small";
+// Also not a mask model: the restoration network the `denoise` op runs on locally, instead
+// of asking ComfyUI to re-roll the frame through a generator (issue #51, ai/denoise.h).
+inline constexpr std::string_view kDenoiseModel = "scunet-color-real";
 
 std::string model_store_root();
 std::string model_dir(std::string_view model);

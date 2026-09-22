@@ -2,9 +2,15 @@
   import { kernelContext } from "@latent/contracts";
   import type { OpDefinition, OpParamSpec } from "@latent/protocol";
   import { Checkbox, Select } from "@neoworks-dev/ui";
-  import { controlKind, paramValue, pendingNote, rowLabel, sliderRange, trackTint } from "./panels";
-  import Slider from "./Slider.svelte";
-  import ValueField from "./ValueField.svelte";
+  import {
+    controlKind,
+    controlValue,
+    pendingNote,
+    rowLabel,
+    sliderRange,
+    trackTint,
+  } from "./panels";
+  import BoxedSlider from "./BoxedSlider.svelte";
 
   const {
     op,
@@ -33,8 +39,9 @@
   const options = $derived((spec.values ?? []).map((value) => ({ value, label: value })));
 
   // The stack is the truth: the control shows whatever the engine last reported, and
-  // falls back to the described default while the op is not in the stack.
-  const current = $derived(paramValue(viewer.stack, op, spec, opId));
+  // falls back to the described default while the op is not in the stack — or while the
+  // selected mask does not hold it, which is where the next write would go.
+  const current = $derived(controlValue(viewer.stack, op, spec, opId, viewer.maskTarget));
   const disabled = $derived(viewer.photoId === null);
   const tint = $derived(trackTint(spec));
 
@@ -62,29 +69,13 @@
   }
 </script>
 
-<div class="px-3 py-0.5" data-op={op.name} data-param={spec.name}>
+<!-- More room on the right than the left: the reset dot hangs off the end of the box and
+     would otherwise sit under the column's edge. -->
+<div class="py-[3px] pr-3 pl-2" data-op={op.name} data-param={spec.name}>
   {#if kind === "slider"}
-    <div class="flex items-center justify-between gap-2">
-      <button
-        type="button"
-        class="truncate rounded-sm py-1 text-left text-xs leading-none text-muted
-               transition-colors hover:text-default"
-        title="Double-click to reset"
-        ondblclick={reset}
-        data-label={spec.name}>{label}</button
-      >
-      <ValueField
-        value={Number(current)}
-        {spec}
-        {range}
-        {disabled}
-        {label}
-        onInput={(next) => write(next, true)}
-        onCommit={(next) => write(next, false)}
-      />
-    </div>
-    <Slider
+    <BoxedSlider
       value={Number(current)}
+      {spec}
       {range}
       {disabled}
       {label}

@@ -29,6 +29,9 @@ struct WorkflowBindings {
   std::string prompt;
   std::string seed;
   std::string model;
+  // The sampler's denoise widget, for the `denoise` graph: how far the model is allowed to
+  // move the picture. Empty for every graph whose strength is not a number it takes.
+  std::string strength;
   // Node id of the SaveImage the result comes out of, so the envelope's outputs_by_node
   // can be read without guessing which output is the picture.
   std::string output;
@@ -36,7 +39,8 @@ struct WorkflowBindings {
 
 struct Workflow {
   std::string name;
-  // Which op it serves: "fill" for generative_fill, "remove" for remove.
+  // Which op it serves: "fill" for generative_fill, "remove" for remove, "denoise" and
+  // "upscale" for the two whole-frame ops.
   std::string task;
   std::string label;
   // Weight files the graph loads. Reported by generative.status so the UI can say which
@@ -52,6 +56,8 @@ struct WorkflowValues {
   std::string mask;
   std::string prompt;
   int64_t seed = 0;
+  // 0..1, substituted into the graph's denoise widget when it has one.
+  double strength = 0;
   // Empty leaves the graph's own loader alone.
   std::string model;
 };

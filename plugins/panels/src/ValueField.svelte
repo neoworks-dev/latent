@@ -12,6 +12,8 @@
     scrubbedValue,
     type SliderRange,
   } from "./panels";
+  import ScrubCursor from "./ScrubCursor.svelte";
+  import { pointerLockDisabled, ScrubDrag, wrapAround } from "./scrub";
 
   const {
     value,
@@ -33,14 +35,15 @@
 
   let editing = $state(false);
   let draft = $state("");
+  /** Where the drawn cursor is while the real one is locked, in window pixels. */
+  let cursor = $state({ x: 0, y: 0 });
+  let locked = $state(false);
   let input = $state<HTMLInputElement | null>(null);
-  let scrubStartX = $state(0);
   let scrubStartValue = $state(0);
-  let scrubbing = $state(false);
-  let pressed = $state(false);
 
-  /** Below this a press is a click that opens the editor, above it a scrub. */
-  const SCRUB_THRESHOLD_PX = 3;
+  // The same locked drag the boxed slider uses: the cursor is frozen for the scrub, so
+  // running out of screen does not run out of value.
+  const drag = new ScrubDrag();
 
   $effect(() => {
     if (!editing || !input) return;
@@ -67,31 +70,38 @@
 
   function onPointerDown(event: PointerEvent): void {
     if (disabled || editing) return;
-    pressed = true;
-    scrubbing = false;
-    scrubStartX = event.clientX;
     scrubStartValue = value;
     const target = event.currentTarget;
-    if (target instanceof HTMLElement) target.setPointerCapture(event.pointerId);
+    if (!(target instanceof HTMLElement)) return;
+    target.setPointerCapture(event.pointerId);
+    // The lock is what lets the scrub outlive the edge of the screen; the driver's
+    // synthetic moves are the one case it has to be left off.
+    drag.begin(pointerLockDisabled(location.search) ? null : target, document);
+    cursor = { x: event.clientX, y: event.clientY };
   }
 
   function onPointerMove(event: PointerEvent): void {
-    if (!pressed) return;
-    const deltaX = event.clientX - scrubStartX;
-    if (!scrubbing && Math.abs(deltaX) < SCRUB_THRESHOLD_PX) return;
-    scrubbing = true;
-    onInput(scrubbedValue(scrubStartValue, deltaX, range, event));
+    // The drawn cursor keeps going where the real one cannot, out one side of the window
+    // and in at the other.
+    cursor = {
+      x: wrapAround(cursor.x + event.movementX, window.innerWidth),
+      y: wrapAround(cursor.y + event.movementY, window.innerHeight),
+    };
+    const moved = drag.move(event.movementX, document.pointerLockElement !== null);
+    if (moved === null) return;
+    locked = document.pointerLockElement !== null;
+    onInput(scrubbedValue(scrubStartValue, moved, range, event));
   }
 
   function onPointerUp(event: PointerEvent): void {
-    if (!pressed) return;
-    pressed = false;
-    if (!scrubbing) {
+    const moved = drag.end();
+    locked = false;
+    if (moved === null) {
+      if (disabled || editing) return;
       beginEdit();
       return;
     }
-    scrubbing = false;
-    onCommit(scrubbedValue(scrubStartValue, event.clientX - scrubStartX, range, event));
+    onCommit(scrubbedValue(scrubStartValue, moved, range, event));
   }
 
   function onKeyDown(event: KeyboardEvent): void {
@@ -136,4 +146,7 @@
     onkeydown={onKeyDown}
     data-readout={spec.name}>{formatValue(value, spec)}</button
   >
+{/if}
+{#if locked}
+  <ScrubCursor x={cursor.x} y={cursor.y} />
 {/if}

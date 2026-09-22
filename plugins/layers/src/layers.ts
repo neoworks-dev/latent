@@ -120,6 +120,31 @@ export function paramSummary(op: Op, definition: OpDefinition | undefined): stri
   return "default";
 }
 
+/** A layer: a group of adjustments under one mask (protocol Op.ops, PROMPT.md 3.7). */
+export function isGroup(op: Op): boolean {
+  return op.op === "group";
+}
+
+/**
+ * The name a row shows. A layer is named by what its mask selects rather than by the op —
+ * "group" is the engine's word for it and means nothing to the person reading the column.
+ */
+export function rowTitle(op: Op, definition: OpDefinition | undefined): string {
+  if (!isGroup(op)) return definition?.label ?? op.op;
+  const kinds = [...new Set((op.mask?.components ?? []).map((component) => component.kind))];
+  if (kinds.length === 0) return "Mask";
+  return kinds.join(", ");
+}
+
+/** A layer's second line: the adjustments sharing its mask, in the order they were added. */
+export function groupSummary(op: Op, definitions: OpDefinition[]): string {
+  const names = (op.ops ?? []).map(
+    (child) => definitions.find((entry) => entry.name === child.op)?.label ?? child.op,
+  );
+  if (names.length === 0) return "no adjustments";
+  return names.join(" · ");
+}
+
 /** The mask summary on a row: how many components, or nothing when the op has no mask. */
 export function maskSummary(op: Op): string {
   const count = op.mask?.components.length ?? 0;

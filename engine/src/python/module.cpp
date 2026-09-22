@@ -303,6 +303,51 @@ bool is_component_field(const std::string& key) {
   return key == "id" || key == "mode" || key == "invert" || key == "feather" || key == "opacity";
 }
 
+std::string add_op_to_group(int64_t photo_id, const std::string& group_id, const std::string& name,
+                            const nlohmann::json& params) {
+  const OpDefinition& definition = require_definition(name);
+  if (!definition.maskable() || is_generative_op(name)) {
+    throw py::value_error("latent: '" + name + "' cannot sit inside a group");
+  }
+  const std::string op_id = make_op_id();
+  const nlohmann::json normalised = normalized(name, params, photo_id);
+  edit_stack(photo_id, [&](Stack& stack) {
+    Op& group = require_op(stack, group_id);
+    if (!group.is_group()) throw std::runtime_error("latent: op '" + group_id + "' is not a group");
+    Op op;
+    op.id = op_id;
+    op.name = name;
+    op.params = normalised;
+    group.ops.push_back(std::move(op));
+  });
+  return op_id;
+}
+
+// Applying a preset replaces the unmasked op of the same name when there is one, so the
+// same preset twice is idempotent instead of stacking two exposures.
+void apply_ops(int64_t photo_id, const py::iterable& ops) {
+  std::vector<nlohmann::json> incoming;
+  for (const py::handle& item : ops) {
+    py::object value = py::reinterpret_borrow<py::object>(item);
+    if (py::isinstance<OpRef>(value)) value = value.attr("to_dict")();
+    incoming.push_back(python_to_json(value));
+  }
+  edit_stack(photo_id, [&](Stack& stack) {
+    for (const nlohmann::json& entry : incoming) {
+      Op op = op_from_json(entry);
+      op.params = normalized(op.name, op.params, photo_id);
+      Op* base = find_base_op(stack, op.name);
+      if (base == nullptr) {
+        op.id = make_op_id();
+        stack.push_back(std::move(op));
+        continue;
+      }
+      base->params = op.params;
+      base->enabled = op.enabled;
+    }
+  });
+}
+
 void bind_mask(py::module_& module) {
   py::class_<MaskRef>(module, "OpMask",
                       "One op's mask: a component list combined top-down (PROMPT.md 3.7).")
@@ -416,11 +461,11 @@ void bind_op(py::module_& module) {
           })
       // Generative ops only (PROMPT.md 3.5): the cached raster's path, the hash it was made
       // from, and whether the stack has moved under it since. Empty on every other op.
-      .def_property_readonly("result",
-                             [](const OpRef& self) {
-                               return op_json(self.photo_id, self.op_id)
-                                   .value("result", std::string());
-                             })
+      .def_property_readonly(
+          "result",
+          [](const OpRef& self) {
+            return op_json(self.photo_id, self.op_id).value("result", std::string());
+          })
       .def_property_readonly("stale",
                              [](const OpRef& self) {
                                return on_engine([&] {
@@ -433,9 +478,32 @@ void bind_op(py::module_& module) {
            [](const OpRef& self) {
              // Returns the jobId. The op is untouched until the job lands, and nothing in
              // the engine ever starts one on its own.
-             return on_engine(
-                 [&] { return engine().run_generative(self.photo_id, self.op_id); });
+             return on_engine([&] { return engine().run_generative(self.photo_id, self.op_id); });
            })
+      // Groups (PROMPT.md 3.7): a layer is one mask and the adjustments under it.
+      .def_property_readonly("is_group",
+                             [](const OpRef& self) {
+                               return op_json(self.photo_id, self.op_id)["op"].get<std::string>() ==
+                                      kGroupOpName;
+                             })
+      .def_property_readonly(
+          "ops",
+          [](const OpRef& self) {
+            const nlohmann::json op = op_json(self.photo_id, self.op_id);
+            py::list items;
+            if (!op.contains("ops")) return items;
+            for (const nlohmann::json& child : op["ops"]) {
+              items.append(py::cast(OpRef{self.photo_id, child["id"].get<std::string>()}));
+            }
+            return items;
+          })
+      .def(
+          "add",
+          [](const OpRef& self, const std::string& name, const py::kwargs& params) {
+            return OpRef{self.photo_id,
+                         add_op_to_group(self.photo_id, self.op_id, name, python_to_json(params))};
+          },
+          py::arg("op"), "Adds an adjustment under this group's mask. Groups only (PROMPT.md 3.7).")
       .def("to_dict",
            [](const OpRef& self) { return json_to_python(op_json(self.photo_id, self.op_id)); })
       .def("__repr__", [](const OpRef& self) {
@@ -464,29 +532,22 @@ std::string add_op(int64_t photo_id, const std::string& name, const nlohmann::js
   return op_id;
 }
 
-// Applying a preset replaces the unmasked op of the same name when there is one, so the
-// same preset twice is idempotent instead of stacking two exposures.
-void apply_ops(int64_t photo_id, const py::iterable& ops) {
-  std::vector<nlohmann::json> incoming;
-  for (const py::handle& item : ops) {
-    py::object value = py::reinterpret_borrow<py::object>(item);
-    if (py::isinstance<OpRef>(value)) value = value.attr("to_dict")();
-    incoming.push_back(python_to_json(value));
-  }
+// A new layer: a group with an empty mask, ready for `.mask.add(...)` and `.add(...)`.
+std::string add_group(int64_t photo_id, const py::object& index) {
+  const std::string op_id = make_op_id();
   edit_stack(photo_id, [&](Stack& stack) {
-    for (const nlohmann::json& entry : incoming) {
-      Op op = op_from_json(entry);
-      op.params = normalized(op.name, op.params, photo_id);
-      Op* base = find_base_op(stack, op.name);
-      if (base == nullptr) {
-        op.id = make_op_id();
-        stack.push_back(std::move(op));
-        continue;
-      }
-      base->params = op.params;
-      base->enabled = op.enabled;
+    Op group;
+    group.id = op_id;
+    group.name = std::string(kGroupOpName);
+    size_t at = stack.size();
+    if (!index.is_none()) {
+      const auto requested = index.cast<int64_t>();
+      at = static_cast<size_t>(
+          std::min<int64_t>(std::max<int64_t>(requested, 0), static_cast<int64_t>(stack.size())));
     }
+    stack.insert(stack.begin() + static_cast<ptrdiff_t>(at), std::move(group));
   });
+  return op_id;
 }
 
 void bind_stack(py::module_& module) {
@@ -518,14 +579,24 @@ void bind_stack(py::module_& module) {
             return OpRef{self.photo_id, add_op(self.photo_id, name, python_to_json(params), index)};
           },
           py::arg("op"), py::arg("index") = py::none())
+      .def(
+          "group",
+          [](const StackRef& self, const py::object& index) {
+            return OpRef{self.photo_id, add_group(self.photo_id, index)};
+          },
+          py::arg("index") = py::none(),
+          "A new layer: an empty group. Give it a mask with `.mask.add(kind)` and the "
+          "adjustments that share it with `.add(op, **params)` (PROMPT.md 3.7).")
       .def("remove",
            [](const StackRef& self, const OpRef& op) {
              edit_stack(self.photo_id, [&](Stack& stack) {
-               const auto found = std::find_if(stack.begin(), stack.end(), [&](const Op& entry) {
-                 return entry.id == op.op_id;
-               });
-               if (found == stack.end()) throw std::runtime_error("latent: op is gone");
-               stack.erase(found);
+               // A child goes from its group, and a group goes with its children.
+               Op* parent = find_parent_group(stack, op.op_id);
+               Stack& from = parent == nullptr ? stack : parent->ops;
+               const auto found = std::find_if(
+                   from.begin(), from.end(), [&](const Op& entry) { return entry.id == op.op_id; });
+               if (found == from.end()) throw std::runtime_error("latent: op is gone");
+               from.erase(found);
              });
            })
       .def("apply",
@@ -648,6 +719,17 @@ void bind_photo(py::module_& module) {
             return preview_jpeg(self.id, max_size, region);
           },
           py::arg("max") = 1024, py::arg("region") = py::none())
+      // Depth (PROMPT.md 3.8). `estimate_depth` returns a jobId and the map arrives later,
+      // like every other model run; `has_depth` says whether one is there now. A relight op
+      // renders nothing until it is.
+      .def("estimate_depth",
+           [](const PhotoRef& self) {
+             return on_engine([&] { return engine().estimate_depth(self.id); });
+           })
+      .def_property_readonly("has_depth",
+                             [](const PhotoRef& self) {
+                               return on_engine([&] { return engine().has_depth(self.id); });
+                             })
       .def("undo",
            [](const PhotoRef& self) { return on_engine([&] { return engine().undo(self.id); }); })
       .def("redo",
@@ -838,8 +920,7 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
         if (!dpi.is_none()) resize["dpi"] = dpi.cast<int>();
         if (!resize.empty()) params["resize"] = resize;
         if (!sharpen.is_none()) {
-          params["sharpen"] = {{"target", sharpen.cast<std::string>()},
-                               {"amount", sharpen_amount}};
+          params["sharpen"] = {{"target", sharpen.cast<std::string>()}, {"amount", sharpen_amount}};
         }
         if (!file_name_template.is_none()) {
           params["fileNameTemplate"] = file_name_template.cast<std::string>();
@@ -849,9 +930,8 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
       py::arg("photos"), py::arg("output_dir"), py::arg("format") = "jpeg",
       py::arg("color_space") = "srgb", py::arg("quality") = py::none(),
       py::arg("long_edge") = py::none(), py::arg("width") = py::none(),
-      py::arg("height") = py::none(), py::arg("dpi") = py::none(),
-      py::arg("sharpen") = py::none(), py::arg("sharpen_amount") = "standard",
-      py::arg("file_name_template") = py::none(),
+      py::arg("height") = py::none(), py::arg("dpi") = py::none(), py::arg("sharpen") = py::none(),
+      py::arg("sharpen_amount") = "standard", py::arg("file_name_template") = py::none(),
       "Queue a batch export and return {jobId, total, files}. `photos` is a Photo, an id, "
       "a list of either, or None for the current photo. The files are written while the "
       "job runs; watch job.progress kind 'export' for its state.");

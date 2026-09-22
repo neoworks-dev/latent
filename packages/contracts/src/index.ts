@@ -2,6 +2,7 @@ import "./desktop";
 import "./services";
 
 export type {
+  DepthListener,
   EngineClient,
   EngineConnectionState,
   EngineFrame,
@@ -11,12 +12,13 @@ export type {
 } from "./engine";
 export type { LatentDesktopBridge } from "./desktop";
 export type { GeometryMode, GeometryView } from "./geometry";
-export type { PaneDefinition, PaneRegistry } from "./panes";
+export type { PaneDefinition, PaneRegistry, SafeArea } from "./panes";
 export { paneModes, panesForMode } from "./panes";
 export type {
   ContentRect,
   FrameDrawMarks,
   FrameSink,
+  FrameTransform,
   ImageTransform,
   OverlayDraw,
   OverlayMap,
@@ -31,7 +33,10 @@ export {
   applyImageTransform,
   clampViewportScale,
   containRect,
+  contentRectFor,
   FIT_VIEWPORT,
+  frameTransform,
+  IDENTITY_FRAME_TRANSFORM,
   IDENTITY_IMAGE_TRANSFORM,
   imagePoint,
   invertImageTransform,
@@ -39,6 +44,7 @@ export {
   MIN_VIEWPORT_SCALE,
   oneToOneScale,
   panViewport,
+  transformImageMatrix,
   zoomLabel,
   zoomViewport,
 } from "./viewer";

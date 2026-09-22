@@ -34,6 +34,7 @@ export const generativePlugin: Plugin.Object<void> = {
   },
 };
 
+export { RasterOpState } from "./raster.svelte";
 export {
   failureMessage,
   generativeOps,
@@ -41,4 +42,6 @@ export {
   modelOptions,
   opLabels,
   statusLine,
+  taskOf,
+  textParam,
 } from "./generative";

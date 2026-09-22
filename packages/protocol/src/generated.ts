@@ -13,6 +13,9 @@ export type MethodName =
   | "op.remove"
   | "history.undo"
   | "history.redo"
+  | "history.list"
+  | "history.jump"
+  | "history.revertOp"
   | "view.open"
   | "view.close"
   | "view.render"
@@ -29,12 +32,17 @@ export type MethodName =
   | "catalog.thumbnails"
   | "catalog.remove"
   | "job.cancel"
+  | "preview.prioritize"
   | "merge.hdr"
   | "merge.panorama"
   | "merge.hdrPanorama"
+  | "merge.starTrail"
   | "merge.preview"
   | "mask.preview"
   | "mask.detect"
+  | "depth.estimate"
+  | "depth.status"
+  | "depth.preview"
   | "generative.run"
   | "generative.status"
   | "mask.stroke"
@@ -43,8 +51,10 @@ export type MethodName =
   | "engine.log"
   | "catalog.changed"
   | "job.progress"
+  | "photo.resolution"
   | "python.output"
-  | "python.finished";
+  | "python.finished"
+  | "depth.changed";
 /**
  * Engine → UI messages without an id. Calling one as a method is a -32601 error.
  */
@@ -53,8 +63,10 @@ export type NotificationName =
   | "engine.log"
   | "catalog.changed"
   | "job.progress"
+  | "photo.resolution"
   | "python.output"
-  | "python.finished";
+  | "python.finished"
+  | "depth.changed";
 /**
  * Stable catalog id (SQLite rowid), so an i64. LTHM binary frames carry it in a u32 slot (protocol/frames.md), which caps thumbnails at 4294967295: catalog.thumbnail and catalog.thumbnails answer -32602 for a larger id instead of sending a frame with a truncated target. Every other method takes the full range.
  */
@@ -62,7 +74,7 @@ export type PhotoId = number;
 export type ViewId = number;
 export type OpId = string;
 /**
- * Mirrors Lightroom's Masking panel. AI kinds (subject, sky, background, objects, people, text) rasterise through mask.detect as a job; the rest rasterise inline from their params.
+ * Mirrors Lightroom's Masking panel, plus the two kinds Lightroom has no answer for. Detected kinds (subject, sky, background, objects, people, text, depth, trails) rasterise through mask.detect as a job; the rest rasterise inline from their params. `depth` is the odd one: its raster is the scene's depth map rather than a selection, and `params.range` bands it in the shader, so moving the range is a slider and not another model run. `trails` is the other: it runs a line detector rather than a model, so it needs nothing from the model store, and because its raster is derived from the frame and its seed stroke alone, the same component detects the aircraft trails in every photo it is copied to.
  */
 export type MaskComponentKind =
   | "subject"
@@ -76,7 +88,8 @@ export type MaskComponentKind =
   | "radial"
   | "luminance"
   | "color"
-  | "depth";
+  | "depth"
+  | "trails";
 export type JobId = number;
 export type Stack = Op[];
 /**
@@ -88,6 +101,12 @@ export type ExportFormat = "jpeg" | "tiff16" | "png" | "avif";
  */
 export type ExportColorSpace = "srgb" | "displayP3" | "adobeRGB" | "rec2020" | "proPhoto";
 export type PhotoFlag = "none" | "pick" | "reject";
+/**
+ * The stack after the add, and the id the engine gave the new op — a caller that added into a group cannot find it by position.
+ */
+export type OpAddResult = StackGetResult & {
+  opId: OpId;
+};
 /**
  * One python.run execution. Unique per engine process, so a client can tell its own run's output from another socket's.
  */
@@ -114,7 +133,15 @@ export type MergeDeghost = "none" | "low" | "medium" | "high";
  * Lightroom's Layout projection. `perspective` composes on a flat canvas; `cylindrical` and `spherical` pre-warp each frame around the focal length read from EXIF before composing.
  */
 export type MergeProjection = "spherical" | "cylindrical" | "perspective";
-export type MergeKind = "hdr" | "panorama" | "hdrPanorama";
+export type MergeKind = "hdr" | "panorama" | "hdrPanorama" | "starTrail";
+/**
+ * `lighten` takes the brightest frame per pixel, which is what draws the trails. `average` takes the mean: one long exposure with sqrt(N) less noise and no trails.
+ */
+export type MergeTrailBlend = "lighten" | "average";
+/**
+ * Where the still half of the picture comes from. `lighten` treats it like everything else, so it also collects every frame's hot pixels and any headlight that swept the ground. `firstFrame` keeps frame one there and lets a later frame in only where it is `foregroundThreshold` brighter.
+ */
+export type MergeTrailForeground = "lighten" | "firstFrame";
 
 /**
  * JSON-RPC 2.0 methods between the Latent engine and its UI. Each method has <Method>Params and <Method>Result. Phase 0 surface only.
@@ -135,6 +162,13 @@ export interface LatentProtocol {
   MaskPreviewResult?: MaskPreviewResult;
   MaskDetectParams?: MaskDetectParams;
   MaskDetectResult?: MaskDetectResult;
+  DepthEstimateParams?: DepthEstimateParams;
+  DepthEstimateResult?: DepthEstimateResult;
+  DepthStatusParams?: DepthStatusParams;
+  DepthStatusResult?: DepthStatusResult;
+  DepthPreviewParams?: DepthPreviewParams;
+  DepthPreviewResult?: DepthPreviewResult;
+  DepthChangedParams?: DepthChangedParams;
   GenerativeRunParams?: GenerativeRunParams;
   GenerativeRunResult?: GenerativeRunResult;
   GenerativeStatusParams?: GenerativeStatusParams;
@@ -165,7 +199,7 @@ export interface LatentProtocol {
   StackSetParams?: StackSetParams;
   StackSetResult?: StackGetResult;
   OpAddParams?: OpAddParams;
-  OpAddResult?: StackGetResult;
+  OpAddResult?: OpAddResult;
   OpUpdateParams?: OpUpdateParams;
   OpUpdateResult?: StackGetResult;
   OpRemoveParams?: OpRemoveParams;
@@ -174,6 +208,15 @@ export interface LatentProtocol {
   HistoryUndoResult?: StackGetResult;
   HistoryRedoParams?: StackGetParams;
   HistoryRedoResult?: StackGetResult;
+  HistoryChange?: HistoryChange;
+  HistoryEntry?: HistoryEntry;
+  HistoryStep?: HistoryStep;
+  HistoryListParams?: StackGetParams;
+  HistoryListResult?: HistoryListResult;
+  HistoryJumpParams?: HistoryJumpParams;
+  HistoryJumpResult?: StackGetResult;
+  HistoryRevertOpParams?: HistoryRevertOpParams;
+  HistoryRevertOpResult?: StackGetResult;
   ViewOpenParams?: ViewOpenParams;
   ViewOpenResult?: ViewOpenResult;
   ViewCloseParams?: ViewCloseParams;
@@ -193,6 +236,9 @@ export interface LatentProtocol {
   RunId?: RunId;
   CatalogImportParams?: CatalogImportParams;
   CatalogImportResult?: CatalogImportResult;
+  PreviewPrioritizeParams?: PreviewPrioritizeParams;
+  PreviewPrioritizeResult?: PreviewPrioritizeResult;
+  PhotoResolutionParams?: PhotoResolutionParams;
   CatalogListParams?: CatalogListParams;
   CatalogListResult?: CatalogListResult;
   CatalogGetParams?: CatalogGetParams;
@@ -221,12 +267,16 @@ export interface LatentProtocol {
   MergeDeghost?: MergeDeghost;
   MergeProjection?: MergeProjection;
   MergeKind?: MergeKind;
+  MergeTrailBlend?: MergeTrailBlend;
+  MergeTrailForeground?: MergeTrailForeground;
   MergeHdrParams?: MergeHdrParams;
   MergeHdrResult?: MergeHdrResult;
   MergePanoramaParams?: MergePanoramaParams;
   MergePanoramaResult?: MergePanoramaResult;
   MergeHdrPanoramaParams?: MergeHdrPanoramaParams;
   MergeHdrPanoramaResult?: MergeHdrPanoramaResult;
+  MergeStarTrailParams?: MergeStarTrailParams;
+  MergeStarTrailResult?: MergeStarTrailResult;
   MergePreviewParams?: MergePreviewParams;
   MergePreviewResult?: MergePreviewResult;
 }
@@ -249,7 +299,7 @@ export interface RpcError {
   data?: unknown;
 }
 /**
- * One entry of the op-stack. `op` names a definition from ops.describe; `params` validates against that definition's schema.
+ * One entry of the op-stack. `op` names a definition from ops.describe; `params` validates against that definition's schema. The reserved name `"group"` is the exception: it has no definition and no params, and is a layer — one mask, one opacity, and the adjustments under them in `ops` (PROMPT.md 3.7).
  */
 export interface Op {
   id: OpId;
@@ -257,9 +307,13 @@ export interface Op {
   params: {
     [k: string]: unknown | undefined;
   };
+  /**
+   * Groups only (`op` is `group`): the adjustments under this group's mask, in the user's order. They render as one branch off the group's input and are blended back through the mask once. A child carries `enabled` and its params; `mask` and `opacity` belong to the group, and a group is never a child of a group.
+   */
+  ops?: Op[];
   mask?: Mask;
   /**
-   * Layer opacity 0–100; absent means 100. The op's output is mixed into its input by opacity × mask.
+   * Layer opacity 0–100; absent means 100. The op's output is mixed into its input by opacity × mask; on a group it scales the whole layer.
    */
   opacity?: number;
   enabled: boolean;
@@ -313,7 +367,7 @@ export interface MaskComponent {
    */
   opacity?: number;
   /**
-   * Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched.
+   * Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. trails: {seed:[[x,y]] — the stroke drawn along one aircraft trail, which is what the detector measures every other streak against; a path and not a box, because a trail is a line and a box around a diagonal one is mostly sky. At most 256 points, thinned by the client — plus sensitivity 0–100 (how much dimmer than the seed a streak may be), minLength 1–100 (shortest streak kept, as a percentage of the long edge) and grow 0–100 (margin drawn around each streak, as a percentage of a two-hundredth of the long edge — a trail is two or three pixels wide and the mask is meant to hug it). AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched.
    */
   params?: {
     [k: string]: unknown | undefined;
@@ -379,7 +433,58 @@ export interface MaskDetectResult {
   jobId: JobId;
 }
 /**
- * Runs one generative op (PROMPT.md 3.5). The engine renders the ops below it, crops the op's mask bounding box plus padding to at most 1536 px on the long edge, hands the crop and the mask to the backend, and stores the result as `Op.result`. Ticks job.progress with kind "generative" and publishes stack.changed when it lands. Nothing else ever starts a run: an op whose `stale` is true keeps rendering its last result until this is called again. An op that is not generative, or has no mask, is a -32602 error.
+ * Runs monocular depth estimation over the photo (PROMPT.md 3.8) and caches the map as `<photo>.latent.d/depth.png`. Ticks job.progress with kind "depth" and publishes depth.changed when it lands. The map belongs to the photo rather than to the stack — it is not edit state, it costs no undo step, and no slider can make it stale — so re-running it is always an explicit ask. A `relight` op renders nothing until one exists, and a `depth` mask component contributes nothing.
+ */
+export interface DepthEstimateParams {
+  photoId: PhotoId;
+}
+export interface DepthEstimateResult {
+  jobId: JobId;
+}
+/**
+ * Whether the photo has a depth map right now. A UI asks this when it opens a photo; after that depth.changed says when one lands.
+ */
+export interface DepthStatusParams {
+  photoId: PhotoId;
+}
+export interface DepthStatusResult {
+  photoId: PhotoId;
+  ready: boolean;
+  /**
+   * What produced the map. Absent when there is none.
+   */
+  model?: string;
+}
+/**
+ * Sends the photo's depth map as one LDPT binary frame on the calling socket (protocol/frames.md), then answers with its size. A photo with no map is a -32602 error.
+ */
+export interface DepthPreviewParams {
+  photoId: PhotoId;
+}
+/**
+ * The LDPT frame's own size. Unlike a mask preview this is image space and has no letterbox: 0..1 over the uncropped photo, so a client draws it through `imageTransform` like any other mask coordinate.
+ */
+export interface DepthPreviewResult {
+  photoId: PhotoId;
+  width: number;
+  height: number;
+  /**
+   * What produced the map — the model's store name, or the stub.
+   */
+  model?: string;
+}
+/**
+ * Broadcast when a depth.estimate job lands. Not a stack change — nothing in the op-stack moved — but every relight op on the photo starts rendering, so a client re-renders its view.
+ */
+export interface DepthChangedParams {
+  photoId: PhotoId;
+  ready: boolean;
+  model?: string;
+  width?: number;
+  height?: number;
+}
+/**
+ * Runs one generative op (PROMPT.md 3.5). The engine renders the ops below it, crops the op's mask bounding box plus padding to at most 1536 px on the long edge, hands the crop and the mask to the backend, and stores the result as `Op.result`. Ticks job.progress with kind "generative" and publishes stack.changed when it lands. Nothing else ever starts a run: an op whose `stale` is true keeps rendering its last result until this is called again. An op that is not generative is a -32602 error, and so is a masked generative op with no mask. `denoise` and `upscale` are the whole-frame ops (issues #51, #52): they take no mask, the whole frame goes to the backend, and `upscale`'s raster comes back larger than the photo — every coordinate on the wire stays normalised over the uncropped photo regardless.
  */
 export interface GenerativeRunParams {
   photoId: PhotoId;
@@ -419,7 +524,7 @@ export interface GenerativeStatusResult {
   models?: string[];
   workflows: {
     name: string;
-    task: "fill" | "remove";
+    task: "fill" | "remove" | "denoise" | "upscale";
     label?: string;
     /**
      * Every weight file the graph loads is installed.
@@ -462,7 +567,18 @@ export interface StackGetResult {
   canUndo: boolean;
   canRedo: boolean;
   histogram?: Histogram;
+  /**
+   * Which snapshot of the undo stack this is, counting the photo's opening state as 0. `revision` is a change counter that advances on every write, transient drag ticks included; this counts undo steps, so a slider drag moves it by one however many frames it took.
+   */
+  historyIndex?: number;
+  /**
+   * How many snapshots the undo stack holds, the opening state included, so `historyIndex + 1 == historyDepth` means nothing is left to redo.
+   */
+  historyDepth?: number;
 }
+/**
+ * 256 bins per channel over the 8-bit display pixels, plus the share of pixels at either end. On ViewRenderResult it is counted over the image rect of the frame that was just sent, letterbox excluded, so it belongs to those pixels; on StackGetResult it comes from whatever frame the view last drew, which is one render behind the edit that is being answered.
+ */
 export interface Histogram {
   bins: number;
   r: number[];
@@ -569,10 +685,19 @@ export interface OpDefinition {
    */
   order?: number;
   /**
-   * The op accepts `mask` and `opacity` (every develop op). Geometry ops and generative ops that own their region are not maskable; absent = false.
+   * The op accepts `mask` and `opacity` (every develop op). Geometry ops, generative ops that own their region, and the whole-frame `denoise`/`upscale` are not maskable; absent = false.
    */
   maskable?: boolean;
-  panel: "light" | "color" | "effects" | "detail" | "optics" | "geometry" | "generative";
+  panel:
+    | "light"
+    | "color"
+    | "effects"
+    | "detail"
+    | "optics"
+    | "geometry"
+    | "generative"
+    | "enhance"
+    | "relight";
   label: string;
   params: OpParamSpec[];
 }
@@ -619,6 +744,10 @@ export interface PhotoOpenResult {
    * True when an existing .latent sidecar was read and its stack restored.
    */
   sidecarLoaded: boolean;
+  /**
+   * True when `<photo>.latent.d/depth.png` was there and is loaded. False means a relight op would render nothing until depth.estimate is called.
+   */
+  depthReady?: boolean;
   catalog?: CatalogPhoto;
 }
 /**
@@ -673,6 +802,10 @@ export interface StackGetParams {
 export interface StackSetParams {
   photoId: PhotoId;
   stack: Stack;
+  /**
+   * What to call this step in the history list, when the caller knows something the diff cannot see: `Golden hour applied`, `Settings pasted`. Absent means the step is named after what it changed.
+   */
+  label?: string;
 }
 export interface OpAddParams {
   photoId: PhotoId;
@@ -684,9 +817,13 @@ export interface OpAddParams {
     [k: string]: unknown | undefined;
   };
   /**
-   * Insert position; end of stack when omitted.
+   * Insert position; end of stack — or of the group named by `parentId` — when omitted.
    */
   index?: number;
+  /**
+   * Add the op inside this group instead of at the top level, so it shares that layer's mask (PROMPT.md 3.7). The group's own `mask` and `opacity` win: both are ignored on the child. -32602 when the id is not a group, or when the op cannot sit in one.
+   */
+  parentId?: string;
   /**
    * True when the add is the first tick of a slider drag: no history snapshot, no sidecar write, so the whole drag undoes as one step. The first non-transient update after it snapshots.
    */
@@ -722,6 +859,66 @@ export interface OpUpdateParams {
 }
 export interface OpRemoveParams {
   photoId: PhotoId;
+  opId: OpId;
+}
+/**
+ * One parameter this step moved. `from` and `to` are the parameter's own values, so the UI formats them with the spec ops.describe gave the control. A value that is not a scalar - a curve's point list - is reported as a change with neither, since a list of points is nothing a history row can show.
+ */
+export interface HistoryChange {
+  param: string;
+  from?: number | string | boolean;
+  to?: number | string | boolean;
+}
+/**
+ * One op inside a `batch` step, described exactly as a step of its own would be. `opId` is what history.revertOp takes to put this one op back to what it was before the step, leaving the rest of the batch where it is.
+ */
+export interface HistoryEntry {
+  kind: "add" | "remove" | "update" | "mask";
+  op: string;
+  opId: OpId;
+  changes?: HistoryChange[];
+}
+/**
+ * One snapshot of the undo stack, described by what it changed from the snapshot before it. Index 0 is the state the photo opened in, so its kind is `initial` and it has no changes. A drag is one step: the engine replaces the snapshot in place while it runs (StackGetResult.historyIndex).
+ */
+export interface HistoryStep {
+  index: number;
+  kind: "initial" | "add" | "remove" | "update" | "mask" | "reorder" | "batch";
+  /**
+   * The op this step is about, by name: `exposure`, `group`. Absent on `initial`, `reorder` and `batch`, which are about the stack rather than one entry.
+   */
+  op?: string;
+  /**
+   * What the caller called this step (StackSetParams.label) - `Golden hour applied`. A UI shows it instead of the name it would otherwise derive, because the caller knew something the diff cannot see.
+   */
+  label?: string;
+  /**
+   * `batch` only: the ops this step touched, one each. A preset moves a dozen at once and naming the step after any one of them would be a lie, so they are listed - which is also what lets a UI unfold the row and revert one of them on its own (history.revertOp).
+   */
+  entries?: HistoryEntry[];
+  opId?: OpId;
+  changes?: HistoryChange[];
+}
+/**
+ * The whole undo stack of one photo, described. One entry per snapshot, oldest first; `index` is where the cursor sits, the same number StackGetResult.historyIndex carries.
+ */
+export interface HistoryListResult {
+  entries: HistoryStep[];
+  index: number;
+}
+/**
+ * Moves the undo cursor straight to one snapshot - clicking a row of the history list. Out of range is -32602; the step that is already current is accepted and changes nothing.
+ */
+export interface HistoryJumpParams {
+  photoId: PhotoId;
+  index: number;
+}
+/**
+ * Puts one op back to what it was before step `index`, and leaves everything else where it is - unfolding a preset's row and taking back the one adjustment that did not suit the photo. It is an edit, not a cursor move: a new step is committed on top, so the revert itself undoes. -32602 when the step or the op is not there, or when `index` is 0, which has no state before it.
+ */
+export interface HistoryRevertOpParams {
+  photoId: PhotoId;
+  index: number;
   opId: OpId;
 }
 /**
@@ -764,6 +961,15 @@ export interface ViewRenderParams {
     centerX?: number;
     centerY?: number;
   };
+  /**
+   * What the client floats over the frame — its panels — in frame pixels. A fitted photo is fitted into the view minus these and centred in what is left, so no panel covers it; a zoomed one still fills the whole frame and runs on behind them. Sticky per view like `viewport`, and not edit state. Absent or all-zero is the old behaviour: fit the whole view.
+   */
+  insets?: {
+    left?: number;
+    top?: number;
+    right?: number;
+    bottom?: number;
+  };
 }
 export interface ViewRenderResult {
   seq: number;
@@ -801,6 +1007,7 @@ export interface ViewRenderResult {
   };
   renderMs: number;
   readbackMs: number;
+  histogram?: Histogram;
 }
 export interface PythonRunParams {
   code: string;
@@ -869,7 +1076,7 @@ export interface CatalogCollection {
   count: number;
 }
 /**
- * Registers files (or every raw in the given directories) in the catalog and queues thumbnails. Returns immediately; progress arrives as job.progress notifications.
+ * Registers files (or every photo in the given directories) in the catalog, then queues thumbnails and previews. Returns immediately; progress arrives as job.progress notifications. Idempotent per path — a row that already exists has its metadata refreshed and keeps its rating, flag and importedAt — so calling this again over a folder is how a rescan is spelled. Every directory in `paths` also becomes a watched root: photos that land in it later are catalogued without being asked for, and the watch is remembered across restarts. Single files never start a watch.
  */
 export interface CatalogImportParams {
   /**
@@ -887,6 +1094,31 @@ export interface CatalogImportResult {
    * The thumbnail job the import queues behind itself, reserved up front so a client can follow both from the one result. Its job.progress carries parentJobId = jobId. It always reports, even when the import found nothing or was cancelled — then with total 0. Absent from an engine that does not queue thumbnails.
    */
   thumbnailJobId?: number;
+  /**
+   * The preview job: one full decode per imported photo, scaled into the engine's preview cache so opening any of them later costs a file read instead of a second of LibRaw. Runs on a thread of its own — the app stays usable — and reports job.progress of kind `previews` with parentJobId = jobId. Cancellable like any other job. Absent from an engine that does not prewarm.
+   */
+  previewJobId?: number;
+}
+/**
+ * Photos to decode first. A running preview job takes these out of its queue before anything else, so the photo being looked at is ready ahead of the rest of the import. Naming a photo that is not queued, or that already has a preview, is not an error — the list is a hint. Each call replaces the previous one.
+ */
+export interface PreviewPrioritizeParams {
+  photoIds: PhotoId[];
+}
+export interface PreviewPrioritizeResult {
+  /**
+   * How many ids the engine recorded. The hint is kept whether or not a preview job is running.
+   */
+  prioritized: number;
+}
+/**
+ * A photo the engine opened from its cached preview now has the full-resolution decode behind it. The frame the client holds came off the proxy, so the views of this photo need re-rendering to show the sharp one. Sent only for a photo that was opened from a preview, and only once.
+ */
+export interface PhotoResolutionParams {
+  photoId: PhotoId;
+  width: number;
+  height: number;
+  full: boolean;
 }
 /**
  * Catalog rows, filtered and sorted. Every property narrows the result; combining them is an AND. Rows with equal sort keys are ordered by filename ascending, then by photoId ascending, so paging is stable and the same list never reshuffles between calls.
@@ -927,6 +1159,10 @@ export interface CatalogFoldersResult {
   folders: {
     path: string;
     count: number;
+    /**
+     * A watched root covers this folder, so photos that land in it are catalogued on their own. False means the folder is only as fresh as its last catalog.import over it, which is what a rescan is.
+     */
+    watched: boolean;
   }[];
 }
 export interface CatalogSetRatingParams {
@@ -1030,7 +1266,7 @@ export interface JobProgressParams {
    * The job that queued this one — set on the thumbnail job an import spawns, absent on a job nobody spawned. A progress UI nests the child under its parent instead of showing two unrelated bars.
    */
   parentJobId?: number;
-  kind: "import" | "thumbnails" | "export" | "mask" | "merge" | "generative";
+  kind: "import" | "thumbnails" | "previews" | "export" | "mask" | "merge" | "generative" | "depth";
   done: number;
   total: number;
   finished: boolean;
@@ -1134,6 +1370,42 @@ export interface MergeHdrPanoramaResult {
   jobId: JobId;
 }
 /**
+ * Stacks 2..500 frames of one night sequence into one linear 16-bit TIFF and registers it in the catalog. The frames are folded in as they decode and dropped again, so the count is bounded by patience rather than by memory. No alignment and no deghosting: a star trail merge assumes a tripod, and registering the frames would straighten the trails.
+ */
+export interface MergeStarTrailParams {
+  /**
+   * The sequence in shooting order. Order is what the comet decay and the gap fill read; a lighten stack alone does not care.
+   */
+  photoIds: PhotoId[];
+  /**
+   * `lighten` takes the brightest frame per pixel, which is what draws the trails. `average` takes the mean: one long exposure with sqrt(N) less noise and no trails.
+   */
+  blend?: "lighten" | "average";
+  /**
+   * Synthetic sub-frames between each pair, bridging the camera's write time so a trail is a line instead of a dotted one. Each is the later frame pulled back a fraction of the inter-frame shift, which is measured by correlating the two frames' high-passed luminance: a frame whose landscape outweighs its stars correlates at zero shift and the fill does nothing, and near the celestial pole the motion is a rotation that a shift only approximates.
+   */
+  gapFill?: number;
+  /**
+   * Where the still half of the picture comes from. `lighten` treats it like everything else, so it also collects every frame's hot pixels and any headlight that swept the ground. `firstFrame` keeps frame one there and lets a later frame in only where it is `foregroundThreshold` brighter.
+   */
+  foreground?: "lighten" | "firstFrame";
+  /**
+   * How far above frame one a pixel has to be before `foreground: "firstFrame"` lets it through, as a percentage of a tenth of the white level. Ignored by the other foreground rule and by `average`.
+   */
+  foregroundThreshold?: number;
+  /**
+   * Comet tails. 0 weights every frame the same; 100 fades the oldest frame 6 stops down, so each trail brightens toward where the star ended up.
+   */
+  decay?: number;
+  /**
+   * Absolute path of the TIFF to write. Default: `<first source without extension>-Trails.tif` next to the sources.
+   */
+  outputPath?: string;
+}
+export interface MergeStarTrailResult {
+  jobId: JobId;
+}
+/**
  * The same merge at preview size, from the raws' embedded JPEGs instead of a full decode — seconds instead of minutes. Writes a PNG and names it in the job's last job.progress `result`; nothing is written to the catalog.
  */
 export interface MergePreviewParams {
@@ -1153,6 +1425,17 @@ export interface MergePreviewParams {
   projection?: "spherical" | "cylindrical" | "perspective";
   boundaryWarp?: number;
   autoCrop?: boolean;
+  /**
+   * `lighten` takes the brightest frame per pixel, which is what draws the trails. `average` takes the mean: one long exposure with sqrt(N) less noise and no trails.
+   */
+  blend?: "lighten" | "average";
+  gapFill?: number;
+  /**
+   * Where the still half of the picture comes from. `lighten` treats it like everything else, so it also collects every frame's hot pixels and any headlight that swept the ground. `firstFrame` keeps frame one there and lets a later frame in only where it is `foregroundThreshold` brighter.
+   */
+  foreground?: "lighten" | "firstFrame";
+  foregroundThreshold?: number;
+  decay?: number;
   longEdge?: number;
 }
 export interface MergePreviewResult {

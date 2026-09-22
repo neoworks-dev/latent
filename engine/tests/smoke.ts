@@ -18,6 +18,7 @@ import {
   startEngine,
   timed,
 } from "./harness";
+import { builtinPresets } from "../../plugins/develop/src/presets";
 
 const outputPath = process.env.LATENT_SMOKE_PNG ?? "/tmp/latent-smoke.png";
 const aiOutputPath = process.env.LATENT_AI_MASK_PNG ?? "/tmp/latent-ai-masks.png";
@@ -90,6 +91,10 @@ const expectedOps = [
   // Generative sits beside Effects: PROMPT.md §3.5's cached rasters, not Lightroom panels.
   "generative_fill",
   "remove",
+  // And Relight beside those: PROMPT.md §3.8's virtual light over the depth map.
+  "denoise",
+  "upscale",
+  "relight",
   "sharpening",
   "noise_reduction",
   "color_noise_reduction",
@@ -129,7 +134,7 @@ for (const op of described.ops) {
   }
 }
 assert(
-  sectionsSeen.join(",") === "Light,Color,Effects,Generative,Detail,Optics,Geometry",
+  sectionsSeen.join(",") === "Light,Color,Effects,Generative,Enhance,Relight,Detail,Optics,Geometry",
   `ops.describe must arrive in Lightroom's panel order, got ${sectionsSeen}`,
 );
 
@@ -175,6 +180,23 @@ assert(
   "the colour mixer asks for the hand-built control",
 );
 
+// The shipped presets are the one place the UI writes op and parameter names it did not
+// read out of this call. `sanitize_stack` drops a name the registry does not know with a
+// warning, so a typo there is a preset row that silently does less than it says.
+for (const preset of builtinPresets) {
+  for (const [name, params] of Object.entries(preset.ops)) {
+    const definition = described.ops.find((op: any) => op.name === name);
+    assert(definition !== undefined, `preset ${preset.id} names unknown op '${name}'`);
+    for (const param of Object.keys(params)) {
+      assert(
+        definition.params.some((spec: any) => spec.name === param),
+        `preset ${preset.id} names unknown parameter '${name}.${param}'`,
+      );
+    }
+  }
+}
+console.log(`  ${builtinPresets.length} shipped presets name only registered parameters`);
+
 const sidecarPath = `${samplePath}.latent`;
 if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
 // Its sibling directory holds brush strokes and mask rasters; a stale one would make the
@@ -214,7 +236,9 @@ const view = await timed("view.open", () =>
 );
 let viewId: number = view.viewId;
 
-await timed("view.render (neutral)", () => ui.call("view.render", { viewId }));
+const neutralRender = await timed("view.render (neutral)", () =>
+  ui.call("view.render", { viewId }),
+);
 const neutral = ui.frame;
 assert(neutral, "no frame for the neutral render");
 
@@ -286,6 +310,32 @@ assert(
   `view.render must report the letterboxed image rect: ${JSON.stringify(render.contentRect)} vs ${JSON.stringify(expectedRect)}`,
 );
 assert(expectedRect[2]! < 1280, "the sample is portrait: its content rect cannot fill a 16:9 view");
+
+// The histogram rides on the render, counted over the content rect of the frame that was
+// just sent — the letterbox would otherwise pile the whole bar into bin 0.
+function histogramMean(bins: number[]): number {
+  let weighted = 0;
+  let total = 0;
+  for (const [level, count] of bins.entries()) {
+    weighted += level * count;
+    total += count;
+  }
+  return total === 0 ? 0 : weighted / total;
+}
+
+assert(render.histogram && render.histogram.bins === 256, "view.render should carry a histogram");
+const counted = render.histogram.r.reduce((sum: number, count: number) => sum + count, 0);
+assert(
+  counted === expectedRect[2]! * expectedRect[3]!,
+  `the histogram must count the content rect only: ${counted} vs ${expectedRect[2]! * expectedRect[3]!}`,
+);
+const neutralMean = histogramMean(neutralRender.histogram.r);
+const exposedMean = histogramMean(render.histogram.r);
+console.log(`  histogram mean ${neutralMean.toFixed(1)} -> ${exposedMean.toFixed(1)}`);
+assert(
+  exposedMean > neutralMean + 5,
+  "the histogram must follow the frame it was sent with, not the one before it",
+);
 
 // +1 EV must be visibly brighter than the neutral render of the same pixels.
 const brightNeutral = mean(neutral.pixels);
@@ -669,9 +719,10 @@ assert(
   "redo must bring the stroke back whole",
 );
 
-// AI kinds are jobs, and a failed one is a message, not a guess. `depth` is the kind that
-// fails the same way on every machine — Phase 2 owns it — so this covers the whole error
-// path whether or not the model store is on disk.
+// AI kinds are jobs: the component is `pending` until the raster lands, and a failure is a
+// message on the component rather than a guessed mask. `depth` is the kind checked here
+// because its answer is the same on every machine that has the model — the scene's depth
+// map — and because a machine without one must say exactly which model is missing.
 const aiMask = {
   id: "mask0002",
   op: "clarity",
@@ -697,30 +748,113 @@ await waitFor("the mask job to finish", () =>
 const maskJob = ui.notifications.find(
   (n) => n.method === "job.progress" && n.params.jobId === detect.jobId && n.params.finished,
 )!;
-console.log(`  mask job ${detect.jobId}: ${maskJob.params.state} — ${maskJob.params.error}`);
-const notImplemented = "depth masks are not implemented yet";
+console.log(`  mask job ${detect.jobId}: ${maskJob.params.state} — ${maskJob.params.error ?? ""}`);
 assert(maskJob.params.kind === "mask", "a mask job reports kind mask");
-assert(maskJob.params.state === "error", "a detect with no model must end in error");
-assert(maskJob.params.error === notImplemented, `wrong failure: ${maskJob.params.error}`);
-const failed = await ui.call("stack.get", { photoId });
-assert(failed.stack[1].mask.components[0].state === "failed", "the component must be failed");
+const depthModelInstalled = maskJob.params.state === "done";
+const afterDetect = await ui.call("stack.get", { photoId });
+const depthComponent = afterDetect.stack[1].mask.components[0];
+
+if (depthModelInstalled) {
+  assert(depthComponent.state === "ready", "a finished detect leaves the component ready");
+  assert(typeof depthComponent.params.model === "string", "the component records what made it");
+  assert(typeof depthComponent.params.raster === "string", "and where the raster was cached");
+  // The default range is the near half of the scene, so a photo of a subject standing in
+  // front of a wall selects something and not everything.
+  const depthMask = await ui.call("mask.preview", { photoId, opId: "mask0002", viewId });
+  console.log(`  depth mask covers ${(depthMask.coverage * 100).toFixed(1)}%`);
+  assert(depthMask.coverage > 0.01, "a depth mask must select the near part of the scene");
+  assert(depthMask.coverage < 0.99, "and must not select the whole frame");
+} else {
+  const missing = "model depth-anything-v2-small not installed (run scripts/models/fetch.py)";
+  assert(maskJob.params.state === "error", "a detect with no model must end in error");
+  assert(maskJob.params.error === missing, `wrong failure: ${maskJob.params.error}`);
+  assert(depthComponent.state === "failed", "the component must be failed");
+  assert(depthComponent.params.error === missing, "the reason belongs on the component");
+  // A pending or failed component contributes nothing, so its op does nothing at all.
+  const pendingPreview = await ui.call("mask.preview", { photoId, opId: "mask0002", viewId });
+  assert(pendingPreview.coverage === 0, "a failed component must contribute nothing");
+  const refusedComponent = await ui.fail("mask.preview", {
+    photoId,
+    opId: "mask0002",
+    componentId: "ai01",
+    viewId,
+  });
+  assert(
+    refusedComponent.startsWith("-32602"),
+    `a failed component has no raster: ${refusedComponent}`,
+  );
+}
+
+// ---- depth and relight (PROMPT.md 3.8) ---------------------------------------------------
+// The depth map belongs to the photo, not to the stack: one job, one cache file, and every
+// relight op on the photo starts rendering the moment it lands.
+await ui.call("stack.set", { photoId, stack: [] });
+await ui.call("view.render", { viewId });
+const beforeRelight = new Uint8Array(ui.frame!.pixels);
+
+const relit = {
+  op: "relight",
+  params: { x: 0.5, y: 0.1, distance: 25, intensity: 80, radius: 70, rays: 70, kelvin: 3200 },
+  enabled: true,
+};
+await ui.call("stack.set", { photoId, stack: [relit] });
+await ui.call("view.render", { viewId });
 assert(
-  failed.stack[1].mask.components[0].params.error === notImplemented,
-  "the reason belongs on the component",
+  difference(beforeRelight, ui.frame!.pixels) === 0,
+  "a relight op renders nothing until the photo has a depth map",
 );
-// A pending or failed component contributes nothing, so its op does nothing at all.
-const pendingPreview = await ui.call("mask.preview", { photoId, opId: "mask0002", viewId });
-assert(pendingPreview.coverage === 0, "a failed component must contribute nothing");
-const refusedComponent = await ui.fail("mask.preview", {
-  photoId,
-  opId: "mask0002",
-  componentId: "ai01",
-  viewId,
-});
 assert(
-  refusedComponent.startsWith("-32602"),
-  `a failed component has no raster: ${refusedComponent}`,
+  (await ui.fail("depth.preview", { photoId })).startsWith("-32602"),
+  "and there is no depth map to preview either",
 );
+
+const depthJob = await timed("depth.estimate", () => ui.call("depth.estimate", { photoId }));
+await waitFor("the depth job to finish", () =>
+  ui.notifications.some(
+    (n) => n.method === "job.progress" && n.params.jobId === depthJob.jobId && n.params.finished,
+  ),
+);
+const depthProgress = ui.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === depthJob.jobId && n.params.finished,
+)!;
+console.log(`  depth job ${depthJob.jobId}: ${depthProgress.params.state} — ${depthProgress.params.message}`);
+assert(depthProgress.params.kind === "depth", "a depth job reports kind depth");
+
+if (depthProgress.params.state === "done") {
+  const changed = ui.notifications.find((n) => n.method === "depth.changed");
+  assert(changed?.params.ready === true, "depth.changed announces the map");
+
+  const depthsBefore = ui.depths.length;
+  const preview = await timed("depth.preview", () => ui.call("depth.preview", { photoId }));
+  assert(ui.depths.length === depthsBefore + 1, "depth.preview sends exactly one LDPT frame");
+  const map = ui.depths.at(-1)!;
+  assert(
+    map.width === preview.width && map.height === preview.height,
+    "the frame and the result must agree on the size",
+  );
+  // A depth map that is one flat value is a broken one: the scene has a near and a far.
+  // Reduced rather than spread — a megapixel of arguments overflows the call stack.
+  let nearest = 0;
+  let farthest = 255;
+  for (const level of map.pixels) {
+    if (level > nearest) nearest = level;
+    if (level < farthest) farthest = level;
+  }
+  assert(nearest > 200, `something in the scene must be near, got ${nearest}`);
+  assert(farthest < 50, `and something must be far, got ${farthest}`);
+  console.log(`  depth map ${map.width}x${map.height}, mean ${mean(map.pixels).toFixed(0)}`);
+
+  await ui.call("view.render", { viewId });
+  const lit = new Uint8Array(ui.frame!.pixels);
+  assert(difference(beforeRelight, lit) > 0.2, "the same op now lights the frame");
+  assert(channelMean(lit, 0) > channelMean(beforeRelight, 0), "a 3200 K light warms it");
+  assert(
+    channelMean(lit, 0) - channelMean(beforeRelight, 0) >
+      channelMean(lit, 2) - channelMean(beforeRelight, 2),
+    "and warms the red channel more than the blue",
+  );
+}
+await ui.call("stack.set", { photoId, stack: [brushed, aiMask] });
 
 // ---- mask errors ------------------------------------------------------------------------
 assert(
@@ -820,6 +954,101 @@ assert(layer.opacity === 75, "op.add must store opacity");
 assert(layer.mask.components[0].id === "radial01", "op.add must store the mask");
 assert(layer.mask.components[0].state === "ready", "an inline kind is ready as soon as it exists");
 
+// ---- layers: one mask, several adjustments ----------------------------------------------
+// A mask is a layer of its own (PROMPT.md 3.7): it exists before anything is adjusted, and
+// the adjustments under it are blended back through it once, however many there are.
+await ui.call("stack.set", { photoId, stack: [] });
+await ui.call("view.render", { viewId });
+const beforeLayer = new Uint8Array(ui.frame!.pixels);
+
+const createdLayer = await timed("op.add (layer)", () =>
+  ui.call("op.add", { photoId, op: "group" }),
+);
+const layerId: string = createdLayer.opId;
+assert(typeof layerId === "string" && layerId.length > 0, "op.add must answer with the new id");
+assert(createdLayer.stack[0].ops.length === 0, "a new layer holds no adjustments yet");
+// The mask comes first — nothing had to be adjusted to select a region.
+await ui.call("op.update", {
+  photoId,
+  opId: layerId,
+  params: {},
+  mask: { components: [radialComponent] },
+});
+const layerPreview = await ui.call("mask.preview", { photoId, opId: layerId, viewId });
+assert(layerPreview.coverage > 0.02, "a layer's mask previews like any other");
+
+// Two adjustments under the one mask: the thing a per-op mask could not express.
+const firstChild = await ui.call("op.add", {
+  photoId,
+  op: "exposure",
+  params: { value: 2 },
+  parentId: layerId,
+});
+await ui.call("op.add", {
+  photoId,
+  op: "contrast",
+  params: { value: 60 },
+  parentId: layerId,
+});
+const layerState = await ui.call("stack.get", { photoId });
+assert(layerState.stack.length === 1, "the layer is one stack entry, whatever it holds");
+assert(
+  layerState.stack[0].ops.map((entry: { op: string }) => entry.op).join(",") ===
+    "exposure,contrast",
+  "both adjustments must sit under the layer",
+);
+await ui.call("view.render", { viewId });
+const layerFrame = new Uint8Array(ui.frame!.pixels);
+const layerRaster = ui.masks.at(-1)!;
+const insideLayer = meanWhere(layerFrame, layerRaster.pixels, (m) => m > 200);
+const insideBase = meanWhere(beforeLayer, layerRaster.pixels, (m) => m > 200);
+const outsideLayer = meanWhere(layerFrame, layerRaster.pixels, (m) => m === 0);
+const outsideBase = meanWhere(beforeLayer, layerRaster.pixels, (m) => m === 0);
+console.log(
+  `  layer inside ${insideBase.toFixed(1)} -> ${insideLayer.toFixed(1)}, ` +
+    `outside ${outsideBase.toFixed(1)} -> ${outsideLayer.toFixed(1)}`,
+);
+assert(insideLayer > insideBase + 20, "the layer's adjustments must reach inside its mask");
+assert(
+  Math.abs(outsideLayer - outsideBase) < 1.5,
+  "a layer must not touch a pixel outside its mask",
+);
+
+// The opacity is the layer's; a child that tries to carry one is told so on engine.log.
+const opacityLogs = ui.notifications.filter((n) => n.method === "engine.log").length;
+const childOpacity = await ui.call("op.update", {
+  photoId,
+  opId: firstChild.opId,
+  params: {},
+  opacity: 20,
+});
+assert(
+  childOpacity.stack[0].ops[0].opacity === undefined,
+  "an adjustment inside a layer has no opacity of its own",
+);
+assert(
+  ui.notifications.filter((n) => n.method === "engine.log").length > opacityLogs,
+  "ignoring a child's opacity must be announced on engine.log",
+);
+
+// Removing the layer takes everything under it.
+const afterLayer = await ui.call("op.remove", { photoId, opId: layerId });
+assert(afterLayer.stack.length === 0, "removing a layer removes its adjustments too");
+
+// A group cannot hold a group, and a geometry op cannot sit in one.
+const nestedGroup = await ui.fail("stack.set", {
+  photoId,
+  stack: [
+    {
+      op: "group",
+      params: {},
+      enabled: true,
+      ops: [{ op: "group", params: {}, enabled: true }],
+    },
+  ],
+});
+assert(nestedGroup.startsWith("-32602"), `a nested group must be -32602, got ${nestedGroup}`);
+
 // The stack the Python and MCP sections below expect.
 await ui.call("stack.set", { photoId, stack: [] });
 
@@ -843,6 +1072,51 @@ assert(maskValues[0] === 1 && maskValues[1] === "radial", "op.mask.add did not a
 assert(maskValues[2] === 40, "op.opacity did not stick");
 assert(maskValues[3] === true, "mask.add must return the component id it generated");
 assert(maskValues[4] > 100, "photo.masks.preview should return a PNG");
+// The same layer from Python: a group first, then the adjustments that share its mask.
+const scriptedLayer = await ui.call("python.run", {
+  code: [
+    "import json",
+    "p = latent.photo",
+    "layer = p.stack.group()",
+    "layer.mask.add('radial', center=[0.5, 0.5], radius=[0.2, 0.2], feather=0)",
+    "layer.add('exposure', value=1.0)",
+    "layer.add('clarity', value=30)",
+    "layer.opacity = 80",
+    "print(json.dumps([layer.is_group, [op.op for op in layer.ops], len(layer.mask),",
+    "                  layer.opacity]))",
+  ].join("\n"),
+  photoId,
+});
+assert(scriptedLayer.ok === true, `the layer script failed: ${scriptedLayer.stderr}`);
+const layerValues = JSON.parse(scriptedLayer.stdout);
+console.log(`  python layer API -> ${scriptedLayer.stdout.trim()}`);
+assert(layerValues[0] === true, "stack.group() must make a group");
+assert(
+  JSON.stringify(layerValues[1]) === JSON.stringify(["exposure", "clarity"]),
+  "both adjustments must sit under the layer",
+);
+assert(layerValues[2] === 1 && layerValues[3] === 80, "the mask and the opacity are the layer's");
+const layerRefused = await ui.call("python.run", {
+  code: [
+    "layer = [op for op in latent.photo.stack if op.is_group][0]",
+    "try:",
+    "    layer.add('crop', left=0.1)",
+    "    print('added')",
+    "except ValueError as error:",
+    "    print('refused')",
+  ].join("\n"),
+  photoId,
+});
+assert(
+  layerRefused.stdout.trim() === "refused",
+  `a geometry op must not go into a layer: ${layerRefused.stdout}${layerRefused.stderr}`,
+);
+await ui.call("stack.set", { photoId, stack: [] });
+await ui.call("python.run", {
+  code: "op = latent.photo.stack.add('exposure', value=1.5)\nop.mask.add('radial')",
+  photoId,
+});
+
 const removed = await ui.call("python.run", {
   code: "op = latent.photo.stack[0]\nop.mask.remove(op.mask[0]['id'])\nprint(len(latent.photo.stack[0].mask))",
 });
@@ -868,6 +1142,16 @@ for (const value of [25, 40, 60]) {
 }
 const dragEnd = await ui.call("op.update", { photoId, opId: dragId, params: { value: 75 } });
 assert(dragEnd.stack.at(-1).params.value === 75, "the drag should end at the last value");
+// The two counters part company here: `revision` took the add and all four ticks, the undo
+// stack took one step. A "which edit am I on" readout has to follow the second one.
+assert(
+  dragEnd.revision >= beforeDrag.revision + 5,
+  "every transient tick is a write, so the change counter must move",
+);
+assert(
+  dragEnd.historyIndex === beforeDrag.historyIndex + 1,
+  `a drag must be one undo step, not ${dragEnd.historyIndex - beforeDrag.historyIndex}`,
+);
 const afterDragUndo = await timed("history.undo (drag)", () =>
   ui.call("history.undo", { photoId }),
 );
@@ -886,6 +1170,98 @@ assert(
   afterDragRedo.stack.at(-1).params.value === 75,
   "redo must bring the op back at the value the drag ended on",
 );
+
+// The history list is what the left column's rows are drawn from: one entry per snapshot,
+// described by what it changed, and the whole drag is one of them.
+const historyRows = await timed("history.list", () => ui.call("history.list", { photoId }));
+assert(
+  historyRows.entries.length === afterDragRedo.historyDepth,
+  `history.list must describe every snapshot: ${historyRows.entries.length} of ${afterDragRedo.historyDepth}`,
+);
+assert(
+  historyRows.index === afterDragRedo.historyIndex,
+  "history.list disagrees with the stack cursor",
+);
+assert(historyRows.entries[0].kind === "initial", "the first row is the photo's opening state");
+const dragStep = historyRows.entries.at(-1);
+assert(
+  dragStep.kind === "add" && dragStep.op === "clarity",
+  `the drag's own step should be the clarity op arriving, not ${dragStep.kind} ${dragStep.op}`,
+);
+// Clicking a row: the cursor moves straight there, and what redo can reach is still there.
+const jumped = await timed("history.jump", () =>
+  ui.call("history.jump", { photoId, index: beforeDrag.historyIndex }),
+);
+assert(
+  jumped.historyIndex === beforeDrag.historyIndex && jumped.canRedo,
+  "a jump must land on the step asked for and leave the tail to redo",
+);
+assert(
+  !jumped.stack.some((op: any) => op.id === dragId),
+  "jumping before the drag must take the op it added with it",
+);
+await ui.call("history.jump", { photoId, index: afterDragRedo.historyIndex });
+
+// A preset is one stack.set that moves a dozen ops. It arrives as one step, named by the
+// caller because the diff cannot know a dozen ops were one click, and listing the ops it
+// touched so a row can be unfolded.
+const beforePreset = await ui.call("stack.get", { photoId });
+const preset = await timed("stack.set (preset)", () =>
+  ui.call("stack.set", {
+    photoId,
+    label: "Golden hour applied",
+    stack: [
+      ...beforePreset.stack,
+      { op: "contrast", params: { value: 25 }, enabled: true },
+      { op: "vibrance", params: { value: 20 }, enabled: true },
+      { op: "clarity", params: { value: 15 }, enabled: true },
+    ],
+  }),
+);
+assert(
+  preset.historyIndex === beforePreset.historyIndex + 1,
+  `a preset must be one history step, not ${preset.historyIndex - beforePreset.historyIndex}`,
+);
+const presetRows = await ui.call("history.list", { photoId });
+const presetStep = presetRows.entries.at(-1);
+assert(
+  presetStep.kind === "batch" && presetStep.label === "Golden hour applied",
+  `the preset's step should be a named batch, not ${presetStep.kind} "${presetStep.label}"`,
+);
+assert(
+  presetStep.entries.length === 3 && presetStep.op === undefined,
+  `a batch lists the ops it touched and is named after none of them: ${JSON.stringify(presetStep)}`,
+);
+console.log(`  "${presetStep.label}" is one step over ${presetStep.entries.length} ops`);
+
+// Unfolding that row and taking back one op of it: the other two stay exactly where the
+// preset put them, and the revert is itself a step.
+const reverted = await timed("history.revertOp", () =>
+  ui.call("history.revertOp", {
+    photoId,
+    index: presetStep.index,
+    opId: presetStep.entries.find((entry: any) => entry.op === "vibrance").opId,
+  }),
+);
+assert(
+  !reverted.stack.some((op: any) => op.op === "vibrance"),
+  "reverting the op the step added must take it back out",
+);
+assert(
+  reverted.stack.some((op: any) => op.op === "contrast" && op.params.value === 25) &&
+    reverted.stack.some((op: any) => op.op === "clarity" && op.params.value === 15),
+  "reverting one op of a step must leave the rest of the step alone",
+);
+assert(
+  reverted.historyIndex === preset.historyIndex + 1 && reverted.canUndo,
+  "a revert is an edit of its own, so it lands as a step and undoes",
+);
+const revertRefused = await ui.fail("history.revertOp", { photoId, index: 0, opId });
+assert(
+  revertRefused.startsWith("-32602"),
+  `step 0 has no state before it to revert to, got ${revertRefused}`,
+);
+console.log(`  one op of the batch reverted, ${reverted.stack.length} ops left on the stack`);
 
 // Everything above rewrote the stack; hand the rest of the file back the history it had
 // before this section — every snapshot undone, then the one exposure op, at its own id.
@@ -922,6 +1298,10 @@ assert(empty.stack.length === 0, "the stack should be empty again");
 const state = await timed("stack.get", () => ui.call("stack.get", { photoId }));
 assert(state.stack.length === 0, "stack.get disagrees with history.undo");
 assert(state.canRedo === true, "canRedo should be true after two undos");
+assert(
+  state.historyIndex === 0 && state.historyDepth >= 3,
+  `stack.get should carry the undo cursor: ${state.historyIndex} of ${state.historyDepth}`,
+);
 assert(state.histogram && state.histogram.bins === 256, "stack.get should carry a histogram");
 const histogramTotal = state.histogram.r.reduce((sum: number, count: number) => sum + count, 0);
 console.log(
@@ -1180,6 +1560,7 @@ assert(
       "merge_hdr",
       "merge_panorama",
       "merge_preview",
+      "merge_star_trail",
       "render_preview",
       "run_python",
     ]),
@@ -1598,7 +1979,12 @@ assert(!existsSync(portFile), "the daemon must remove its mcp.port file on the w
 // overlay — runs end to end on a machine with no checkpoint on disk. Its own daemon,
 // because the detector is chosen once at startup.
 const stubScratch = `${scratch}-stub`;
-const stubEngine = startEngine(stubScratch, ["--no-mcp"], { LATENT_MASK_STUB: "1" });
+const stubEngine = startEngine(stubScratch, ["--no-mcp"], {
+  LATENT_MASK_STUB: "1",
+  // The same daemon stands in for the generative backend, so the whole-frame ops below run
+  // without ComfyUI (engine/src/generative/stub_backend.cpp).
+  LATENT_GENERATIVE_STUB: "1",
+});
 const stub = await connect(await stubEngine.endpoint);
 const stubPhoto = await timed("photo.open (stub)", () =>
   stub.call("photo.open", { path: samplePath }),
@@ -1681,14 +2067,28 @@ assert(
 assert(stub.masks.at(-1)!.width === 640, "the raster follows the view it was sized for");
 
 // The raster outlives the process: reopening reads the PNG back rather than re-detecting.
+// The sidecar was written before groups — the mask sits on the adjustment itself — so the
+// reopen is also the migration: each old mask becomes a layer of one (PROMPT.md 3.7).
 await stub.call("view.close", { viewId: stubView.viewId });
 await stub.call("photo.close", { photoId: stubId });
 const reopenedStub = await stub.call("photo.open", { path: samplePath });
 stubId = reopenedStub.photoId;
+const migrated = await stub.call("stack.get", { photoId: stubId });
+const stubLayer = migrated.stack.find((entry: { op: string }) => entry.op === "group");
+assert(stubLayer !== undefined, "a mask written before groups must come back as a layer");
+assert(
+  stubLayer.ops.length === 1 && stubLayer.ops[0].id === "stub0001",
+  "the adjustment must stay under the layer that took its mask",
+);
+assert(stubLayer.ops[0].mask === undefined, "a child's mask belongs to the layer above it");
+assert(
+  stubLayer.mask.components[0].id === "subject1",
+  "the layer must carry the mask the op had",
+);
 const restoredView = await stub.call("view.open", { photoId: stubId, width: 640, height: 480 });
 const restoredPreview = await stub.call("mask.preview", {
   photoId: stubId,
-  opId: "stub0001",
+  opId: stubLayer.id,
   componentId: "subject1",
   viewId: restoredView.viewId,
 });
@@ -1696,6 +2096,109 @@ assert(
   Math.abs(restoredPreview.coverage - stubPreview.coverage) < 0.001,
   "the cached raster must come back from disk unchanged",
 );
+// ---- the whole-frame ops on the stub backend (issues #51, #52) -------------------------
+// `denoise` and `upscale` take no mask, so the one thing to prove here is the path the
+// masked ops cannot cover: a run that is started without a region, a raster that comes back
+// covering the frame, and — for the upscale — one that is bigger than the photo without
+// anything else in the protocol moving.
+await stub.call("view.render", { viewId: restoredView.viewId });
+const beforeEnhance = new Uint8Array(stub.frame.pixels);
+const beforeDetail = detailEnergy(beforeEnhance);
+
+const denoiseAdd = await stub.call("op.add", { photoId: stubId, op: "denoise", params: {} });
+const denoiseId: string = denoiseAdd.opId;
+const denoiseJob = await timed("generative.run (denoise)", () =>
+  stub.call("generative.run", { photoId: stubId, opId: denoiseId }),
+);
+await waitFor("the stub denoise to finish", () =>
+  stub.notifications.some(
+    (n) => n.method === "job.progress" && n.params.jobId === denoiseJob.jobId && n.params.finished,
+  ),
+);
+const denoiseProgress = stub.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === denoiseJob.jobId && n.params.finished,
+)!;
+assert(
+  denoiseProgress.params.state === "done",
+  `the denoise run failed: ${JSON.stringify(denoiseProgress.params)}`,
+);
+
+const afterDenoise = await stub.call("stack.get", { photoId: stubId });
+const denoiseOp = afterDenoise.stack.find((entry: { id: string }) => entry.id === denoiseId);
+assert(denoiseOp.result === `generative/${denoiseId}.png`, "the run must cache a raster");
+assert(denoiseOp.inputHash?.length === 64, "the raster must record what it was made from");
+assert(
+  JSON.stringify(denoiseOp.resultRect) === "[0,0,1,1]",
+  `a whole-frame raster covers the content rect, got ${JSON.stringify(denoiseOp.resultRect)}`,
+);
+assert(denoiseOp.stale !== true, "a raster made from the stack below it is not stale");
+console.log(`  denoise -> ${denoiseOp.result}, rect ${JSON.stringify(denoiseOp.resultRect)}`);
+
+const upscaleAdd = await stub.call("op.add", {
+  photoId: stubId,
+  op: "upscale",
+  params: { factor: "4x" },
+});
+const upscaleId: string = upscaleAdd.opId;
+const upscaleJob = await timed("generative.run (upscale 4x)", () =>
+  stub.call("generative.run", { photoId: stubId, opId: upscaleId }),
+);
+await waitFor("the stub upscale to finish", () =>
+  stub.notifications.some(
+    (n) => n.method === "job.progress" && n.params.jobId === upscaleJob.jobId && n.params.finished,
+  ),
+);
+const upscaleProgress = stub.notifications.find(
+  (n) => n.method === "job.progress" && n.params.jobId === upscaleJob.jobId && n.params.finished,
+)!;
+assert(
+  upscaleProgress.params.state === "done",
+  `the upscale run failed: ${JSON.stringify(upscaleProgress.params)}`,
+);
+
+// The preview is proxy resolution whatever the raster's size is: the upscale changes what
+// an export renders at, not what a view is.
+const upscaledFrame = await stub.call("view.render", { viewId: restoredView.viewId });
+assert(
+  upscaledFrame.width === 640,
+  `an upscale must not resize the view, got ${upscaledFrame.width}`,
+);
+// The rasters are actually in the frame: the stub softens what it is handed, so the
+// composite shows up as both a difference and a loss of detail. Without this the run could
+// "succeed" while the renderer composited nothing at all.
+const enhancedDetail = detailEnergy(stub.frame.pixels);
+const moved = difference(beforeEnhance, stub.frame.pixels);
+console.log(
+  `  whole-frame rasters moved the frame by ${moved.toFixed(2)}, detail ${beforeDetail.toFixed(2)} -> ${enhancedDetail.toFixed(2)}`,
+);
+// `difference` is the share of bytes that moved, and a blur moves a lot of them while
+// barely changing any local average — so the share is the honest signal, not a mean.
+assert(moved > 0.05, `the whole-frame rasters must reach the frame, moved ${moved}`);
+assert(
+  enhancedDetail < beforeDetail * 0.8,
+  `the stub blurs what it is handed, so detail must drop: ${beforeDetail} -> ${enhancedDetail}`,
+);
+await Bun.write(
+  "/tmp/latent-enhance-stub.png",
+  encodePng(stub.frame.pixels, stub.frame.width, stub.frame.height),
+);
+console.log("  wrote /tmp/latent-enhance-stub.png");
+
+// An op that renders below both rasters makes both of them stale, and both keep rendering:
+// a re-run is always the user's call.
+await stub.call("op.add", {
+  photoId: stubId,
+  op: "lens_correction",
+  params: { distortion: 20 },
+});
+const stale = await stub.call("stack.get", { photoId: stubId });
+for (const id of [denoiseId, upscaleId]) {
+  const entry = stale.stack.find((op: { id: string }) => op.id === id);
+  assert(entry.stale === true, `an edit under ${entry.op} must mark it stale`);
+  assert(entry.result !== undefined, "a stale op keeps its last result");
+}
+console.log("  an edit below marked both whole-frame rasters stale");
+
 stub.close();
 stubEngine.process.kill("SIGTERM");
 await stubEngine.process.exited;

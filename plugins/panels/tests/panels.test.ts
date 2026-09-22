@@ -3,6 +3,7 @@ import type { Op, OpDefinition, OpParamSpec } from "@latent/protocol";
 import {
   compareOrder,
   controlKind,
+  controlValue,
   curveParams,
   curveStroke,
   decimalsFor,
@@ -17,6 +18,9 @@ import {
   historyShortcut,
   isBipolar,
   keyboardDelta,
+  layerBadge,
+  layerEntryId,
+  maskTargetLabel,
   mixerChannels,
   mixerParams,
   opEdited,
@@ -293,12 +297,16 @@ describe("slider arithmetic", () => {
     expect(fillBounds(75, amountRange)).toEqual({ left: 0, width: 50 });
   });
 
-  test("scrubbing moves a step per pixel, ten with Shift, a quarter with Ctrl", () => {
+  test("scrubbing sweeps the range in 800 px, ten times that with Shift", () => {
     const plain = { shiftKey: false, ctrlKey: false, altKey: false };
-    expect(scrubbedValue(0, 20, evRange, plain)).toBe(0.2);
-    expect(scrubbedValue(0, 20, evRange, { ...plain, shiftKey: true })).toBe(2);
-    expect(scrubbedValue(0, 20, evRange, { ...plain, ctrlKey: true })).toBe(0.05);
-    expect(scrubbedValue(1, -400, evRange, plain)).toBe(-3);
+    // −5…5 is ten units, so 80 px is one of them whatever the step says.
+    expect(scrubbedValue(0, 80, evRange, plain)).toBe(1);
+    expect(scrubbedValue(0, 8, evRange, { ...plain, shiftKey: true })).toBe(1);
+    expect(scrubbedValue(0, 80, evRange, { ...plain, ctrlKey: true })).toBe(0.25);
+    // The same 80 px on a 0…150 slider: its own range over the same travel, snapped to
+    // the integer step.
+    expect(scrubbedValue(0, 80, amountRange, plain)).toBe(15);
+    expect(scrubbedValue(1, -400, evRange, plain)).toBe(-4);
   });
 
   test("arrow keys step, Shift steps ten, other keys are not the slider's", () => {
@@ -369,9 +377,88 @@ describe("edited detection", () => {
     expect(groupEdited(stack, color)).toBe(true);
   });
 
+  test("a selected mask is what edited means: the layer's copy, not the photo's", () => {
+    const layer: Op = {
+      id: "g1",
+      op: "group",
+      params: {},
+      enabled: true,
+      ops: [{ id: "child", op: "exposure", params: { value: 0.8 }, enabled: true }],
+    };
+    const stack = [stackEntry("exposure", { value: 1.5 }), layer];
+    expect(layerEntryId(stack, "g1", "exposure")).toBe("child");
+    // The layer does not hold white_balance, so that slider has nothing of its own yet.
+    expect(layerEntryId(stack, "g1", "white_balance")).toBe(null);
+    expect(layerEntryId(stack, null, "exposure")).toBe(null);
+    expect(paramValue(stack, exposure, exposure.params[0], "child")).toBe(0.8);
+    expect(opEdited(stack, whiteBalance, "g1")).toBe(false);
+    expect(opEdited(stack, exposure, "g1")).toBe(true);
+    // The photo's own exposure is 1.5, but an empty layer is still an unedited one.
+    expect(opEdited([stackEntry("exposure", { value: 1.5 })], exposure, "g1")).toBe(false);
+    expect(maskTargetLabel(stack, "g1")).toBe("Mask 1");
+    expect(maskTargetLabel(stack, "missing")).toBe(null);
+    // What the column shows: the layer's copy, the default where it has none — never the
+    // photo's value, which is not where the next drag would land.
+    expect(controlValue(stack, exposure, exposure.params[0], "child", "g1")).toBe(0.8);
+    expect(controlValue(stack, exposure, exposure.params[0], null, "g1")).toBe(0);
+    expect(controlValue(stack, exposure, exposure.params[0], null, null)).toBe(1.5);
+  });
+
   test("a section reset writes every parameter of an op in one call", () => {
     expect(defaultParams(whiteBalance)).toEqual({ temperature: 0, tint: 0 });
     expect(defaultParams(sharpening)).toEqual({ amount: 40 });
+  });
+});
+
+describe("the layer badge", () => {
+  /** A mask as the engine sends one: a group, its components, its adjustments. */
+  function layer(id: string, children: Op[], opacity?: number): Op {
+    const entry: Op = {
+      id,
+      op: "group",
+      params: {},
+      enabled: true,
+      mask: { components: [{ id: "sky1", kind: "sky", mode: "add" }] },
+      ops: children,
+    };
+    if (opacity !== undefined) entry.opacity = opacity;
+    return entry;
+  }
+
+  test("an adjustment that is also inside a mask says so, and opens that mask", () => {
+    const stack = [
+      stackEntry("exposure", { value: 1 }),
+      layer("g1", [stackEntry("exposure", { value: -1 })], 60),
+    ];
+    // The Edit column's slider is the global one; the badge points at the layer that holds
+    // the other copy of it.
+    expect(layerBadge(stack, exposure)).toEqual({
+      opId: "g1",
+      layers: 1,
+      components: 1,
+      opacity: 60,
+    });
+    // A global adjustment nothing masks has no badge.
+    expect(layerBadge([stackEntry("exposure", { value: 1 })], exposure)).toBeNull();
+    expect(layerBadge([], exposure)).toBeNull();
+  });
+
+  test("two masks holding the same adjustment count, and the first one opens", () => {
+    const stack = [
+      layer("g1", [stackEntry("exposure", { value: 1 })]),
+      layer("g2", [stackEntry("exposure", { value: 2 })]),
+    ];
+    expect(layerBadge(stack, exposure)).toMatchObject({ opId: "g1", layers: 2 });
+  });
+
+  test("an op that is a layer only by its opacity still shows one", () => {
+    const faint: Op = { ...stackEntry("exposure", { value: 1 }), opacity: 50 };
+    expect(layerBadge([faint], exposure)).toEqual({
+      opId: "op-exposure",
+      layers: 0,
+      components: 0,
+      opacity: 50,
+    });
   });
 });
 

@@ -5,7 +5,7 @@
   // Lightroom draws it the same way.
   import { kernelContext } from "@latent/contracts";
   import type { MaskComponent } from "@latent/protocol";
-  import { Slider, ValueField } from "@latent/plugin-panels";
+  import { BoxedSlider } from "@latent/plugin-panels";
   import { Button, LoadingSpinner, StatusBadge, Tooltip } from "@neoworks-dev/ui";
   import ArrowsClockwiseIcon from "phosphor-svelte/lib/ArrowsClockwiseIcon";
   import IntersectIcon from "phosphor-svelte/lib/IntersectIcon";
@@ -111,41 +111,20 @@
         <span class="ml-auto text-[10px] text-faint">{component.mode}</span>
       </div>
 
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-xs text-muted">Feather</span>
-        <ValueField
-          value={feather}
-          spec={featherSpec}
-          range={{ min: 0, max: 100, step: 1 }}
-          label="Feather"
-          onInput={(next) => write({ feather: next }, true)}
-          onCommit={(next) => write({ feather: next })}
-        />
-      </div>
-      <Slider
+      <BoxedSlider
         value={feather}
+        spec={featherSpec}
         range={{ min: 0, max: 100, step: 1 }}
         label="Feather"
         onInput={(next) => write({ feather: next }, true)}
         onCommit={(next) => write({ feather: next })}
         onReset={() => write({ feather: 0 })}
       />
-
-      <div class="flex items-center justify-between gap-2">
-        <span class="text-xs text-muted">Opacity</span>
-        <ValueField
-          value={opacity}
-          spec={opacitySpec}
-          range={{ min: 0, max: 100, step: 1 }}
-          label="Component opacity"
-          onInput={(next) => write({ opacity: next }, true)}
-          onCommit={(next) => write({ opacity: next })}
-        />
-      </div>
-      <Slider
+      <BoxedSlider
         value={opacity}
+        spec={opacitySpec}
         range={{ min: 0, max: 100, step: 1 }}
-        label="Component opacity"
+        label="Opacity"
         onInput={(next) => write({ opacity: next }, true)}
         onCommit={(next) => write({ opacity: next })}
         onReset={() => write({ opacity: 100 })}

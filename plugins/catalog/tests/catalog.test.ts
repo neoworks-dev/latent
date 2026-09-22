@@ -6,8 +6,13 @@ import {
   filterLabel,
   folderRows,
   folderTree,
-  gridTemplate,
+  cellAspect,
+  gridGap,
+  gridHeaderHeight,
+  gridSections,
+  gridWindow,
   infoRows,
+  justifyRows,
   isSortKey,
   isTypingTarget,
   jobGroups,
@@ -15,6 +20,9 @@ import {
   movedSelection,
   nextSelection,
   sortOptions,
+  stripCellWidth,
+  stripGap,
+  stripWindow,
   thumbnailKey,
   type CatalogKeyEvent,
 } from "../src/catalog";
@@ -26,34 +34,46 @@ function key(key: string, overrides: Partial<CatalogKeyEvent> = {}): CatalogKeyE
 describe("folder tree", () => {
   test("shared prefixes become one row with the counts rolled up", () => {
     const tree = folderTree([
-      { path: "/home/me/Pictures/trip", count: 2 },
-      { path: "/home/me/Pictures/city", count: 1 },
+      { path: "/home/me/Pictures/trip", count: 2, watched: true },
+      { path: "/home/me/Pictures/city", count: 1, watched: true },
     ]);
     expect(tree).toEqual([
-      { path: "/home/me/Pictures", label: "home/me/Pictures", depth: 0, count: 3 },
-      { path: "/home/me/Pictures/city", label: "city", depth: 1, count: 1 },
-      { path: "/home/me/Pictures/trip", label: "trip", depth: 1, count: 2 },
+      { path: "/home/me/Pictures", label: "home/me/Pictures", depth: 0, count: 3, watched: true },
+      { path: "/home/me/Pictures/city", label: "city", depth: 1, count: 1, watched: true },
+      { path: "/home/me/Pictures/trip", label: "trip", depth: 1, count: 2, watched: true },
     ]);
   });
 
   test("a chain that holds photos of its own does not collapse into its child", () => {
     const tree = folderTree([
-      { path: "/photos", count: 1 },
-      { path: "/photos/raw", count: 4 },
+      { path: "/photos", count: 1, watched: false },
+      { path: "/photos/raw", count: 4, watched: false },
     ]);
     expect(tree).toEqual([
-      { path: "/photos", label: "photos", depth: 0, count: 5 },
-      { path: "/photos/raw", label: "raw", depth: 1, count: 4 },
+      { path: "/photos", label: "photos", depth: 0, count: 5, watched: false },
+      { path: "/photos/raw", label: "raw", depth: 1, count: 4, watched: false },
     ]);
   });
 
   test("separate roots stay separate and no folders is no rows", () => {
     const tree = folderTree([
-      { path: "/mnt/card", count: 1 },
-      { path: "/home/me/pics", count: 1 },
+      { path: "/mnt/card", count: 1, watched: false },
+      { path: "/home/me/pics", count: 1, watched: true },
     ]);
     expect(tree.map((node) => node.label)).toEqual(["home/me/pics", "mnt/card"]);
     expect(folderTree([])).toEqual([]);
+  });
+
+  test("a parent is watched only when everything under it is", () => {
+    const tree = folderTree([
+      { path: "/photos/trip", count: 2, watched: true },
+      { path: "/photos/old", count: 1, watched: false },
+    ]);
+    expect(tree.map((node) => [node.label, node.watched])).toEqual([
+      ["photos", false],
+      ["old", false],
+      ["trip", true],
+    ]);
   });
 });
 
@@ -290,8 +310,8 @@ describe("selection", () => {
 
 describe("folder rows", () => {
   const tree = folderTree([
-    { path: "/photos/trip/day1", count: 2 },
-    { path: "/photos/city", count: 1 },
+    { path: "/photos/trip/day1", count: 2, watched: true },
+    { path: "/photos/city", count: 1, watched: true },
   ]);
 
   test("a row with deeper rows under it gets a chevron, a leaf does not", () => {
@@ -330,13 +350,235 @@ describe("sort menu", () => {
 });
 
 describe("grid sizing", () => {
-  test("the slider is clamped to its range and columns fill the row", () => {
+  function sized(
+    photoId: number,
+    width: number,
+    height: number,
+    capturedAt?: string,
+  ): CatalogPhoto {
+    return {
+      photoId,
+      path: `/photos/${photoId}.RAF`,
+      folder: "/photos",
+      filename: `${photoId}.RAF`,
+      width,
+      height,
+      camera: "X-T5",
+      capturedAt,
+      importedAt: "2026-01-01T00:00:00Z",
+      rating: 0,
+      flag: "none",
+      hasSidecar: false,
+    };
+  }
+
+  function fullDate(iso: string): string {
+    return new Date(iso).toLocaleDateString(undefined, { dateStyle: "full" });
+  }
+
+  function rowWidth(cells: { width: number }[]): number {
+    return cells.reduce((sum, cell) => sum + cell.width, 0) + gridGap * (cells.length - 1);
+  }
+
+  test("the slider is clamped to its range", () => {
     expect(clampGridSize(160)).toBe(160);
     expect(clampGridSize(40)).toBe(96);
     expect(clampGridSize(9000)).toBe(320);
     expect(clampGridSize(Number.NaN)).toBe(96);
-    expect(gridTemplate(200)).toBe("repeat(auto-fill, minmax(200px, 1fr))");
-    expect(gridTemplate(10)).toBe("repeat(auto-fill, minmax(96px, 1fr))");
+  });
+
+  test("a cell's aspect is the photo's, clamped both ways", () => {
+    expect(cellAspect(sized(1, 6000, 4000))).toBe(1.5);
+    expect(cellAspect(sized(2, 4000, 6000))).toBeCloseTo(2 / 3, 5);
+    expect(cellAspect(sized(3, 12000, 1000))).toBe(3);
+    expect(cellAspect(sized(4, 1000, 12000))).toBeCloseTo(1 / 3, 5);
+    expect(cellAspect(sized(5, 0, 0))).toBe(1);
+  });
+
+  test("full rows end flush with the pane and keep each photo's aspect", () => {
+    const photos = Array.from({ length: 9 }, (_unused, index) => sized(index, 3000, 2000));
+    const rows = justifyRows(photos, 1000, 160);
+
+    expect(rows.length).toBeGreaterThan(1);
+    for (const row of rows.slice(0, -1)) {
+      expect(rowWidth(row.cells)).toBe(1000);
+      for (const cell of row.cells) expect(cell.width / row.height).toBeCloseTo(1.5, 1);
+    }
+    expect(rows.flatMap((row) => row.cells.map((cell) => cell.photo.photoId))).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
+  });
+
+  test("a mixed row shares one height, so widths differ by aspect", () => {
+    const rows = justifyRows(
+      [sized(1, 3000, 2000), sized(2, 2000, 3000), sized(3, 4000, 3000), sized(4, 3000, 3000)],
+      600,
+      200,
+    );
+
+    const [first] = rows;
+    expect(rowWidth(first.cells)).toBe(600);
+    expect(first.cells[0].width).toBeGreaterThan(first.cells[1].width);
+  });
+
+  test("a trailing part-row stays at the target height instead of stretching", () => {
+    const rows = justifyRows([sized(1, 3000, 2000)], 2000, 160);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].height).toBe(160);
+    expect(rows[0].cells[0].width).toBe(240);
+  });
+
+  test("an unmeasured pane lays out nothing", () => {
+    expect(justifyRows([sized(1, 3000, 2000)], 0, 160)).toEqual([]);
+  });
+
+  test("consecutive photos from one day become one titled section", () => {
+    const sections = gridSections(
+      [
+        sized(1, 3000, 2000, "2026-04-11T09:00:00Z"),
+        sized(2, 3000, 2000, "2026-04-11T18:00:00Z"),
+        sized(3, 3000, 2000, "2026-04-12T09:00:00Z"),
+      ],
+      1000,
+      160,
+    );
+
+    expect(sections.map((entry) => [entry.title, entry.count])).toEqual([
+      [fullDate("2026-04-11T09:00:00Z"), 2],
+      [fullDate("2026-04-12T09:00:00Z"), 1],
+    ]);
+    expect(sections.map((entry) => entry.key)).toEqual([1, 3]);
+  });
+
+  test("a row never straddles two dates", () => {
+    const sections = gridSections(
+      [sized(1, 3000, 2000, "2026-04-11T09:00:00Z"), sized(2, 3000, 2000, "2026-04-12T09:00:00Z")],
+      4000,
+      160,
+    );
+
+    expect(sections).toHaveLength(2);
+    for (const entry of sections) {
+      expect(entry.rows.flatMap((row) => row.cells)).toHaveLength(1);
+    }
+  });
+
+  test("a date that comes back under another sort opens a second section", () => {
+    const sections = gridSections(
+      [
+        sized(1, 3000, 2000, "2026-04-11T09:00:00Z"),
+        sized(2, 3000, 2000, "2026-04-12T09:00:00Z"),
+        sized(3, 3000, 2000, "2026-04-11T10:00:00Z"),
+      ],
+      1000,
+      160,
+    );
+
+    expect(sections.map((entry) => entry.key)).toEqual([1, 2, 3]);
+    expect(sections[0].title).toBe(sections[2].title);
+  });
+
+  test("photos the EXIF has no capture time for get their own title", () => {
+    const sections = gridSections(
+      [sized(1, 3000, 2000), sized(2, 3000, 2000, "not a date")],
+      1000,
+      160,
+    );
+
+    expect(sections).toHaveLength(1);
+    expect(sections[0].title).toBe("No capture date");
+    expect(sections[0].count).toBe(2);
+  });
+});
+
+describe("grid scrolling", () => {
+  function day(photoId: number, capturedAt: string): CatalogPhoto {
+    return {
+      photoId,
+      path: `/photos/${photoId}.RAF`,
+      folder: "/photos",
+      filename: `${photoId}.RAF`,
+      width: 3000,
+      height: 2000,
+      camera: "X-T5",
+      capturedAt,
+      importedAt: "2026-01-01T00:00:00Z",
+      rating: 0,
+      flag: "none",
+      hasSidecar: false,
+    };
+  }
+
+  /** Two days of 12 photos each, five to a row at this width and target height. */
+  function twoDays(): CatalogPhoto[] {
+    return [
+      ...Array.from({ length: 12 }, (_unused, index) => day(index + 1, "2026-04-11T09:00:00Z")),
+      ...Array.from({ length: 12 }, (_unused, index) => day(index + 13, "2026-04-12T09:00:00Z")),
+    ];
+  }
+
+  test("rows stack under their title, and a section under the one before it", () => {
+    const [first, second] = gridSections(twoDays(), 1200, 160);
+
+    expect(first.top).toBe(0);
+    expect(first.rows[0].top).toBe(gridHeaderHeight + gridGap);
+    expect(first.rows[1].top).toBe(first.rows[0].top + first.rows[0].height + gridGap);
+
+    const last = first.rows[first.rows.length - 1];
+    expect(first.height).toBe(last.top + last.height - first.top);
+    expect(second.top).toBe(first.height);
+    expect(second.rows[0].top).toBe(second.top + gridHeaderHeight + gridGap);
+  });
+
+  test("only the rows within a screen of the scrollport are drawn", () => {
+    const sections = gridSections(twoDays(), 1200, 160);
+    const total = sections.reduce((sum, entry) => sum + entry.rows.length, 0);
+    const windowed = gridWindow(sections, 0, 200);
+
+    // Every title survives: a title drawn only while its own rows are on screen could not
+    // stick to the top of the scrollport.
+    expect(windowed.map((entry) => entry.section.key)).toEqual(sections.map((entry) => entry.key));
+    const drawn = windowed.reduce((sum, entry) => sum + entry.rows.length, 0);
+    expect(drawn).toBeGreaterThan(0);
+    expect(drawn).toBeLessThan(total);
+  });
+
+  test("a scroll to the end draws the last row and not the first", () => {
+    const sections = gridSections(twoDays(), 1200, 160);
+    const bottom = sections[sections.length - 1];
+    const windowed = gridWindow(sections, bottom.top + bottom.height, 200);
+    const drawn = windowed.flatMap((entry) => entry.rows);
+
+    expect(drawn).toContain(bottom.rows[bottom.rows.length - 1]);
+    expect(drawn).not.toContain(sections[0].rows[0]);
+  });
+
+  test("an unmeasured pane draws no rows at all", () => {
+    const sections = gridSections(twoDays(), 1200, 160);
+
+    expect(gridWindow(sections, 0, 0).flatMap((entry) => entry.rows)).toEqual([]);
+  });
+});
+
+describe("filmstrip scrolling", () => {
+  const pitch = stripCellWidth + stripGap;
+
+  test("an unscrolled strip draws the scrollport and a strip's width past it", () => {
+    expect(stripWindow(500, 0, 10 * pitch)).toEqual({ start: 0, end: 20 });
+  });
+
+  test("scrolling moves the window and keeps a strip's width behind it", () => {
+    expect(stripWindow(500, 40 * pitch, 10 * pitch)).toEqual({ start: 30, end: 60 });
+  });
+
+  test("the window never runs past either end of the catalog", () => {
+    expect(stripWindow(12, 0, 10 * pitch)).toEqual({ start: 0, end: 12 });
+    expect(stripWindow(500, 2 * pitch, 10 * pitch)).toEqual({ start: 0, end: 22 });
+  });
+
+  test("a strip nobody has measured yet draws nothing", () => {
+    expect(stripWindow(500, 0, 0)).toEqual({ start: 0, end: 0 });
   });
 });
 

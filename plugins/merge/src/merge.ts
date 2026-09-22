@@ -14,6 +14,9 @@ import type {
   MergePanoramaParams,
   MergePreviewParams,
   MergeProjection,
+  MergeStarTrailParams,
+  MergeTrailBlend,
+  MergeTrailForeground,
 } from "@latent/protocol";
 
 /**
@@ -27,23 +30,37 @@ export interface MergeOptions {
   projection: MergeProjection;
   boundaryWarp: number;
   autoCrop: boolean;
+  blend: MergeTrailBlend;
+  gapFill: number;
+  foreground: MergeTrailForeground;
+  foregroundThreshold: number;
+  decay: number;
 }
 
-/** Lightroom's own starting point: aligned, no deghosting, spherical, cropped, no warp. */
+/**
+ * Lightroom's own starting point: aligned, no deghosting, spherical, cropped, no warp —
+ * and for the star trail merge, the plain lighten stack the schema defaults to.
+ */
 export const defaultMergeOptions: MergeOptions = {
   autoAlign: true,
   deghost: "none",
   projection: "spherical",
   boundaryWarp: 0,
   autoCrop: true,
+  blend: "lighten",
+  gapFill: 0,
+  foreground: "lighten",
+  foregroundThreshold: 2,
+  decay: 0,
 };
 
-export const mergeKinds: readonly MergeKind[] = ["hdr", "panorama", "hdrPanorama"];
+export const mergeKinds: readonly MergeKind[] = ["hdr", "panorama", "hdrPanorama", "starTrail"];
 
 export const kindLabels: Record<MergeKind, string> = {
   hdr: "HDR",
   panorama: "Panorama",
   hdrPanorama: "HDR Panorama",
+  starTrail: "Star Trails",
 };
 
 /** The suffix Lightroom gives the merged file; the dialog shows it as the output name. */
@@ -51,16 +68,22 @@ export const kindSuffixes: Record<MergeKind, string> = {
   hdr: "HDR",
   panorama: "Pano",
   hdrPanorama: "HDRPano",
+  starTrail: "Trails",
 };
 
 /** Auto Align and Deghost Amount belong to the exposure half of the merge. */
 export function showsHdrOptions(kind: MergeKind): boolean {
-  return kind !== "panorama";
+  return kind === "hdr" || kind === "hdrPanorama";
 }
 
 /** Layout projection, Boundary Warp and Auto Crop belong to the stitching half. */
 export function showsPanoramaOptions(kind: MergeKind): boolean {
-  return kind !== "hdr";
+  return kind === "panorama" || kind === "hdrPanorama";
+}
+
+/** Blend, gap fill, foreground and comet decay belong to the night sequence. */
+export function showsStarTrailOptions(kind: MergeKind): boolean {
+  return kind === "starTrail";
 }
 
 /** How many source photos each kind takes, straight from the schema's bounds. */
@@ -68,6 +91,9 @@ export const photoCounts: Record<MergeKind, { min: number; max: number }> = {
   hdr: { min: 2, max: 7 },
   panorama: { min: 2, max: 12 },
   hdrPanorama: { min: 4, max: 48 },
+  // The frames are folded in as they decode and dropped again (engine/src/merge/startrail.h),
+  // so this cap is the night, not the memory.
+  starTrail: { min: 2, max: 500 },
 };
 
 /** Why this selection cannot be merged as this kind, or `""` when it can. */
@@ -89,6 +115,16 @@ export const deghostOptions: { value: MergeDeghost; label: string }[] = [
   { value: "high", label: "High" },
 ];
 
+export const blendOptions: { value: MergeTrailBlend; label: string }[] = [
+  { value: "lighten", label: "Lighten (trails)" },
+  { value: "average", label: "Average (one exposure)" },
+];
+
+export const foregroundOptions: { value: MergeTrailForeground; label: string }[] = [
+  { value: "lighten", label: "Brightest frame" },
+  { value: "firstFrame", label: "First frame" },
+];
+
 export const projectionOptions: { value: MergeProjection; label: string }[] = [
   { value: "spherical", label: "Spherical" },
   { value: "cylindrical", label: "Cylindrical" },
@@ -97,6 +133,11 @@ export const projectionOptions: { value: MergeProjection; label: string }[] = [
 
 /** Boundary Warp is Lightroom's 0–100 percentage; the slider is the panel column's. */
 export const boundaryWarpRange = { min: 0, max: 100, step: 1 };
+
+/** The star trail sliders, in the engine's own ranges (protocol MergeStarTrailParams). */
+export const gapFillRange = { min: 0, max: 8, step: 1 };
+export const foregroundThresholdRange = { min: 0, max: 100, step: 1 };
+export const decayRange = { min: 0, max: 100, step: 1 };
 
 export function isMergeKind(value: string): value is MergeKind {
   return mergeKinds.some((entry) => entry === value);
@@ -110,19 +151,29 @@ export function isProjection(value: string): value is MergeProjection {
   return projectionOptions.some((option) => option.value === value);
 }
 
-export type MergeMethod = "merge.hdr" | "merge.panorama" | "merge.hdrPanorama";
+export function isTrailBlend(value: string): value is MergeTrailBlend {
+  return blendOptions.some((option) => option.value === value);
+}
+
+export function isTrailForeground(value: string): value is MergeTrailForeground {
+  return foregroundOptions.some((option) => option.value === value);
+}
+
+export type MergeMethod = "merge.hdr" | "merge.panorama" | "merge.hdrPanorama" | "merge.starTrail";
 
 const methodByKind: Record<MergeKind, MergeMethod> = {
   hdr: "merge.hdr",
   panorama: "merge.panorama",
   hdrPanorama: "merge.hdrPanorama",
+  starTrail: "merge.starTrail",
 };
 
 export function mergeMethod(kind: MergeKind): MergeMethod {
   return methodByKind[kind];
 }
 
-export type MergeParams = MergeHdrParams | MergePanoramaParams | MergeHdrPanoramaParams;
+export type MergeParams =
+  MergeHdrParams | MergePanoramaParams | MergeHdrPanoramaParams | MergeStarTrailParams;
 
 /**
  * The params for `mergeMethod(kind)`. Only the fields that kind's method accepts are put
@@ -143,6 +194,16 @@ export function mergeParams(
       projection: options.projection,
       boundaryWarp: options.boundaryWarp,
       autoCrop: options.autoCrop,
+    };
+  }
+  if (kind === "starTrail") {
+    return {
+      photoIds: ids,
+      blend: options.blend,
+      gapFill: options.gapFill,
+      foreground: options.foreground,
+      foregroundThreshold: options.foregroundThreshold,
+      decay: options.decay,
     };
   }
   return {

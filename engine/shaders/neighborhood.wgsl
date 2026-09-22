@@ -12,6 +12,8 @@
 //   105 sharpening           v0 = amount, detail, masking
 //   106 defringe             v0 = purple amount, hue low, hue high; v1 = the same in green
 //   107 chromatic_aberration v6.x radius
+//   108 manual_denoise       v0 = luminance, detail, color, colorDetail
+//                            v6.x = tap spacing of this à trous level, v6.y = level index
 
 struct VSOut {
   @builtin(position) pos: vec4f,
@@ -50,6 +52,21 @@ fn mask_at(position: vec2f) -> f32 {
 }
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+
+// Kept in step with the copy in blur.wgsl: the two halves of one à trous level have to
+// weight their taps the same way or the filter is not separable any more.
+fn denoise_sigmas(signal: f32, detail: f32, colour_detail: f32, level: f32) -> vec2f {
+  // Sensor noise is read noise plus photon noise: a floor that does not care how dark the
+  // pixel is, and a term that grows as the square root of the signal. A window proportional
+  // to the signal instead — the obvious thing — is far too tight in the shadows, which is
+  // exactly where high-ISO noise lives, and that is what makes a naive bilateral useless on
+  // a lifted night frame.
+  let noise = sqrt(0.000016 + (0.0016 * max(signal, 0.0)));
+  let falloff = pow(0.6, level);
+  let light = mix(4.0, 0.5, clamp(detail, 0.0, 1.0)) * noise * falloff;
+  let colour = mix(14.0, 1.5, clamp(colour_detail, 0.0, 1.0)) * noise * falloff;
+  return vec2f(max(light, 1e-5), max(colour, 1e-5));
+}
 
 fn tone_position(c: vec3f) -> f32 {
   return clamp(pow(max(luma(c), 0.0), 1.0 / 2.2), 0.0, 1.0);
@@ -230,6 +247,49 @@ fn desaturate(rgb: vec3f, amount: f32) -> vec3f {
       let purple = op.v[0].x * hue_window(hue, op.v[0].y, op.v[0].z);
       let green = op.v[1].x * hue_window(hue, op.v[1].y, op.v[1].z);
       rgb = desaturate(source, edge * max(purple, green));
+    }
+    // manual_denoise: the vertical half of one à trous level, then the mix back. `mid` is
+    // blur.wgsl's horizontal pass, so `mid.rgb` is already colour-filtered and `mid.a`
+    // already luminance-filtered, and the range weight keys off `mid.a` — a luminance that
+    // has had a pass of noise taken out of it is a far steadier edge detector than the raw
+    // pixel is at ISO 12800.
+    case 108u: {
+      let step = max(i32(op.v[6].x), 1);
+      // Same outlier rule as the horizontal half: the reference is the three centre taps
+      // averaged, so a speckle cannot vouch for itself.
+      let centre_light = (mid_tap(centre.x, centre.y - step).a + mid_tap(centre.x, centre.y).a +
+                          mid_tap(centre.x, centre.y + step).a) /
+                         3.0;
+      let sigmas = denoise_sigmas(centre_light, op.v[0].y, op.v[0].w, op.v[6].y);
+      var spline = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
+      var colour = vec3f(0.0);
+      var colour_weight = 0.0;
+      var light = 0.0;
+      var light_weight = 0.0;
+      for (var i = -2; i <= 2; i = i + 1) {
+        let c = mid_tap(centre.x, centre.y + i * step);
+        let spatial = spline[i + 2];
+        let difference = c.a - centre_light;
+        let light_weighting = spatial * exp(-0.5 * difference * difference / (sigmas.x * sigmas.x));
+        let colour_weighting =
+            spatial * exp(-0.5 * difference * difference / (sigmas.y * sigmas.y));
+        colour = colour + c.rgb * colour_weighting;
+        colour_weight = colour_weight + colour_weighting;
+        light = light + c.a * light_weighting;
+        light_weight = light_weight + light_weighting;
+      }
+      let filtered_colour = colour / max(colour_weight, 1e-5);
+      let filtered_light = light / max(light_weight, 1e-5);
+      let source_light = luma(source);
+      // The two sliders mix their own half back and nothing else: Luminance moves only the
+      // brightness, Color only the offset from grey. A run at Color 100 and Luminance 0 is
+      // exactly what a high-ISO frame usually wants — the blotches gone, the grain intact.
+      // Each of the three levels mixes at the full slider value, so the levels compound:
+      // 50 is a real denoise, not half of one.
+      let out_light = mix(source_light, filtered_light, clamp(op.v[0].x, 0.0, 1.0));
+      let out_chroma = mix(source - source_light, filtered_colour - luma(filtered_colour),
+                           clamp(op.v[0].z, 0.0, 1.0));
+      rgb = max(out_light + out_chroma, vec3f(0.0));
     }
     // chromatic_aberration: lateral fringes are chroma that only exists at a steep edge,
     // so pull the chroma there towards the local average and halve what is left. Without

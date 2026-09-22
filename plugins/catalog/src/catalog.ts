@@ -16,12 +16,19 @@ export interface FolderNode {
   depth: number;
   /** Photos in this folder and everything under it. */
   count: number;
+  /**
+   * Every folder under this row is watched, so photos dropped anywhere in it turn up on
+   * their own. A branch with one unwatched folder in it is not watched: the row would
+   * otherwise promise freshness it cannot keep.
+   */
+  watched: boolean;
 }
 
 interface TrieNode {
   path: string;
   label: string;
   count: number;
+  watched: boolean;
   children: Map<string, TrieNode>;
 }
 
@@ -31,7 +38,7 @@ interface TrieNode {
  * import of `/home/me/Pictures/trip` is not five levels of indentation.
  */
 export function folderTree(folders: CatalogFoldersResult["folders"]): FolderNode[] {
-  const root: TrieNode = { path: "", label: "", count: 0, children: new Map() };
+  const root: TrieNode = { path: "", label: "", count: 0, watched: true, children: new Map() };
   for (const folder of folders) {
     let node = root;
     for (const segment of folder.path.split("/").filter(Boolean)) {
@@ -40,10 +47,12 @@ export function folderTree(folders: CatalogFoldersResult["folders"]): FolderNode
         path: `${node.path}/${segment}`,
         label: segment,
         count: 0,
+        watched: true,
         children: new Map(),
       };
       if (!existing) node.children.set(segment, child);
       child.count += folder.count;
+      child.watched = child.watched && folder.watched;
       node = child;
     }
   }
@@ -58,7 +67,13 @@ export function folderTree(folders: CatalogFoldersResult["folders"]): FolderNode
       label = `${label}/${only.label}`;
       collapsed = only;
     }
-    rows.push({ path: collapsed.path, label, depth, count: collapsed.count });
+    rows.push({
+      path: collapsed.path,
+      label,
+      depth,
+      count: collapsed.count,
+      watched: collapsed.watched,
+    });
     const children = [...collapsed.children.values()].sort((a, b) =>
       a.label.localeCompare(b.label),
     );
@@ -114,16 +129,216 @@ export function isSortKey(value: string): value is SortKey {
   return sortOptions.some((option) => option.value === value);
 }
 
+/** The slider is the row height the grid aims for, not a cell width. */
 export const gridSizeRange = { min: 96, max: 320, step: 8 };
+
+/** Pixels between cells, both axes. Must match the `gap` the grid pane draws. */
+export const gridGap = 8;
+
+/**
+ * Widest and tallest cell the grid will lay out, as a width:height ratio. A 6:1 panorama
+ * left unclamped is a row on its own, three pixels tall.
+ */
+export const gridAspectLimit = 3;
 
 export function clampGridSize(size: number): number {
   if (!Number.isFinite(size)) return gridSizeRange.min;
   return Math.min(gridSizeRange.max, Math.max(gridSizeRange.min, Math.round(size)));
 }
 
-/** Grid columns for a cell size: as many as fit, then share the remainder evenly. */
-export function gridTemplate(size: number): string {
-  return `repeat(auto-fill, minmax(${clampGridSize(size)}px, 1fr))`;
+export interface GridCell {
+  photo: CatalogPhoto;
+  width: number;
+}
+
+export interface GridRow {
+  /** Distance from the top of the grid's content box: the grid positions rows absolutely. */
+  top: number;
+  height: number;
+  cells: GridCell[];
+}
+
+/**
+ * Height of a section title. Baked in rather than measured because the layout runs for the
+ * whole catalog, most of which is nowhere near the screen and has no box to measure. The
+ * title element is drawn at exactly this height so the two cannot drift apart.
+ */
+export const gridHeaderHeight = 32;
+
+/** The aspect a cell gets: the photo's own, clamped so one frame can't flatten a row. */
+export function cellAspect(photo: CatalogPhoto): number {
+  if (photo.width <= 0 || photo.height <= 0) return 1;
+  const aspect = photo.width / photo.height;
+  return Math.min(gridAspectLimit, Math.max(1 / gridAspectLimit, aspect));
+}
+
+function packRow(run: CatalogPhoto[], top: number, height: number): GridRow {
+  return {
+    top,
+    height: Math.round(height),
+    cells: run.map((photo) => ({ photo, width: Math.round(cellAspect(photo) * height) })),
+  };
+}
+
+/**
+ * Lightroom's justified grid: fill each row across `containerWidth` at one shared height
+ * near `targetHeight`, so every cell keeps its own aspect and the reading order stays
+ * left-to-right, top-to-bottom. A trailing part-row is left at the target height rather
+ * than stretched across the pane. `startTop` is where the first row's top edge lands, so a
+ * section can lay its rows out in the coordinates the whole grid scrolls through.
+ */
+export function justifyRows(
+  photos: CatalogPhoto[],
+  containerWidth: number,
+  targetHeight: number,
+  startTop = 0,
+): GridRow[] {
+  if (containerWidth <= 0) return [];
+  const target = clampGridSize(targetHeight);
+  const rows: GridRow[] = [];
+  let run: CatalogPhoto[] = [];
+  let aspectSum = 0;
+  let top = startTop;
+
+  for (const photo of photos) {
+    run.push(photo);
+    aspectSum += cellAspect(photo);
+    const spare = containerWidth - gridGap * (run.length - 1);
+    if (aspectSum * target < spare) continue;
+    const row = packRow(run, top, spare / aspectSum);
+    // Rounding every width down leaves a pixel or two at the right edge; the last cell
+    // takes them, so the row ends flush with the pane.
+    const total = row.cells.reduce((sum, cell) => sum + cell.width, 0);
+    row.cells[row.cells.length - 1].width += spare - total;
+    rows.push(row);
+    top += row.height + gridGap;
+    run = [];
+    aspectSum = 0;
+  }
+
+  if (run.length > 0) rows.push(packRow(run, top, target));
+  return rows;
+}
+
+export interface GridSection {
+  /** The run's first photo; the `each` key, since a date can repeat under another sort. */
+  key: number;
+  title: string;
+  count: number;
+  rows: GridRow[];
+  /** Top edge in the grid's content box, and the title plus every row under it. */
+  top: number;
+  height: number;
+}
+
+/** The calendar day a photo belongs to: the grouping key, and the heading it reads as. */
+function captureDay(photo: CatalogPhoto): { key: string; title: string } {
+  const parsed = photo.capturedAt ? new Date(photo.capturedAt) : undefined;
+  if (!parsed || Number.isNaN(parsed.getTime())) return { key: "", title: "No capture date" };
+  return {
+    key: parsed.toDateString(),
+    title: parsed.toLocaleDateString(undefined, { dateStyle: "full" }),
+  };
+}
+
+function section(
+  run: CatalogPhoto[],
+  containerWidth: number,
+  targetHeight: number,
+  top: number,
+): GridSection {
+  const rows = justifyRows(run, containerWidth, targetHeight, top + gridHeaderHeight + gridGap);
+  const last = rows.at(-1);
+  return {
+    key: run[0].photoId,
+    title: captureDay(run[0]).title,
+    count: run.length,
+    rows,
+    top,
+    height: last ? last.top + last.height - top : gridHeaderHeight,
+  };
+}
+
+/**
+ * The grid under capture-date titles: each run of consecutive photos from one day is
+ * justified on its own, so a row never straddles two dates. Runs rather than a group-by —
+ * the page arrives in the engine's sort order and the grid never re-sorts it, so sorting
+ * by anything but time gives whatever sections that order happens to contain.
+ */
+export function gridSections(
+  photos: CatalogPhoto[],
+  containerWidth: number,
+  targetHeight: number,
+): GridSection[] {
+  const sections: GridSection[] = [];
+  let run: CatalogPhoto[] = [];
+  let top = 0;
+
+  const close = (): void => {
+    const entry = section(run, containerWidth, targetHeight, top);
+    sections.push(entry);
+    top += entry.height;
+    run = [];
+  };
+
+  for (const photo of photos) {
+    const first = run[0];
+    if (first && captureDay(first).key !== captureDay(photo).key) close();
+    run.push(photo);
+  }
+
+  if (run.length > 0) close();
+  return sections;
+}
+
+export interface WindowedSection {
+  section: GridSection;
+  /** Only the rows near the scrollport; every other row is its height and nothing else. */
+  rows: GridRow[];
+}
+
+/**
+ * What a scrolled grid actually has to draw. Every section is kept, because a title that
+ * only existed while its own rows were on screen could not stick to the top of the
+ * scrollport — there is one title per day and they cost nothing. The rows are windowed: a
+ * library is thousands of cells, a cell is a dozen elements, and the whole catalog is
+ * listed now rather than a page of it.
+ *
+ * A screen of overscan either way, so a flick has cells to show before the next scroll
+ * event lands.
+ */
+export function gridWindow(
+  sections: GridSection[],
+  scrollTop: number,
+  viewportHeight: number,
+): WindowedSection[] {
+  const top = scrollTop - viewportHeight;
+  const bottom = scrollTop + viewportHeight * 2;
+  return sections.map((entry) => ({
+    section: entry,
+    rows: entry.rows.filter((row) => row.top < bottom && row.top + row.height > top),
+  }));
+}
+
+/** The filmstrip's cell box: the width a cell is drawn at, and the gap to the next one. */
+export const stripCellWidth = 104;
+export const stripGap = 6;
+
+/**
+ * The cells a horizontally scrolled filmstrip has to draw: the scrollport plus a strip's
+ * width either way. Every cell is the same width, so the range is arithmetic rather than a
+ * measurement. `end` is exclusive.
+ */
+export function stripWindow(
+  count: number,
+  scrollLeft: number,
+  viewportWidth: number,
+): { start: number; end: number } {
+  const pitch = stripCellWidth + stripGap;
+  return {
+    start: Math.max(0, Math.floor((scrollLeft - viewportWidth) / pitch)),
+    end: Math.min(count, Math.ceil((scrollLeft + viewportWidth * 2) / pitch)),
+  };
 }
 
 export interface InfoRow {
@@ -186,6 +401,27 @@ export interface CatalogFilter {
   minRating?: number;
   /** Case-insensitive substring over filename and camera; the engine does the matching. */
   query?: string;
+}
+
+/**
+ * The one-click filters, shared by the library inside the grid and by the strip's own bar.
+ * Each is a whole `catalog.list` filter rather than a flag toggled onto the current one:
+ * the engine does the filtering, and "All" has to be able to say "nothing at all".
+ */
+export const quickFilters: { label: string; filter: CatalogFilter }[] = [
+  { label: "All", filter: {} },
+  { label: "Picks", filter: { flag: "pick" } },
+  { label: "Rejects", filter: { flag: "reject" } },
+  { label: "3★+", filter: { minRating: 3 } },
+];
+
+/**
+ * Whether two filters are the same request. The quick filters are the only objects with
+ * these shapes, so comparing the serialised filter is enough to know which row is on —
+ * a search typed into the box is a different filter and turns all of them off.
+ */
+export function sameFilter(a: CatalogFilter, b: CatalogFilter): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 const flagLabels: Record<PhotoFlag, string> = {

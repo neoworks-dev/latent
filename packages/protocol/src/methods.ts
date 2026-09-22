@@ -11,11 +11,14 @@ export interface MethodMap {
   // The schema declares these results/params as `$ref` aliases of StackGet*; the
   // generator dedupes identical types, so the canonical names are used here.
   "stack.set": { params: G.StackSetParams; result: G.StackGetResult };
-  "op.add": { params: G.OpAddParams; result: G.StackGetResult };
+  "op.add": { params: G.OpAddParams; result: G.OpAddResult };
   "op.update": { params: G.OpUpdateParams; result: G.StackGetResult };
   "op.remove": { params: G.OpRemoveParams; result: G.StackGetResult };
   "history.undo": { params: G.StackGetParams; result: G.StackGetResult };
   "history.redo": { params: G.StackGetParams; result: G.StackGetResult };
+  "history.list": { params: G.StackGetParams; result: G.HistoryListResult };
+  "history.jump": { params: G.HistoryJumpParams; result: G.StackGetResult };
+  "history.revertOp": { params: G.HistoryRevertOpParams; result: G.StackGetResult };
   "view.open": { params: G.ViewOpenParams; result: G.ViewOpenResult };
   "view.close": { params: G.ViewCloseParams; result: G.ViewCloseResult };
   "view.render": { params: G.ViewRenderParams; result: G.ViewRenderResult };
@@ -31,6 +34,11 @@ export interface MethodMap {
   "catalog.thumbnail": { params: G.CatalogThumbnailParams; result: G.CatalogThumbnailResult };
   "mask.preview": { params: G.MaskPreviewParams; result: G.MaskPreviewResult };
   "mask.detect": { params: G.MaskDetectParams; result: G.MaskDetectResult };
+  // Returns a jobId; the map lands while job.progress kind `depth` ticks, and
+  // depth.changed says it is there. depth.preview sends one LDPT frame before its result.
+  "depth.estimate": { params: G.DepthEstimateParams; result: G.DepthEstimateResult };
+  "depth.status": { params: G.DepthStatusParams; result: G.DepthStatusResult };
+  "depth.preview": { params: G.DepthPreviewParams; result: G.DepthPreviewResult };
   "generative.run": { params: G.GenerativeRunParams; result: G.GenerativeRunResult };
   "generative.status": { params: G.GenerativeStatusParams; result: G.GenerativeStatusResult };
   // MaskStrokeResult is a `$ref` alias of StackGetResult; the generator dedupes it.
@@ -40,11 +48,17 @@ export interface MethodMap {
   "catalog.thumbnails": { params: G.CatalogThumbnailsParams; result: G.CatalogThumbnailsResult };
   "catalog.remove": { params: G.CatalogRemoveParams; result: G.CatalogRemoveResult };
   "job.cancel": { params: G.JobCancelParams; result: G.JobCancelResult };
-  // All four answer `{ jobId }`; the merged photo's id arrives on the job's last
+  // A hint, not a queue operation: the running preview job takes these photos next.
+  "preview.prioritize": {
+    params: G.PreviewPrioritizeParams;
+    result: G.PreviewPrioritizeResult;
+  };
+  // All five answer `{ jobId }`; the merged photo's id arrives on the job's last
   // job.progress, in `result`, because the merge itself takes minutes.
   "merge.hdr": { params: G.MergeHdrParams; result: G.MergeHdrResult };
   "merge.panorama": { params: G.MergePanoramaParams; result: G.MergePanoramaResult };
   "merge.hdrPanorama": { params: G.MergeHdrPanoramaParams; result: G.MergeHdrPanoramaResult };
+  "merge.starTrail": { params: G.MergeStarTrailParams; result: G.MergeStarTrailResult };
   "merge.preview": { params: G.MergePreviewParams; result: G.MergePreviewResult };
 }
 
@@ -53,8 +67,10 @@ export interface NotificationMap {
   "engine.log": G.EngineLogParams;
   "catalog.changed": G.CatalogChangedParams;
   "job.progress": G.JobProgressParams;
+  "photo.resolution": G.PhotoResolutionParams;
   "python.output": G.PythonOutputParams;
   "python.finished": G.PythonFinishedParams;
+  "depth.changed": G.DepthChangedParams;
 }
 
 export type MethodName = keyof MethodMap;
@@ -73,6 +89,9 @@ export const methods: readonly MethodName[] = [
   "op.remove",
   "history.undo",
   "history.redo",
+  "history.list",
+  "history.jump",
+  "history.revertOp",
   "view.open",
   "view.close",
   "view.render",
@@ -89,12 +108,17 @@ export const methods: readonly MethodName[] = [
   "catalog.thumbnails",
   "catalog.remove",
   "job.cancel",
+  "preview.prioritize",
   "merge.hdr",
   "merge.panorama",
   "merge.hdrPanorama",
+  "merge.starTrail",
   "merge.preview",
   "mask.preview",
   "mask.detect",
+  "depth.estimate",
+  "depth.status",
+  "depth.preview",
   "generative.run",
   "generative.status",
   "mask.stroke",
@@ -106,6 +130,8 @@ export const notifications: readonly NotificationName[] = [
   "engine.log",
   "catalog.changed",
   "job.progress",
+  "photo.resolution",
   "python.output",
   "python.finished",
+  "depth.changed",
 ];

@@ -1,7 +1,11 @@
 <script lang="ts">
-  // Left column: where the filmstrip's photos come from. Import, search, quick filters,
+  // The library: where the filmstrip's photos come from. Import, search, quick filters,
   // sort, the folder tree and collections. Every row is a `catalog.list` filter — nothing
   // here filters client-side.
+  //
+  // It lives inside the grid rather than in a column of its own: choosing which photos you
+  // are looking at is what the grid is for, and the left column belongs to the photo that
+  // is open. The strip's own bar carries the search and the sort while the grid is closed.
   //
   // Hand-built controls, and why: the design system has no text field (search and the
   // collection name box are bare inputs in a token-styled shell), no segmented control
@@ -11,6 +15,7 @@
   import { kernelContext } from "@latent/contracts";
   import type { MergeKind } from "@latent/protocol";
   import { Button, SectionHeader, Select, Tooltip } from "@neoworks-dev/ui";
+  import ArrowsClockwiseIcon from "phosphor-svelte/lib/ArrowsClockwiseIcon";
   import CaretDownIcon from "phosphor-svelte/lib/CaretDownIcon";
   import CaretRightIcon from "phosphor-svelte/lib/CaretRightIcon";
   import DotsThreeIcon from "phosphor-svelte/lib/DotsThreeIcon";
@@ -20,7 +25,15 @@
   import PlusIcon from "phosphor-svelte/lib/PlusIcon";
   import SortAscendingIcon from "phosphor-svelte/lib/SortAscendingIcon";
   import SortDescendingIcon from "phosphor-svelte/lib/SortDescendingIcon";
-  import { folderRows, folderTree, isSortKey, sortOptions, type CatalogFilter } from "./catalog";
+  import {
+    folderRows,
+    folderTree,
+    isSortKey,
+    quickFilters,
+    sameFilter,
+    sortOptions,
+    type CatalogFilter,
+  } from "./catalog";
 
   const { paneId: _paneId }: { paneId: string } = $props();
   const ctx = kernelContext();
@@ -33,23 +46,15 @@
     { kind: "hdr", label: "HDR" },
     { kind: "panorama", label: "Panorama" },
     { kind: "hdrPanorama", label: "HDR Pano" },
+    { kind: "starTrail", label: "Star Trails" },
   ];
-  const quickFilters: { label: string; filter: CatalogFilter }[] = [
-    { label: "All", filter: {} },
-    { label: "Picks", filter: { flag: "pick" } },
-    { label: "Rejects", filter: { flag: "reject" } },
-    { label: "3★+", filter: { minRating: 3 } },
-  ];
-
   let newCollection = $state("");
   let renamingId = $state<number | null>(null);
   let renameText = $state("");
   let menuId = $state<number | null>(null);
 
-  // The quick filters are the only objects that produce these shapes, so comparing the
-  // serialised filter is enough to know which row is the current one.
   function isActive(filter: CatalogFilter): boolean {
-    return JSON.stringify(filter) === JSON.stringify(catalog.filter);
+    return sameFilter(filter, catalog.filter);
   }
 
   /** Enter commits whichever text field has focus: the new-collection box or a rename. */
@@ -117,7 +122,7 @@
 
 <div class="flex h-full flex-col gap-3 overflow-y-auto px-3 pt-1 pb-3 text-xs">
   <div class="flex gap-1">
-    <Tooltip text="Import selected raw files" placement="bottom">
+    <Tooltip text="Import selected photos" placement="bottom">
       <Button size="sm" icon={FilesIcon} onclick={() => void importFiles()}>Files…</Button>
     </Tooltip>
     <Tooltip text="Import a folder and everything under it" placement="bottom">
@@ -240,6 +245,31 @@
           <span class="truncate">{row.node.label}</span>
           <span class="ml-auto shrink-0 tabular-nums text-faint">{row.node.count}</span>
         </button>
+        <!-- The daemon watches imported folders, so this is for what landed while it was
+             not running, and for a folder whose watch inotify could not take. -->
+        <Tooltip
+          text={row.node.watched
+            ? "Watched live — rescan anyway"
+            : "Rescan for photos added since the import"}
+          placement="bottom"
+        >
+          <button
+            type="button"
+            class="shrink-0 rounded-sm px-1 py-1 text-faint hover:text-default"
+            data-folder-rescan={row.node.path}
+            aria-label="Rescan {row.node.label}"
+            onclick={() => void catalog.importPaths([row.node.path], true)}
+          >
+            <ArrowsClockwiseIcon size={11} weight="bold" />
+          </button>
+        </Tooltip>
+        {#if row.node.watched}
+          <span
+            class="mr-1 size-1.5 shrink-0 rounded-full bg-action"
+            title="New photos in this folder appear on their own"
+            data-folder-watched={row.node.path}
+          ></span>
+        {/if}
       </div>
     {/each}
     {#if rows.length === 0}

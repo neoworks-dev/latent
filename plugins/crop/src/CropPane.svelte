@@ -4,7 +4,7 @@
   // — is also what arms and disarms the tool, and mounting is what switches the viewer to
   // the uncropped frame.
   import { kernelContext, type OverlayPointer, type OverlayRect } from "@latent/contracts";
-  import { Slider, ValueField } from "@latent/plugin-panels";
+  import { BoxedSlider } from "@latent/plugin-panels";
   import type { OpParamSpec } from "@latent/protocol";
   import { Button, Select, Tooltip } from "@neoworks-dev/ui";
   import ArrowClockwiseIcon from "phosphor-svelte/lib/ArrowClockwiseIcon";
@@ -351,25 +351,15 @@
     </Tooltip>
   </div>
 
-  <div class="flex items-center gap-2 px-3">
-    <span class="w-14 shrink-0 text-muted">Straighten</span>
-    <div class="min-w-0 flex-1">
-      <Slider
-        value={crop.angle}
-        range={angleRange}
-        label="Straighten"
-        onInput={(next) => void crop.setAngle(next, true)}
-        onCommit={(next) => void crop.setAngle(next, false)}
-        onReset={() => void crop.setAngle(0, false)}
-      />
-    </div>
-    <ValueField
+  <div class="px-2">
+    <BoxedSlider
       value={crop.angle}
       spec={angleSpec}
       range={angleRange}
       label="Straighten"
       onInput={(next) => void crop.setAngle(next, true)}
       onCommit={(next) => void crop.setAngle(next, false)}
+      onReset={() => void crop.setAngle(0, false)}
     />
   </div>
 

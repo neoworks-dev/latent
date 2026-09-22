@@ -134,6 +134,7 @@ void take_envelope(ComfyEnvelope& out, const nlohmann::json& value) {
   out.code = error.value("code", std::string());
   out.message = error.value("message", std::string());
   out.hint = error.value("hint", std::string());
+  if (out.hint.empty()) out.hint = comfy_hint_for(out.code, out.message);
 }
 
 ComfyEnvelope drive(const std::string& mode, std::span<const std::string> args,
@@ -193,10 +194,24 @@ ComfyEnvelope drive(const std::string& mode, std::span<const std::string> args,
   envelope.message = envelope.errors.empty()
                          ? "comfy exited " + std::to_string(envelope.exit_code) + " without JSON"
                          : envelope.errors.substr(0, 400);
+  envelope.hint = comfy_hint_for(envelope.code, envelope.message);
   return envelope;
 }
 
 }  // namespace
+
+std::string comfy_hint_for(const std::string& code, const std::string& message) {
+  if (code == "server_not_running") return "start ComfyUI: `comfy launch`";
+  std::string lowered = message;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
+  const bool refused = lowered.find("connection refused") != std::string::npos ||
+                       lowered.find("connection error") != std::string::npos ||
+                       lowered.find("cannot connect") != std::string::npos ||
+                       lowered.find("failed to establish a new connection") != std::string::npos;
+  if (refused) return "ComfyUI is not answering: start it with `comfy launch`";
+  return {};
+}
 
 std::string ComfyEnvelope::failure() const {
   if (!message.empty() && !hint.empty()) return message + " (" + hint + ")";

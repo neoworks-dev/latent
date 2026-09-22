@@ -18,8 +18,8 @@
 
 namespace latent {
 
-// `generative_fill` and `remove`, the two ops registered under PipelineStage::Generative.
-bool is_generative_op(std::string_view name);
+// `is_generative_op` lives in ops/registry.h: the stack's own data layer needs it too, to
+// keep a generative op's mask out of the group migration (ops/mask.h).
 
 // The passes the renderer runs before this op's composite, in stack order: every enabled op
 // below PipelineStage::Generative, plus the generative ops that sit lower in the stack.
@@ -44,6 +44,20 @@ void annotate_generative_stale(nlohmann::json& stack_json, const Stack& stack);
 
 // `generative/<opId>.png`, relative to `<photo>.latent.d/` (ops/mask.h, sidecar_dir_for).
 std::string generative_result_relative_path(std::string_view op_id);
+
+// Which graph an op asks for: "fill", "remove", "denoise" or "upscale". An op that is not
+// generative has no task and answers empty.
+std::string generative_task(std::string_view op_name);
+
+// An `upscale` op's `factor` param as a number: 2 or 4. Anything unparseable reads as 2,
+// which is the param's first value and so its default.
+double upscale_factor(const Op& op);
+
+// What an export of this stack has to render at, as a multiple of the photo's native size:
+// the product of every enabled `upscale` op that actually has a raster. An upscale the user
+// has not run yet changes nothing, exactly like a generative op without its result
+// (issue #52 — export must not resample a 4x raster back down to native).
+double stack_upscale_factor(const Stack& stack);
 
 // A rect normalised over the content rect, [0,1] in both axes, x0 < x1 and y0 < y1.
 struct GenerativeRect {

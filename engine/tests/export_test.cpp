@@ -466,6 +466,52 @@ TEST_CASE("the sample raw exports at native resolution", "[export][gpu]") {
   CHECK(image.pixels[centre] + image.pixels[centre + 1] + image.pixels[centre + 2] > 0);
 }
 
+TEST_CASE("an upscale renders the export at the size its raster really is", "[export][gpu]") {
+  Fixture* fixture = gpu_fixture();
+  if (fixture == nullptr) SKIP("no GPU adapter or no sample raw");
+
+  // A small synthetic photo rather than the sample raw: what is asserted is the size the
+  // export renders at, and a 24 MP frame at 2x is gigabytes of ping-pong for nothing.
+  constexpr uint32_t kWidth = 320;
+  constexpr uint32_t kHeight = 200;
+  DecodedRaw small;
+  small.width = kWidth;
+  small.height = kHeight;
+  small.camera = "Synthetic Test";
+  small.rgba.assign(static_cast<size_t>(kWidth) * kHeight * 4, 20000);
+  for (size_t pixel = 0; pixel < static_cast<size_t>(kWidth) * kHeight; ++pixel) {
+    small.rgba[(pixel * 4) + 3] = 65535;
+  }
+  fixture->renderer->load_photo(2, small);
+
+  Op upscale = make_op("upscale", {{"factor", "2x"}});
+  upscale.result_rect = {0, 0, 1, 1};
+
+  // Asked for but never run: the op has no raster, so the export is the photo's own size.
+  ExportRenderOptions options;
+  const Rgb16Image native = fixture->renderer->render_export(2, Stack{upscale}, options);
+  CHECK(native.width == kWidth);
+  CHECK(native.height == kHeight);
+
+  Rgb8Image raster;
+  raster.width = kWidth * 2;
+  raster.height = kHeight * 2;
+  raster.pixels.assign(static_cast<size_t>(raster.width) * raster.height * 3, 180);
+  upscale.result = "generative/u1.png";
+  fixture->renderer->put_generative_result(2, upscale.id, upscale.result, raster);
+
+  const Rgb16Image bigger = fixture->renderer->render_export(2, Stack{upscale}, options);
+  CHECK(bigger.width == kWidth * 2);
+  CHECK(bigger.height == kHeight * 2);
+  CHECK(bigger.pixels.size() == bigger.expected_size());
+
+  // An explicit output size is still the user's: the upscale decides what the export is
+  // rendered from, not what it is written at.
+  options.resize.long_edge = 500;
+  const Rgb16Image resized = fixture->renderer->render_export(2, Stack{upscale}, options);
+  CHECK(std::max(resized.width, resized.height) == 500);
+}
+
 TEST_CASE("a crop changes the exported pixel count", "[export][gpu]") {
   Fixture* fixture = gpu_fixture();
   if (fixture == nullptr) SKIP("no GPU adapter or no sample raw");

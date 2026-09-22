@@ -4,6 +4,7 @@
 //
 // The compiled graph in engine/workflows/ is a template and is never edited on disk; the
 // filled copy lives in the job's own temp directory and dies with it.
+#include "ai/model_store.h"
 #include "generative/backend.h"
 #include "generative/comfy_cli.h"
 #include "generative/image_io.h"
@@ -11,6 +12,7 @@
 #include "ops/op.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 
 #include <algorithm>
@@ -19,6 +21,7 @@
 #include <fstream>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace latent {
 
@@ -75,12 +78,12 @@ class ComfyBackend : public GenerativeBackend {
  public:
   std::string name() const override { return "comfy"; }
 
-  GenerativeResult inpaint(const GenerativeRequest& request,
-                           const GenerativeProgress& progress) override {
+  GenerativeResult run(const GenerativeRequest& request,
+                       const GenerativeProgress& progress) override {
     const auto started = std::chrono::steady_clock::now();
     GenerativeResult result;
     try {
-      run(request, progress, result);
+      execute(request, progress, result);
     } catch (const std::exception& error) {
       result.ok = false;
       result.code = result.code.empty() ? "engine_error" : result.code;
@@ -93,8 +96,8 @@ class ComfyBackend : public GenerativeBackend {
   }
 
  private:
-  void run(const GenerativeRequest& request, const GenerativeProgress& progress,
-           GenerativeResult& result) {
+  void execute(const GenerativeRequest& request, const GenerativeProgress& progress,
+               GenerativeResult& result) {
     const std::string workspace = comfy_workspace_path();
     const std::vector<Workflow> workflows = load_workflows();
     // `model` names either a graph or a weight file; a graph wins, because naming one is
@@ -115,11 +118,16 @@ class ComfyBackend : public GenerativeBackend {
     static int64_t serial = 0;
     ++serial;
     const std::string crop_path = request.work_dir + "/" + upload_name("crop", serial);
-    const std::string mask_path = request.work_dir + "/" + upload_name("mask", serial);
     write_file(crop_path, request.image);
-    write_file(mask_path, request.mask);
+    // A whole-frame task sends no mask, and `comfy upload` would fail on a path that is not
+    // there. The graph has no mask binding either, so nothing downstream misses it.
+    const bool has_mask = !request.mask.empty();
+    const std::string mask_path =
+        has_mask ? request.work_dir + "/" + upload_name("mask", serial) : std::string();
+    if (has_mask) write_file(mask_path, request.mask);
 
-    const std::array<std::string, 3> upload = {"upload", crop_path, mask_path};
+    std::vector<std::string> upload = {"upload", crop_path};
+    if (has_mask) upload.push_back(mask_path);
     const ComfyEnvelope uploaded = comfy_call(upload);
     if (!uploaded.ok) {
       result.code = uploaded.code.empty() ? "upload_failed" : uploaded.code;
@@ -130,9 +138,10 @@ class ComfyBackend : public GenerativeBackend {
 
     WorkflowValues values;
     values.image = uploaded_name(uploaded.data, crop_path);
-    values.mask = uploaded_name(uploaded.data, mask_path);
+    if (has_mask) values.mask = uploaded_name(uploaded.data, mask_path);
     values.prompt = request.prompt;
     values.seed = request.seed;
+    values.strength = request.strength;
     if (!model_is_workflow) values.model = request.model;
     const std::string filled_path = request.work_dir + "/workflow.json";
     {
@@ -168,7 +177,22 @@ class ComfyBackend : public GenerativeBackend {
       result.message = "cannot read the output ComfyUI wrote to " + path;
       return;
     }
+    if (request.task == "upscale") resample_to_scale(request, result);
     result.ok = true;
+  }
+
+  // The upscale model's factor is fixed — 4x for the one the graph ships — and the op asks
+  // for 2x or 4x. One resample at the end closes the gap. Resampling the input first, or
+  // running the model twice, would be two passes over the same detail (issue #52).
+  static void resample_to_scale(const GenerativeRequest& request, GenerativeResult& result) {
+    const std::optional<Rgb8Image> source = decode_rgb_png(request.image);
+    const std::optional<Rgb8Image> produced = decode_rgb_png(result.png);
+    if (!source.has_value() || !produced.has_value()) return;
+    const auto width = static_cast<uint32_t>(std::lround(source->width * request.scale));
+    const auto height = static_cast<uint32_t>(std::lround(source->height * request.scale));
+    if (width == 0 || height == 0) return;
+    if (produced->width == width && produced->height == height) return;
+    result.png = encode_rgb_png(box_resize(*produced, width, height));
   }
 
   // `data.uploads[i].cloud_name` for the file we just sent. The CLI answers with the bare
@@ -248,10 +272,25 @@ std::unique_ptr<GenerativeBackend> make_comfy_backend() {
   return std::make_unique<ComfyBackend>();
 }
 
-std::unique_ptr<GenerativeBackend> make_generative_backend(std::string_view requested) {
-  if (requested == "stub") return make_stub_backend();
-  if (requested == "comfy") return make_comfy_backend();
-  return stub_requested() ? make_stub_backend() : make_comfy_backend();
+std::string resolve_generative_backend(std::string_view requested, std::string_view task) {
+  if (requested == "stub" || requested == "sky" || requested == "comfy" || requested == "onnx") {
+    return std::string(requested);
+  }
+  if (stub_requested()) return "stub";
+  // A denoise prefers the local restoration model: it is trained on this problem, it needs
+  // no server, and it tiles, so it runs at the photo's own resolution rather than at one
+  // diffusion pass worth of pixels. Without the model installed there is still the graph.
+  if (task == "denoise" && onnx_denoise_installed()) return "onnx";
+  return "comfy";
+}
+
+std::unique_ptr<GenerativeBackend> make_generative_backend(std::string_view requested,
+                                                           std::string_view task) {
+  const std::string resolved = resolve_generative_backend(requested, task);
+  if (resolved == "stub") return make_stub_backend();
+  if (resolved == "sky") return make_sky_backend();
+  if (resolved == "onnx") return make_onnx_denoise_backend();
+  return make_comfy_backend();
 }
 
 nlohmann::json generative_status() {
@@ -268,6 +307,17 @@ nlohmann::json generative_status() {
                             {"requires", workflow.required_models}};
     graphs.push_back(entry);
   }
+
+  // The local denoise model is not a ComfyUI graph, but it is a denoise provider, and the
+  // column that asks "can this op run" has one list to read. `requires` names what is
+  // missing so the message is the same shape as a graph missing its checkpoint.
+  const bool local_denoise = onnx_denoise_installed();
+  graphs.push_back({{"name", std::string(kDenoiseModel)},
+                    {"task", "denoise"},
+                    {"label", "SCUNet, local (onnxruntime)"},
+                    {"ready", local_denoise},
+                    {"requires", local_denoise ? nlohmann::json::array()
+                                               : nlohmann::json::array({kDenoiseModel})}});
 
   // One cheap call that answers "is a server up": it is the same probe `comfy launch`
   // would be waiting on, and it costs nothing when the server is down.
@@ -286,7 +336,7 @@ nlohmann::json generative_status() {
 
   const bool stub = stub_requested();
   nlohmann::json status = {{"backend", stub ? "stub" : "comfy"},
-                           {"backends", nlohmann::json::array({"comfy", "stub"})},
+                           {"backends", nlohmann::json::array({"comfy", "onnx", "sky", "stub"})},
                            {"stub", stub},
                            {"comfy",
                             {{"installed", !executable.empty()},

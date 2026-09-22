@@ -19,6 +19,12 @@ struct DecodedRaw {
 };
 
 // Throws std::runtime_error with LibRaw's message on failure.
-DecodedRaw decode_raw(const std::string& path);
+//
+// `min_long_edge` lets a caller that only wants a proxy skip the demosaic: when halving the
+// photo still leaves its long edge at or above the value, LibRaw bins each Bayer quad into
+// one pixel instead of interpolating, which is ~150 ms rather than ~460 ms for 24 MP. Zero
+// (the default) always decodes at full resolution. The result is whatever resolution was
+// cheapest, so a caller passing this has to read `width`/`height` back.
+DecodedRaw decode_raw(const std::string& path, uint32_t min_long_edge = 0);
 
 }  // namespace latent
