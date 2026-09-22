@@ -222,6 +222,35 @@ TEST_CASE("a cached mask survives a render and a resize rebuilds it") {
   CHECK_THAT(fixture->coverage(first), Catch::Matchers::WithinAbs(0.5, 0.02));
 }
 
+TEST_CASE("a luminance mask samples the photo, not the ops below it") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  // The flat photo is mid-grey, well under the band; +3 EV below the layer would put every
+  // pixel inside it if the mask read the op's input. Lightroom's range masks read the
+  // unadjusted photo (issue #1), so the band selects nothing before and after the edit, and a
+  // view that never saw the stack without the edit agrees with the one that did.
+  const nlohmann::json band = nlohmann::json::parse(
+      R"({"id": "lum", "kind": "luminance", "mode": "add", "feather": 0,
+          "params": {"range": [0.8, 1], "smoothness": 0}})");
+  std::vector<std::string> warnings;
+  Op below;
+  below.id = "below001";
+  below.name = "exposure";
+  below.params = normalize_params_for("exposure", {{"value", 0.0}}, warnings);
+  const Op masked = masked_exposure({band}, 1.0, 100);
+
+  CHECK_THAT(fixture->coverage({below, masked}), Catch::Matchers::WithinAbs(0.0, 0.001));
+  below.params = normalize_params_for("exposure", {{"value", 3.0}}, warnings);
+  const Stack edited = {below, masked};
+  CHECK_THAT(fixture->coverage(edited), Catch::Matchers::WithinAbs(0.0, 0.001));
+
+  fixture->renderer->open_view(2, 1, kSize, kSize);
+  const double fresh =
+      fixture->renderer->read_mask(2, edited, "exp00001", {}, fixture->raster, 0).coverage;
+  CHECK_THAT(fresh, Catch::Matchers::WithinAbs(0.0, 0.001));
+}
+
 namespace {
 
 // A hard-edged disc at a named point of the *image*. Feather 0 so the raster's centroid is

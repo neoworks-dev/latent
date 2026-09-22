@@ -179,11 +179,10 @@ class Renderer {
   // Runs the op chain into the view's ping-pong textures and returns the texture the last
   // pass wrote (the base when the stack had nothing to do).
   WGPUTextureView run_passes(View& view, const Stack& stack, bool bypass_crop);
-  // Rasterises and folds one op's mask into a cached r8 texture. Called between passes,
-  // because a luminance or colour component reads the op's input, which only exists once
-  // everything below it has been submitted.
+  // Rasterises and folds one op's mask into a cached r8 texture. Luminance and colour
+  // components sample the view's base, so it runs before the op chain is encoded.
   void build_mask(View& view, const Op& op, const nlohmann::json& canonical,
-                  const std::string& hash, WGPUTextureView input);
+                  const std::string& hash);
 
   Gpu gpu_;
   RenderPipelineHandle linearize_pipeline_;

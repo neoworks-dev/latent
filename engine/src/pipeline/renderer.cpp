@@ -576,18 +576,20 @@ MaskUniform mask_uniform(const MaskComponent& component, const GeometryMap& map)
 }
 
 // What invalidates a cached raster: the mask's own JSON, the view's size, the content rect
-// inside it, and the geometry stage that put it there. The last is the whole point of image
-// space — the coordinates no longer move when a crop does, but the *pixels* they land on
-// do, so a straighten that leaves the content rect's size alone still has to re-rasterise.
-// The op's *input* deliberately does not: a masked slider drag must not re-rasterise, and
-// the price is that a luminance or colour mask keeps the levels it was built from until
-// the mask or the frame changes (see NEXT.md's mask.refresh).
+// inside it, the geometry stage that put it there, and the base it samples. The geometry is
+// the whole point of image space — the coordinates no longer move when a crop does, but the
+// *pixels* they land on do, so a straighten that leaves the content rect's size alone still
+// has to re-rasterise. Luminance and colour components sample the view's base, the photo
+// before any op, as Lightroom's range masks do (issue #1): nothing in the stack can make
+// them stale, so the key only needs to know when the base itself was redrawn.
 std::string mask_cache_key(const nlohmann::json& canonical, const GeometryMap& map,
-                           const GeometryParams& params, const ViewGeometry& geometry) {
+                           const GeometryParams& params, const ViewGeometry& geometry,
+                           uint64_t base_generation) {
   const nlohmann::json keyed = {
       {"m", canonical},
       {"r", {map.content.x, map.content.y, map.content.width, map.content.height}},
-      {"g", geometry_to_json(params)}};
+      {"g", geometry_to_json(params)},
+      {"b", base_generation}};
   return mask_hash(keyed, geometry.width, geometry.height);
 }
 
@@ -678,6 +680,8 @@ struct Renderer::View {
   int64_t photo_id = 0;
   ViewGeometry geometry;
   bool base_valid = false;
+  // Bumped every time `base` is redrawn; range masks sample it, so it is in their cache key.
+  uint64_t base_generation = 0;
   GeometryParams geometry_params;
   // What the user asked to look at, and the stage resolved for it: every mask pass, every
   // op pass and the `imageTransform` on the wire read this one object.
@@ -942,6 +946,7 @@ void Renderer::build_base(View& view) {
   gpu_.wait_idle();
   gpu_.raise_pending_error();
   view.base_valid = true;
+  ++view.base_generation;
 }
 
 struct Renderer::Pass {
@@ -959,7 +964,7 @@ struct Renderer::Pass {
 };
 
 void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canonical,
-                          const std::string& hash, WGPUTextureView input) {
+                          const std::string& hash) {
   const Mask mask = mask_from_json(canonical);
   const Photo& photo = *photos_.at(view.photo_id);
   MaskEntry& entry = view.masks[op.id];
@@ -1037,8 +1042,8 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
   for (const MaskComponent* component : active) {
     MaskComponentTexture& texture = entry.components[component->id];
     const std::string key =
-        mask_cache_key(component_to_json(*component), view.map, view.geometry_params,
-                       view.geometry);
+        mask_cache_key(component_to_json(*component), view.map, view.geometry_params, view.geometry,
+                       view.base_generation);
     if (!texture.texture) {
       texture.texture =
           gpu_.create_texture(width, height, WGPUTextureFormat_R8Unorm, usage, "mask-component");
@@ -1051,7 +1056,7 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
       WGPUTextureView raster =
           texture.source_view ? texture.source_view.get() : white_mask_view_.get();
       const std::array<WGPUBindGroupEntry, 3> entries = {
-          texture_entry(0, input),
+          texture_entry(0, view.base_view.get()),
           buffer_entry(1, mask_uniforms_.get(), kOpUniformStride * slot, sizeof(MaskUniform)),
           texture_entry(2, raster)};
       keep.push_back(gpu_.create_bind_group(mask_pipeline_.get(), entries));
@@ -1173,8 +1178,8 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
     if (op->mask.has_value() && op->mask->contains("components") &&
         !(*op->mask)["components"].empty()) {
       pass.mask_json = *op->mask;
-      pass.mask_hash =
-          mask_cache_key(pass.mask_json, view.map, view.geometry_params, view.geometry);
+      pass.mask_hash = mask_cache_key(pass.mask_json, view.map, view.geometry_params, view.geometry,
+                                      view.base_generation);
       const auto found = view.masks.find(op->id);
       pass.mask_dirty = found == view.masks.end() || found->second.hash != pass.mask_hash;
     }
@@ -1200,23 +1205,19 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
                       kCurveSlotStride);
   }
 
+  // Masks read the base, not the op's input, so every dirty one is built before the chain is
+  // encoded and a mask edit never splits the render. A cached one costs nothing.
+  for (const Pass& pass : passes) {
+    if (!pass.mask_dirty) continue;
+    build_mask(view, *pass.op, pass.mask_json, pass.mask_hash);
+  }
+
   std::vector<BindGroupHandle> bind_groups;
   WGPUCommandEncoder encoder = gpu_.begin_commands("view-render");
   WGPUTextureView source = view.base_view.get();
   size_t target_index = 0;
   for (size_t i = 0; i < passes.size(); ++i) {
     Pass& pass = passes[i];
-    // A luminance or colour component reads the op's input, so the chain below it has to
-    // have run. Everything already encoded goes out, the mask is built, and the encoder
-    // starts again. Only a mask edit lands here: a cached one costs nothing.
-    if (pass.mask_dirty) {
-      gpu_.submit(encoder);
-      gpu_.wait_idle();
-      gpu_.raise_pending_error();
-      bind_groups.clear();
-      build_mask(view, *pass.op, pass.mask_json, pass.mask_hash, source);
-      encoder = gpu_.begin_commands("view-render");
-    }
     pass.mask_view = white_mask_view_.get();
     if (!pass.mask_hash.empty()) {
       const MaskEntry& entry = view.masks.at(pass.op->id);
@@ -1358,7 +1359,7 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
                                 std::string_view component_id, std::vector<uint8_t>& out,
                                 size_t offset) {
   View& view = view_for(view_id);
-  WGPUTextureView last = run_passes(view, stack, false);
+  run_passes(view, stack, false);
 
   const Op* op = find_op(stack, op_id);
   if (op == nullptr) throw std::runtime_error("unknown opId '" + std::string(op_id) + "'");
@@ -1368,11 +1369,11 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
   }
   // A disabled or neutral op has no pass, so run_passes never built its mask; the overlay
   // still has to be able to show it.
-  const std::string hash =
-      mask_cache_key(*op->mask, view.map, view.geometry_params, view.geometry);
+  const std::string hash = mask_cache_key(*op->mask, view.map, view.geometry_params, view.geometry,
+                                          view.base_generation);
   const auto found = view.masks.find(op->id);
   if (found == view.masks.end() || found->second.hash != hash) {
-    build_mask(view, *op, *op->mask, hash, last);
+    build_mask(view, *op, *op->mask, hash);
   }
 
   const MaskEntry& entry = view.masks.at(op->id);
