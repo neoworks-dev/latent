@@ -93,6 +93,7 @@ const expectedOps = [
   "remove",
   // And Relight beside those: PROMPT.md §3.8's virtual light over the depth map.
   "denoise",
+  "manual_denoise",
   "upscale",
   "relight",
   "sharpening",
