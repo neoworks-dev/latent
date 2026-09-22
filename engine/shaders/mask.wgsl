@@ -14,7 +14,7 @@
 //
 //   1 linear     v0 = start.xy, end.xy
 //   2 radial     v0 = centre.xy, radius.xy; v1.x = angle in radians
-//   3 luminance  v0 = lo, hi, smoothness     (over the op's input, display-referred)
+//   3 luminance  v0 = lo, hi, smoothness     (over the view's base: the photo before any op)
 //   4 color      v0 = sample count, range, smoothness; v1..v5 = samples in Oklab
 //   5 raster     the `raster` binding: a brush stroke list or an AI model's output
 //
@@ -161,7 +161,8 @@ fn blurred_raster(uv: vec2f) -> f32 {
       let reach = length(turned / radius);
       value = 1.0 - smoothstep(1.0 - feather, 1.0, reach);
     }
-    // luminance: a band of the op's input, smoothness and feather both softening its ends.
+    // luminance: a band of the base (the photo before any op), smoothness and feather both
+    // softening its ends.
     case 3u: {
       let level = tone_position(textureLoad(src, vec2i(in.pos.xy), 0).rgb);
       let edge = max(mask.v[0].z, mask.feather) * 0.5 + 0.004;
