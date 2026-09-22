@@ -17,6 +17,9 @@ export interface ConsoleKeyEvent {
   shiftKey: boolean;
 }
 
+/** The rail mode the console's card lives on; Ctrl+` is the shortcut to it. */
+export const CONSOLE_MODE = "python";
+
 /**
  * Ctrl+` toggles the console — the one shortcut that must also work while the textarea has
  * focus, so it deliberately has no typing guard.
@@ -117,7 +120,7 @@ export function groupRuns(lines: ConsoleLine[]): ConsoleRun[] {
   return runs;
 }
 
-/** The console pane's drag range: tall enough to read, never taller than the window. */
+/** The scrollback's drag range: tall enough to read, never taller than the window. */
 export function clampConsoleHeight(height: number): number {
   if (!Number.isFinite(height)) return 220;
   return Math.min(560, Math.max(120, Math.round(height)));

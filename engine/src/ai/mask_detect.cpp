@@ -8,11 +8,13 @@
 #include "ai/mask_detect.h"
 
 #include "ai/dedicated.h"
+#include "ai/depth.h"
 #include "ai/florence2.h"
 #include "ai/model_store.h"
 #include "ai/ort_session.h"
 #include "ai/preprocess.h"
 #include "ai/sam2.h"
+#include "ai/trails.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -89,6 +91,10 @@ class StubDetector : public MaskDetector {
     }
     width = std::max(width, 1U);
     height = std::max(height, 1U);
+
+    // Trails is a line detector, not a model (ai/trails.h): there is nothing for the stub
+    // to stand in for, and a test that runs with LATENT_MASK_STUB=1 gets the real answer.
+    if (request.kind == MaskKind::Trails) return run_trails(request);
 
     MaskDetectResult result;
     result.ok = true;
@@ -205,11 +211,11 @@ class OrtMaskDetector : public MaskDetector {
       case MaskKind::Sky:
       case MaskKind::People:
         return run_semantic(request);
-      case MaskKind::Depth: {
-        MaskDetectResult result;
-        result.message = "depth masks are not implemented yet";
-        return result;
-      }
+      case MaskKind::Depth:
+        return run_depth(request);
+      // No model store, no session: the streak detector is arithmetic over the frame.
+      case MaskKind::Trails:
+        return run_trails(request);
       default: {
         MaskDetectResult result;
         result.message = "mask kind '" + std::string(mask_kind_name(request.kind)) +
@@ -305,6 +311,19 @@ class OrtMaskDetector : public MaskDetector {
     result.ok = true;
     result.model = std::string(kBiRefNetModel);
     result.raster = plane_to_gray(alpha, request.image.width, request.image.height);
+    return result;
+  }
+
+  // The raster a depth component carries is the depth map itself, not a selection: the
+  // near/far band lives in mask.wgsl so the range is a live slider (ops/mask.cpp).
+  MaskDetectResult run_depth(const MaskDetectRequest& request) {
+    if (!model_installed(kDepthModel)) return missing(kDepthModel);
+    DepthAnythingV2 model(model_dir(kDepthModel));
+    MaskDetectResult result;
+    result.ok = true;
+    result.model = std::string(kDepthModel);
+    result.raster =
+        plane_to_gray(model.depth(request.image), request.image.width, request.image.height);
     return result;
   }
 

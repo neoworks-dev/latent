@@ -10,6 +10,7 @@ import type {
   EngineHelloResult,
   OpsDescribeResult,
   StackChangedParams,
+  OpAddResult,
   StackGetResult,
   CatalogPhoto,
   JobCancelResult,
@@ -25,7 +26,13 @@ import type {
   ViewRenderResult,
 } from "@latent/protocol";
 import { FRAME_HEADER_BYTES, parseFrameHeader } from "@latent/protocol";
-import { opDefinitions, PhotoState, renderFrame, startMockEngine } from "../mock-engine";
+import {
+  histogramOf,
+  opDefinitions,
+  PhotoState,
+  renderFrame,
+  startMockEngine,
+} from "../mock-engine";
 
 function exposureOf(photo: PhotoState): number {
   const entry = photo.stack.find((candidate) => candidate.op === "exposure");
@@ -35,7 +42,63 @@ function exposureOf(photo: PhotoState): number {
 describe("history semantics", () => {
   test("a fresh photo has nothing to undo or redo", () => {
     const photo = new PhotoState();
-    expect(photo.snapshot()).toEqual({ stack: [], revision: 0, canUndo: false, canRedo: false });
+    expect(photo.snapshot()).toEqual({
+      stack: [],
+      revision: 0,
+      canUndo: false,
+      canRedo: false,
+      // One snapshot deep — the state the photo opened in — with the cursor on it.
+      historyIndex: 0,
+      historyDepth: 1,
+    });
+  });
+
+  test("a drag is one undo step however many revisions it took", () => {
+    const photo = new PhotoState();
+    const op = photo.addOp("exposure", { value: 0 });
+    const step = photo.snapshot().historyIndex ?? 0;
+    const revision = photo.revision;
+    for (let tick = 1; tick <= 20; tick++) {
+      photo.updateOp(op.id, { value: tick / 10 }, undefined, true);
+    }
+    photo.updateOp(op.id, { value: 2 }, undefined, false);
+    // Every tick is a write, so the change counter moved; the undo stack took one step.
+    expect(photo.revision).toBeGreaterThan(revision + 20);
+    expect(photo.snapshot().historyIndex).toBe(step + 1);
+    photo.undo();
+    expect(exposureOf(photo)).toBe(0);
+  });
+
+  test("the history list says what each step changed, and a jump lands on one", () => {
+    const photo = new PhotoState();
+    const op = photo.addOp("exposure", { value: 0 });
+    photo.updateOp(op.id, { value: 1.5 }, undefined, false);
+
+    const listed = photo.historyList();
+    expect(listed.index).toBe(2);
+    expect(listed.entries.map((entry) => entry.kind)).toEqual(["initial", "add", "update"]);
+    expect(listed.entries[2]).toMatchObject({
+      index: 2,
+      op: "exposure",
+      changes: [{ param: "value", from: 0, to: 1.5 }],
+    });
+
+    photo.jump(1);
+    expect(exposureOf(photo)).toBe(0);
+    expect(photo.historyList().index).toBe(1);
+    expect(photo.canRedo).toBe(true);
+    expect(() => photo.jump(9)).toThrow();
+  });
+
+  test("the eye and the layer opacity are steps of their own", () => {
+    const photo = new PhotoState();
+    const op = photo.addOp("exposure", { value: 1 });
+    photo.updateOp(op.id, {}, false, false);
+    const entries = photo.historyList().entries;
+    expect(entries.at(-1)).toMatchObject({
+      kind: "update",
+      changes: [{ param: "enabled", from: true, to: false }],
+    });
   });
 
   test("a committed mutation snapshots, undo restores the stack before it", () => {
@@ -164,6 +227,22 @@ describe("frames", () => {
     expect(after[0]).toBeGreaterThan(Number(before[0]));
     expect(after[1]).toBe(Number(before[1]));
     expect(after[2]).toBe(Number(before[2]));
+  });
+
+  test("the histogram counts the content rect and follows the pixels", () => {
+    const photo = new PhotoState();
+    const dark = renderFrame(8, 4, 1, 1, photo.stack);
+    const before = histogramOf(dark, 8, 4, [0, 0, 8, 4]);
+    expect(before.bins).toBe(256);
+    expect(before.r.reduce((sum, count) => sum + count, 0)).toBe(8 * 4);
+
+    // Half the frame, so half the pixels: the letterbox is what this rect leaves out.
+    const half = histogramOf(dark, 8, 4, [0, 0, 4, 4]);
+    expect(half.g.reduce((sum, count) => sum + count, 0)).toBe(4 * 4);
+
+    photo.addOp("exposure", { value: 4 });
+    const blown = histogramOf(renderFrame(8, 4, 2, 1, photo.stack), 8, 4, [0, 0, 8, 4]);
+    expect(blown.clippedHighlightsPct).toBeGreaterThan(before.clippedHighlightsPct);
   });
 
   test("the parametric regions reach the pixels too", () => {
@@ -1059,6 +1138,76 @@ describe("masks over the socket", () => {
         viewId,
       });
       expect(after.coverage).toBeGreaterThan(0);
+    } finally {
+      client.close();
+      engine.stop();
+    }
+  });
+
+  test("a mask is a layer: a group with its own adjustments, created before any of them", async () => {
+    const engine = startMockEngine(0);
+    const client = await TestClient.connect(engine.port);
+    try {
+      const opened = await client.call<PhotoOpenResult>("photo.open", { path: "/photos/x.arw" });
+      const photoId = opened.photoId;
+      // A mask comes first: nothing has to be adjusted before a region can be selected.
+      const added = await client.call<OpAddResult>("op.add", { photoId, op: "group" });
+      const groupId = added.opId;
+      expect(groupId).toBeTruthy();
+      expect(added.stack[0]).toMatchObject({ op: "group", ops: [] });
+
+      await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId: groupId,
+        params: {},
+        mask: { components: [{ id: "radial1", kind: "radial", mode: "add" }] },
+      });
+
+      // Two adjustments under the one mask — the thing a per-op mask could not express.
+      const exposure = await client.call<OpAddResult>("op.add", {
+        photoId,
+        op: "exposure",
+        params: { value: 1 },
+        parentId: groupId,
+      });
+      await client.call<OpAddResult>("op.add", {
+        photoId,
+        op: "clarity",
+        params: { value: 20 },
+        parentId: groupId,
+      });
+      const withBoth = await client.call<StackGetResult>("stack.get", { photoId });
+      expect(withBoth.stack).toHaveLength(1);
+      expect(withBoth.stack[0]?.ops?.map((child) => child.op)).toEqual(["exposure", "clarity"]);
+      expect(withBoth.stack[0]?.mask?.components[0]?.id).toBe("radial1");
+
+      // A child's own mask and opacity are the group's: a write that carries them is ignored.
+      const ignored = await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId: exposure.opId,
+        params: { value: 2 },
+        opacity: 40,
+      });
+      expect(ignored.stack[0]?.ops?.[0]).toMatchObject({ params: { value: 2 } });
+      expect(ignored.stack[0]?.ops?.[0]?.opacity).toBeUndefined();
+
+      // Opacity belongs to the layer, and removing a child leaves the mask alone.
+      await client.call<StackGetResult>("op.update", {
+        photoId,
+        opId: groupId,
+        params: {},
+        opacity: 60,
+      });
+      const removed = await client.call<StackGetResult>("op.remove", {
+        photoId,
+        opId: exposure.opId,
+      });
+      expect(removed.stack[0]?.opacity).toBe(60);
+      expect(removed.stack[0]?.ops?.map((child) => child.op)).toEqual(["clarity"]);
+
+      // The layer goes with everything under it.
+      const gone = await client.call<StackGetResult>("op.remove", { photoId, opId: groupId });
+      expect(gone.stack).toHaveLength(0);
     } finally {
       client.close();
       engine.stop();

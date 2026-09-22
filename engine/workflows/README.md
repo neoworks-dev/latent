@@ -32,6 +32,21 @@ that the graph feeds an IMAGE into `InpaintModelConditioning.mask` and fails at 
 | `inpaint-flux-fill` | `fill` | Flux.1 Fill Dev | **No** — needs ~24 GB of weights that are not installed |
 | `inpaint-sdxl` | `fill` | Any SD/SDXL checkpoint, default `RealVisXL_V5.0_fp16.safetensors` | Yes |
 | `remove` | `remove` | The same SDXL graph with a "nothing there" prompt and a lower CFG | Yes |
+| `denoise` | `denoise` | SDXL img2img at a low denoise, default `RealVisXL_V5.0_fp16.safetensors` | Yes |
+| `upscale` | `upscale` | `4x-UltraSharp.pth` through `ImageUpscaleWithModel` | Yes |
+
+The last two are the whole-frame ops (issues #51, #52). Neither takes a mask, and the
+engine hands each the frame the ops below it produced rather than a crop.
+
+`denoise` is an img2img pass because this ComfyUI install has no restoration node — SCUNet,
+Restormer and NAFNet are all custom nodes, and the honest fix is not a better graph but a
+model in the **raw** domain, before demosaic, which is a pipeline change rather than another
+workflow. Until then the sampler's `denoise` widget is the op's Strength, kept under 0.5:
+above that an img2img pass stops cleaning the photograph and starts inventing another one.
+
+`upscale` needs no sampler and no prompt. `ImageUpscaleWithModel` tiles the frame and blends
+the seams itself, which is why a 24 MP photo goes through it in one run while `denoise` has
+to be handed a 1536 px frame.
 
 `generative.status` reports `ready` per graph by looking for every file in `requires`
 under `<comfy workspace>/models/`. `choose_workflow` picks the first ready graph for the
@@ -42,15 +57,18 @@ loader widget.
 
 ## Substituted node ids
 
-| Graph | image | mask | prompt | seed | model | output |
-| --- | --- | --- | --- | --- | --- | --- |
-| `inpaint-flux-fill` | `160.image` | `211.image` | `108.text` | `112.seed` | `106.unet_name` | `313` |
-| `inpaint-sdxl` | `156.image` | `207.image` | `102.text` | `105.seed` | `101.ckpt_name` | `309` |
-| `remove` | `156.image` | `207.image` | — | `105.seed` | `101.ckpt_name` | `309` |
+| Graph | image | mask | prompt | seed | strength | model | output |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `inpaint-flux-fill` | `160.image` | `211.image` | `108.text` | `112.seed` | — | `106.unet_name` | `313` |
+| `inpaint-sdxl` | `156.image` | `207.image` | `102.text` | `105.seed` | — | `101.ckpt_name` | `309` |
+| `remove` | `156.image` | `207.image` | — | `105.seed` | — | `101.ckpt_name` | `309` |
+| `denoise` | `156.image` | — | — | `105.seed` | `105.denoise` | `101.ckpt_name` | `207` |
+| `upscale` | `152.image` | — | — | — | — | `101.model_name` | `203` |
 
 `remove` has no prompt binding on purpose: the op has no prompt param, and the graph's own
-positive and negative text are what "remove" means. `output` is the `SaveImage` node, read
-back from the run envelope's `outputs_by_node`.
+positive and negative text are what "remove" means. The two whole-frame graphs have no mask
+binding for the same reason — there is no mask to bind, and the backend skips the upload.
+`output` is the `SaveImage` node, read back from the run envelope's `outputs_by_node`.
 
 The node ids are minted by `comfy workflow compose` and are stable for a given compiled
 file. They change if the graph is recomposed — update `bindings.json` and this table

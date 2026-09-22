@@ -1,0 +1,107 @@
+{
+  "156": {
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "load crop.png"
+    },
+    "inputs": {
+      "image": "inputs/crop.png"
+    }
+  },
+  "101": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "RealVisXL_V5.0_fp16.safetensors"
+    }
+  },
+  "102": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "a clean photograph, fine natural detail, sharp grain-free texture",
+      "clip": [
+        "101",
+        1
+      ]
+    }
+  },
+  "103": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "noise, grain, chroma noise, speckle, banding, smudged detail, artifacts",
+      "clip": [
+        "101",
+        1
+      ]
+    }
+  },
+  "104": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "vae": [
+        "101",
+        2
+      ],
+      "pixels": [
+        "156",
+        0
+      ]
+    }
+  },
+  "105": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 0,
+      "steps": 20,
+      "cfg": 3.0,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 0.3,
+      "model": [
+        "101",
+        0
+      ],
+      "positive": [
+        "102",
+        0
+      ],
+      "negative": [
+        "103",
+        0
+      ],
+      "latent_image": [
+        "104",
+        0
+      ]
+    }
+  },
+  "106": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "105",
+        0
+      ],
+      "vae": [
+        "101",
+        2
+      ]
+    }
+  },
+  "207": {
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "save composed final (image)"
+    },
+    "inputs": {
+      "images": [
+        "106",
+        0
+      ],
+      "filename_prefix": "outputs/latent-denoise"
+    }
+  },
+  "_meta": {
+    "schema": "compose/1",
+    "blueprint": "engine/workflows/denoise/blueprint.yaml"
+  }
+}

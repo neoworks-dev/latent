@@ -30,6 +30,10 @@ namespace {
 // Uniform buffer bindings must start on a 256-byte boundary, so each op pass gets a
 // 256-byte slot in one buffer and the whole stack is uploaded in a single write.
 constexpr uint64_t kOpUniformStride = 256;
+// How many à trous levels manual_denoise runs. Three is where the support (five taps at
+// one, two and four pixels apart) stops growing usefully for sensor noise: a fourth level
+// reaches 40 px, which is subject matter rather than noise, and costs two more passes.
+constexpr int kWaveletLevels = 3;
 // One tone curve: 256 entries of vec4f, .xyz being the red/green/blue outputs.
 constexpr uint64_t kCurveFloats = 4 * kCurveLutSize;
 constexpr uint64_t kCurveSlotStride = kCurveFloats * sizeof(float);
@@ -53,7 +57,15 @@ enum class MaskPass : uint32_t {
   Luminance = 3,
   Color = 4,
   Raster = 5,
+  Depth = 6,
 };
+
+// The two branches that read the `raster` binding, and therefore need an upload before
+// anything is encoded: a brush stroke list or a model's output, and the depth map a depth
+// component bands.
+bool reads_raster(MaskPass kind) {
+  return kind == MaskPass::Raster || kind == MaskPass::Depth;
+}
 
 // Combine modes, matching the switch in shaders/mask_combine.wgsl. Replace seeds the
 // accumulator with the first component that contributes, whatever its own mode says: a
@@ -86,6 +98,32 @@ struct CombineUniform {
 };
 static_assert(sizeof(CombineUniform) == 16, "must match CombineParams in mask_combine.wgsl");
 
+// One `relight` pass. Two of these per op — the shafts march and the shading that reads it
+// — so they get a buffer of their own rather than a slot in the op buffer: the geometry
+// chain alone fills what an OpUniform has room for.
+struct RelightUniform {
+  float origin[2] = {0, 0};
+  float size[2] = {1, 1};
+  uint32_t pass_index = 0;
+  float opacity = 1;
+  uint32_t pad[2] = {0, 0};
+  float m0[4] = {1, 0, 0, 0};
+  float m1[4] = {0, 1, 0, 0};
+  float m2[4] = {0, 0, 1, 0};
+  float geom[4] = {0, 1, 0, 1};
+  float flip[4] = {1, 1, 0, 0};
+  float light[4] = {0, 0, 0.5F, 1};
+  float tone[4] = {1, 1, 1, 0};
+  float shape[4] = {0.5F, 0.6F, 0.02F, 0};
+  float rays[4] = {0, 0.6F, 0.5F, 32};
+};
+static_assert(sizeof(RelightUniform) == 176, "must match RelightParams in relight.wgsl");
+static_assert(sizeof(RelightUniform) <= kOpUniformStride, "a relight pass must fit its slot");
+// Steps per march. 32 is where the jittered shafts stop showing rings at proxy resolution;
+// the pass is fullscreen and every step costs a homography, so this is the frame budget's
+// share of the feature (PROMPT.md 8.1).
+constexpr float kRelightSteps = 48;
+
 // One component's textures inside a view: the r8 raster mask.wgsl wrote, plus the upload
 // a brush or an AI kind is rasterised from.
 struct MaskComponentTexture {
@@ -114,6 +152,15 @@ struct MaskEntry {
 struct StoredRaster {
   std::string hash;
   GrayImage image;
+};
+
+// The photo's depth map: image space at the model's own resolution, uploaded as it is
+// (ai/depth.h). Unlike a mask raster it is not resampled to the view — relight.wgsl reads it
+// bilinearly, and a nearest-neighbour resample on the way in would bake in the blocks that
+// filtering is there to avoid.
+struct StoredDepth {
+  std::string key;
+  Gray16Image image;
 };
 
 // One generative op's result on the GPU: the PNG a backend returned, uploaded as rgba8 and
@@ -220,6 +267,19 @@ std::array<float, 3> kelvin_gains(double kelvin, double tint) {
           static_cast<float>(gains[2] / luminance * magenta)};
 }
 
+// A light's own colour at unit luminance: the Planckian radiator at `kelvin`, clamped into
+// gamut and scaled so changing the temperature changes the hue of the light and not how
+// much of it there is.
+std::array<float, 3> light_color(double kelvin) {
+  const std::array<double, 3> white = planckian_white(kelvin);
+  const std::array<double, 3> positive = {std::max(white[0], 0.0), std::max(white[1], 0.0),
+                                          std::max(white[2], 0.0)};
+  const double luminance = (0.2126 * positive[0]) + (0.7152 * positive[1]) + (0.0722 * positive[2]);
+  if (luminance < 1e-6) return {1, 1, 1};
+  return {static_cast<float>(positive[0] / luminance), static_cast<float>(positive[1] / luminance),
+          static_cast<float>(positive[2] / luminance)};
+}
+
 std::array<float, 3> white_balance_gains(const Op& op) {
   if (text(op, "mode") == "kelvin") {
     return kelvin_gains(param(op, "kelvin", 5500.0), param(op, "tint"));
@@ -302,10 +362,18 @@ bool is_neutral(const Op& op, OpKind kind) {
       return param(op, "amount") == 0;
     case OpKind::NoiseReduction:
       return param(op, "luminance") == 0;
+    // Both halves at zero: the filter still runs its levels but mixes none of them back, so
+    // skipping it is the same picture for none of the passes.
+    case OpKind::ManualDenoise:
+      return param(op, "luminance") == 0 && param(op, "color") == 0;
     case OpKind::Defringe:
       return param(op, "purpleAmount") == 0 && param(op, "greenAmount") == 0;
     case OpKind::ChromaticAberration:
       return !flag(op, "enabled");
+    // A light at zero intensity with no rays is a light that is off. Its position and
+    // colour are still worth keeping — that is what the user set up.
+    case OpKind::Relight:
+      return param(op, "intensity") == 0 && param(op, "rays") == 0;
     case OpKind::ToneCurve:
     case OpKind::Geometry:
     // A generative op has no neutral value: whether it does anything is decided by whether
@@ -409,6 +477,14 @@ OpUniform op_uniform(const Op& op, OpKind kind, const ViewGeometry& geometry) {
       uniform.v[2] = static_cast<float>(param(op, "contrast") / 100.0);
       uniform.v[24] = 3;
       return uniform;
+    // The tap spacing and the level index are written per level by run_passes; what belongs
+    // to the op is the four sliders.
+    case OpKind::ManualDenoise:
+      uniform.v[0] = static_cast<float>(param(op, "luminance") / 100.0);
+      uniform.v[1] = static_cast<float>(param(op, "detail", 50.0) / 100.0);
+      uniform.v[2] = static_cast<float>(param(op, "color") / 100.0);
+      uniform.v[3] = static_cast<float>(param(op, "colorDetail", 50.0) / 100.0);
+      return uniform;
     case OpKind::ColorNoiseReduction:
       uniform.v[0] = static_cast<float>(param(op, "amount") / 100.0);
       uniform.v[1] = static_cast<float>(param(op, "detail", 50.0) / 100.0);
@@ -455,6 +531,8 @@ MaskPass mask_pass_kind(MaskKind kind) {
       return MaskPass::Luminance;
     case MaskKind::Color:
       return MaskPass::Color;
+    case MaskKind::Depth:
+      return MaskPass::Depth;
     default:
       return MaskPass::Raster;
   }
@@ -541,6 +619,7 @@ MaskUniform mask_uniform(const MaskComponent& component, const GeometryMap& map)
                                         std::numbers::pi / 180.0);
       return uniform;
     }
+    case MaskKind::Depth:
     case MaskKind::Luminance: {
       const auto range = component_pair(component.params, "range", 0.5, 1.0);
       uniform.v[0] = static_cast<float>(range[0]);
@@ -575,19 +654,84 @@ MaskUniform mask_uniform(const MaskComponent& component, const GeometryMap& map)
   }
 }
 
+// One `relight` pass, with the whole geometry chain in it so the shader can read a depth
+// map that is stored in image space. `pass_index` is the only thing that differs between
+// the two passes of one op, so both are built from here.
+RelightUniform relight_uniform(const Op& op, const GeometryMap& map, const ViewGeometry& geometry,
+                               uint32_t pass_index) {
+  RelightUniform uniform;
+  uniform.pass_index = pass_index;
+  uniform.opacity = static_cast<float>(std::clamp(op.opacity, 0.0, kFullOpacity) / 100.0);
+  uniform.origin[0] = static_cast<float>(geometry.content_x);
+  uniform.origin[1] = static_cast<float>(geometry.content_y);
+  uniform.size[0] = static_cast<float>(geometry.content_width);
+  uniform.size[1] = static_cast<float>(geometry.content_height);
+  for (int i = 0; i < 3; ++i) {
+    uniform.m0[i] = static_cast<float>(map.view_to_working[i]);
+    uniform.m1[i] = static_cast<float>(map.view_to_working[3 + i]);
+    uniform.m2[i] = static_cast<float>(map.view_to_working[6 + i]);
+  }
+  uniform.geom[0] = static_cast<float>(map.distortion_k);
+  uniform.geom[1] = static_cast<float>(map.work_aspect);
+  uniform.geom[2] = static_cast<float>(map.quadrant);
+  uniform.geom[3] = static_cast<float>(map.image_aspect);
+  uniform.flip[0] = map.flip_horizontal ? -1.0F : 1.0F;
+  uniform.flip[1] = map.flip_vertical ? -1.0F : 1.0F;
+
+  // The light is stored in image space like a mask coordinate, and the march works in view
+  // pixels: this is the one conversion, done once per frame rather than per invocation.
+  const std::array<double, 2> on_screen =
+      mat3_apply(map.image_to_view, param(op, "x", 0.5), param(op, "y", 0.5));
+  uniform.light[0] = static_cast<float>(on_screen[0]);
+  uniform.light[1] = static_cast<float>(on_screen[1]);
+  uniform.light[2] = static_cast<float>(param(op, "distance", 50.0) / 100.0);
+  // Reach, in image widths: a quarter of the frame at 0 and a little under two frames at
+  // 100, which is the span between "a lamp in the picture" and "the sun outside it".
+  uniform.light[3] = static_cast<float>(0.15 + (param(op, "radius", 40.0) / 100.0 * 1.6));
+
+  const std::array<float, 3> color = light_color(param(op, "kelvin", 5500.0));
+  uniform.tone[0] = color[0];
+  uniform.tone[1] = color[1];
+  uniform.tone[2] = color[2];
+  // Intensity is a gain on what the surface already reflects, so 100 is +2 stops of light
+  // where the beam lands rather than a fixed amount of radiance.
+  uniform.tone[3] = static_cast<float>(param(op, "intensity") / 100.0 * 3.0);
+
+  uniform.shape[0] = static_cast<float>(param(op, "falloff", 50.0) / 100.0);
+  uniform.shape[1] = static_cast<float>(param(op, "occlusion", 60.0) / 100.0);
+  // How far apart two depths have to be before one shadows the other. The map is a guess,
+  // so this is never zero: a hard test draws every kink in it as a hard edge.
+  uniform.shape[2] = static_cast<float>(0.005 + (param(op, "softness", 25.0) / 100.0 * 0.08));
+  // The other half of the same slider: a penumbra. A shadow edge in a depth map is as hard
+  // as the map, and a photographer reads a razor-edged shadow across a distant background
+  // as a bug rather than as a light.
+  uniform.shape[3] = static_cast<float>(
+      1.0 + (param(op, "softness", 25.0) / 100.0 * std::max(geometry.content_height, 1U) / 64.0));
+
+  // The shafts pass answers with a 0..1 shape and the falloff is applied on top of it, so
+  // this is the light the air scatters straight into the lens where the beam is brightest.
+  uniform.rays[0] = static_cast<float>(param(op, "rays", 45.0) / 100.0 * 0.9);
+  uniform.rays[1] = static_cast<float>(0.05 + (param(op, "rayLength", 60.0) / 100.0 * 0.95));
+  uniform.rays[2] = static_cast<float>(param(op, "rayDecay", 50.0) / 100.0);
+  uniform.rays[3] = kRelightSteps;
+  return uniform;
+}
+
 // What invalidates a cached raster: the mask's own JSON, the view's size, the content rect
-// inside it, and the geometry stage that put it there. The last is the whole point of image
-// space — the coordinates no longer move when a crop does, but the *pixels* they land on
-// do, so a straighten that leaves the content rect's size alone still has to re-rasterise.
-// The op's *input* deliberately does not: a masked slider drag must not re-rasterise, and
-// the price is that a luminance or colour mask keeps the levels it was built from until
-// the mask or the frame changes (see NEXT.md's mask.refresh).
+// inside it, the geometry stage that put it there, and the base it samples. The geometry is
+// the whole point of image space — the coordinates no longer move when a crop does, but the
+// *pixels* they land on do, so a straighten that leaves the content rect's size alone still
+// has to re-rasterise. Luminance and colour components sample the view's base, the photo
+// before any op, as Lightroom's range masks do (issue #1): nothing in the stack can make
+// them stale, so the key only needs to know when the base itself was redrawn.
 std::string mask_cache_key(const nlohmann::json& canonical, const GeometryMap& map,
-                           const GeometryParams& params, const ViewGeometry& geometry) {
+                           const GeometryParams& params, const ViewGeometry& geometry,
+                           uint64_t base_generation) {
   const nlohmann::json keyed = {
       {"m", canonical},
       {"r", {map.content.x, map.content.y, map.content.width, map.content.height}},
-      {"g", geometry_to_json(params)}};
+      {"g", geometry_to_json(params)},
+      {"b", base_generation}};
   return mask_hash(keyed, geometry.width, geometry.height);
 }
 
@@ -598,8 +742,7 @@ std::string mask_cache_key(const nlohmann::json& canonical, const GeometryMap& m
 // it rather than paying to rebuild it on every zoom step.
 std::array<uint32_t, 2> image_raster_size(uint32_t photo_width, uint32_t photo_height,
                                           uint32_t view_width, uint32_t view_height) {
-  const double aspect =
-      static_cast<double>(std::max(1U, photo_width)) / std::max(1U, photo_height);
+  const double aspect = static_cast<double>(std::max(1U, photo_width)) / std::max(1U, photo_height);
   double width = view_width;
   double height = width / aspect;
   if (height > view_height) {
@@ -650,10 +793,12 @@ OpKind op_kind(std::string_view name) {
   if (name == "clarity") return OpKind::Clarity;
   if (name == "dehaze") return OpKind::Dehaze;
   if (name == "noise_reduction") return OpKind::NoiseReduction;
+  if (name == "manual_denoise") return OpKind::ManualDenoise;
   if (name == "color_noise_reduction") return OpKind::ColorNoiseReduction;
   if (name == "sharpening") return OpKind::Sharpening;
   if (name == "defringe") return OpKind::Defringe;
   if (name == "chromatic_aberration") return OpKind::ChromaticAberration;
+  if (name == "relight") return OpKind::Relight;
   if (name == "crop" || name == "rotate" || name == "flip" || name == "transform") {
     return OpKind::Geometry;
   }
@@ -669,6 +814,9 @@ struct Renderer::Photo {
   // AI mask rasters by componentId: written by mask.detect, reloaded from the PNG cache
   // at photo.open, shared by every view of this photo.
   std::unordered_map<std::string, StoredRaster> rasters;
+  // The scene's depth map: written by depth.estimate, reloaded from the PNG cache at
+  // photo.open, shared by every view and by every relight op in the stack.
+  StoredDepth depth;
   // Generative results by opId. Unlike a mask raster these are uploaded once at their own
   // resolution and sampled through the composite's rect, so no view holds a copy.
   std::unordered_map<std::string, StoredResult> results;
@@ -678,6 +826,8 @@ struct Renderer::View {
   int64_t photo_id = 0;
   ViewGeometry geometry;
   bool base_valid = false;
+  // Bumped every time `base` is redrawn; range masks sample it, so it is in their cache key.
+  uint64_t base_generation = 0;
   GeometryParams geometry_params;
   // What the user asked to look at, and the stage resolved for it: every mask pass, every
   // op pass and the `imageTransform` on the wire read this one object.
@@ -687,16 +837,45 @@ struct Renderer::View {
   TextureViewHandle base_view;
   TextureHandle ping[2];
   TextureViewHandle ping_view[2];
+  // The group branch's own pair, made by ensure_branch() the first time a group renders:
+  // the children ping-pong here so the group's input — which is one of `ping` — is still
+  // there for blend.wgsl to mix against.
+  TextureHandle branch[2];
+  TextureViewHandle branch_view[2];
+  uint32_t branch_width = 0;
+  uint32_t branch_height = 0;
+  // manual_denoise's own pair, made by ensure_wavelet(): its three levels ping-pong here so
+  // that the op's input is still intact when the blend at the end mixes through the mask.
+  // It cannot borrow `branch`, which a group holding the denoise is already using.
+  TextureHandle wavelet[2];
+  TextureViewHandle wavelet_view[2];
+  uint32_t wavelet_width = 0;
+  uint32_t wavelet_height = 0;
   TextureHandle scratch;
   TextureViewHandle scratch_view;
+  // The photo's depth map at this view's image-raster size, and the key it was uploaded
+  // from. Made the first frame a relight op or a depth mask needs it.
+  TextureHandle depth;
+  TextureViewHandle depth_view;
+  std::string depth_key;
+  uint32_t depth_width = 0;
+  uint32_t depth_height = 0;
   TextureHandle output;
   TextureViewHandle output_view;
   BufferHandle fit_uniform;
   BufferHandle frame_uniform;
   BufferHandle op_uniforms;
   BufferHandle curve_uniforms;
+  // Two slots per relight op — the shafts march and the shading — at the same 256-byte
+  // stride as everything else.
+  BufferHandle relight_uniforms;
+  // One slot per à trous level of each manual_denoise op: same stride, same struct, and the
+  // only thing that differs between them is the tap spacing.
+  BufferHandle wavelet_uniforms;
   uint32_t op_capacity = 0;
   uint32_t curve_capacity = 0;
+  uint32_t relight_capacity = 0;
+  uint32_t wavelet_capacity = 0;
   // One entry per masked op, keyed by opId and invalidated by the mask's hash.
   std::unordered_map<std::string, MaskEntry> masks;
 };
@@ -728,8 +907,16 @@ Renderer::Renderer(uint32_t max_texture_dim) : gpu_(max_texture_dim) {
       mask_combine.get(), WGPUTextureFormat_R8Unorm, "mask-combine");
 
   const ShaderModuleHandle composite = gpu_.create_shader(shaders::kComposite, "composite");
-  composite_pipeline_ = gpu_.create_fullscreen_pipeline(
-      composite.get(), WGPUTextureFormat_RGBA16Float, "composite");
+  composite_pipeline_ =
+      gpu_.create_fullscreen_pipeline(composite.get(), WGPUTextureFormat_RGBA16Float, "composite");
+
+  const ShaderModuleHandle blend = gpu_.create_shader(shaders::kBlend, "blend");
+  blend_pipeline_ =
+      gpu_.create_fullscreen_pipeline(blend.get(), WGPUTextureFormat_RGBA16Float, "blend");
+
+  const ShaderModuleHandle relight = gpu_.create_shader(shaders::kRelight, "relight");
+  relight_pipeline_ =
+      gpu_.create_fullscreen_pipeline(relight.get(), WGPUTextureFormat_RGBA16Float, "relight");
 
   const auto sampled =
       static_cast<WGPUTextureUsage>(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
@@ -783,6 +970,12 @@ void Renderer::load_photo(int64_t photo_id, const DecodedRaw& raw) {
   gpu_.raise_pending_error();
 
   photos_[photo_id] = std::move(photo);
+  // A second load of the same photo replaces the texture every open view downscaled its
+  // base from, so those bases are stale even though nothing about the view changed.
+  // photo.open upgrading a cached preview to the full-resolution decode is that caller.
+  for (auto& [view_id, view] : views_) {
+    if (view->photo_id == photo_id) view->base_valid = false;
+  }
 }
 
 void Renderer::unload_photo(int64_t photo_id) {
@@ -912,8 +1105,8 @@ void Renderer::build_base(View& view) {
   const Mat3 matrix = mat3_multiply(
       view.map.view_to_working,
       Mat3{static_cast<double>(geometry.content_width), 0, static_cast<double>(geometry.content_x),
-           0, static_cast<double>(geometry.content_height),
-           static_cast<double>(geometry.content_y), 0, 0, 1});
+           0, static_cast<double>(geometry.content_height), static_cast<double>(geometry.content_y),
+           0, 0, 1});
   for (int i = 0; i < 3; ++i) {
     fit.m0[i] = static_cast<float>(matrix[i]);
     fit.m1[i] = static_cast<float>(matrix[3 + i]);
@@ -942,24 +1135,90 @@ void Renderer::build_base(View& view) {
   gpu_.wait_idle();
   gpu_.raise_pending_error();
   view.base_valid = true;
+  ++view.base_generation;
+}
+
+void Renderer::ensure_branch(View& view) {
+  const uint32_t width = view.geometry.width;
+  const uint32_t height = view.geometry.height;
+  if (view.branch_width == width && view.branch_height == height && view.branch[0]) return;
+  const auto usage = static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment |
+                                                   WGPUTextureUsage_TextureBinding);
+  for (int i = 0; i < 2; ++i) {
+    view.branch[i] =
+        gpu_.create_texture(width, height, WGPUTextureFormat_RGBA16Float, usage, "view-branch");
+    view.branch_view[i].reset(wgpuTextureCreateView(view.branch[i].get(), nullptr));
+  }
+  view.branch_width = width;
+  view.branch_height = height;
+}
+
+void Renderer::ensure_wavelet(View& view) {
+  const uint32_t width = view.geometry.width;
+  const uint32_t height = view.geometry.height;
+  if (view.wavelet_width == width && view.wavelet_height == height && view.wavelet[0]) return;
+  const auto usage = static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment |
+                                                   WGPUTextureUsage_TextureBinding);
+  for (int i = 0; i < 2; ++i) {
+    view.wavelet[i] =
+        gpu_.create_texture(width, height, WGPUTextureFormat_RGBA16Float, usage, "view-wavelet");
+    view.wavelet_view[i].reset(wgpuTextureCreateView(view.wavelet[i].get(), nullptr));
+  }
+  view.wavelet_width = width;
+  view.wavelet_height = height;
+}
+
+void Renderer::ensure_depth(View& view) {
+  const Photo& photo = *photos_.at(view.photo_id);
+  const Gray16Image& map = photo.depth.image;
+  if (map.pixels.empty()) return;
+  if (view.depth_key == photo.depth.key && view.depth_width == map.width &&
+      view.depth_height == map.height) {
+    return;
+  }
+  // R16Uint rather than a float format: the shader loads texels and interpolates them itself,
+  // so nothing here needs filtering, and 1/65535 is exactly what the map was quantised to.
+  view.depth = gpu_.create_texture(
+      map.width, map.height, WGPUTextureFormat_R16Uint,
+      static_cast<WGPUTextureUsage>(WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst),
+      "depth-map");
+  gpu_.write_texture(view.depth.get(), map.width, map.height, 2, map.pixels.data(),
+                     map.pixels.size() * sizeof(uint16_t));
+  view.depth_view.reset(wgpuTextureCreateView(view.depth.get(), nullptr));
+  view.depth_key = photo.depth.key;
+  view.depth_width = map.width;
+  view.depth_height = map.height;
 }
 
 struct Renderer::Pass {
   OpKind kind = OpKind::None;
   OpUniform uniform;
   int curve_slot = 0;
+  // Relight only: where its pair of RelightUniforms sits in the view's relight buffer.
+  int relight_slot = -1;
+  // manual_denoise only: where its run of kWaveletLevels uniforms starts, one per level.
+  int wavelet_slot = -1;
   const Op* op = nullptr;
-  // Empty when the op has no mask; otherwise the canonical mask JSON and its cache key.
+  // Empty when nothing masks this pass; otherwise the canonical mask JSON and its cache key.
+  // On a group's passes it is the *group's* mask, carried by the first child (which is
+  // where it gets built) and sampled by the Blend that closes the group.
   nlohmann::json mask_json;
   std::string mask_hash;
   bool mask_dirty = false;
   WGPUTextureView mask_view = nullptr;
   // A generative op's uploaded result, or null when the engine has not been handed one.
   WGPUTextureView result_view = nullptr;
+  // Set on every pass that belongs to a group, including its closing Blend. The children
+  // render into the branch pair; the Blend reads the group's input and writes back to the
+  // main pair. `mask_owner` is the op whose id keys the mask cache — the group for those,
+  // the op itself for a plain masked op.
+  const Op* group = nullptr;
+  bool group_first = false;
+  const Op* mask_owner = nullptr;
 };
 
 void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canonical,
-                          const std::string& hash, WGPUTextureView input) {
+                          const std::string& hash) {
   const Mask mask = mask_from_json(canonical);
   const Photo& photo = *photos_.at(view.photo_id);
   MaskEntry& entry = view.masks[op.id];
@@ -996,10 +1255,10 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
 
   // Brush stroke lists and model rasters become r8 uploads before anything is encoded: a
   // queue write between two render passes of the same encoder is not ordered against them.
-  const std::array<uint32_t, 2> raster_size = image_raster_size(
-      photo.width, photo.height, view.geometry.width, view.geometry.height);
+  const std::array<uint32_t, 2> raster_size =
+      image_raster_size(photo.width, photo.height, view.geometry.width, view.geometry.height);
   for (const MaskComponent* component : active) {
-    if (mask_pass_kind(component->kind) != MaskPass::Raster) continue;
+    if (!reads_raster(mask_pass_kind(component->kind))) continue;
     MaskComponentTexture& texture = entry.components[component->id];
     GrayImage image;
     std::string source_key;
@@ -1008,12 +1267,12 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
       // re-renders the pass below but never re-stamps the strokes.
       source_key = mask_hash(component->params, raster_size[0], raster_size[1]);
       if (texture.source_hash == source_key) continue;
-      image = rasterize_brush(brush_strokes(component->params), component->feather,
-                              raster_size[0], raster_size[1]);
+      image = rasterize_brush(brush_strokes(component->params), component->feather, raster_size[0],
+                              raster_size[1]);
     } else {
       const StoredRaster& stored = photo.rasters.at(component->id);
-      source_key = stored.hash + "@" + std::to_string(raster_size[0]) + "x" +
-                   std::to_string(raster_size[1]);
+      source_key =
+          stored.hash + "@" + std::to_string(raster_size[0]) + "x" + std::to_string(raster_size[1]);
       if (texture.source_hash == source_key) continue;
       image = resample_gray(stored.image, raster_size[0], raster_size[1]);
     }
@@ -1037,8 +1296,8 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
   for (const MaskComponent* component : active) {
     MaskComponentTexture& texture = entry.components[component->id];
     const std::string key =
-        mask_cache_key(component_to_json(*component), view.map, view.geometry_params,
-                       view.geometry);
+        mask_cache_key(component_to_json(*component), view.map, view.geometry_params, view.geometry,
+                       view.base_generation);
     if (!texture.texture) {
       texture.texture =
           gpu_.create_texture(width, height, WGPUTextureFormat_R8Unorm, usage, "mask-component");
@@ -1051,7 +1310,7 @@ void Renderer::build_mask(View& view, const Op& op, const nlohmann::json& canoni
       WGPUTextureView raster =
           texture.source_view ? texture.source_view.get() : white_mask_view_.get();
       const std::array<WGPUBindGroupEntry, 3> entries = {
-          texture_entry(0, input),
+          texture_entry(0, view.base_view.get()),
           buffer_entry(1, mask_uniforms_.get(), kOpUniformStride * slot, sizeof(MaskUniform)),
           texture_entry(2, raster)};
       keep.push_back(gpu_.create_bind_group(mask_pipeline_.get(), entries));
@@ -1117,46 +1376,81 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
   }
 
   // The stack is the user's order; the passes run in Lightroom's (PipelineStage in
-  // ops/registry.h). A stable sort keeps two ops of the same stage in stack order.
-  std::vector<const Op*> ordered;
-  ordered.reserve(stack.size());
-  for (const Op& op : stack) {
-    if (op.enabled) ordered.push_back(&op);
-  }
-  std::stable_sort(ordered.begin(), ordered.end(), [](const Op* a, const Op* b) {
-    const OpDefinition* left = find_op_definition(a->name);
-    const OpDefinition* right = find_op_definition(b->name);
-    const int left_stage = left == nullptr ? 0 : static_cast<int>(left->stage);
-    const int right_stage = right == nullptr ? 0 : static_cast<int>(right->stage);
-    return left_stage < right_stage;
-  });
+  // ops/registry.h). A stable sort keeps two ops of the same stage in stack order. A group
+  // sorts as one entry at PipelineStage::Local however its children are spread, because it
+  // renders as one branch.
+  const auto stage_of = [](const Op& op) {
+    if (op.is_group()) return static_cast<int>(PipelineStage::Local);
+    const OpDefinition* definition = find_op_definition(op.name);
+    return definition == nullptr ? 0 : static_cast<int>(definition->stage);
+  };
+  const auto in_stage_order = [&](const Stack& entries) {
+    std::vector<const Op*> ordered;
+    ordered.reserve(entries.size());
+    for (const Op& op : entries) {
+      if (op.enabled) ordered.push_back(&op);
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [&](const Op* a, const Op* b) { return stage_of(*a) < stage_of(*b); });
+    return ordered;
+  };
 
   std::vector<Pass> passes;
   std::vector<CurveTable> curves;
-  for (const Op* op : ordered) {
-    const OpKind kind = op_kind(op->name);
-    if (kind == OpKind::None || kind == OpKind::Geometry) continue;
-    if (is_neutral(*op, kind)) continue;
+  std::vector<RelightUniform> relights;
+  std::vector<OpUniform> wavelets;
+  // One op's pass, or nothing when the op has nothing to do: unknown, geometry, at its
+  // defaults, or a generative op whose result this engine has not been handed.
+  const auto build_pass = [&](const Op& op) -> std::optional<Pass> {
+    const OpKind kind = op_kind(op.name);
+    if (kind == OpKind::None || kind == OpKind::Geometry) return std::nullopt;
+    if (is_neutral(op, kind)) return std::nullopt;
     Pass pass;
     pass.kind = kind;
-    pass.op = op;
+    pass.op = &op;
     if (kind == OpKind::ToneCurve) {
       CurveTable table{};
-      if (!curve_table(*op, table)) continue;
+      if (!curve_table(op, table)) return std::nullopt;
       pass.curve_slot = static_cast<int>(curves.size());
       curves.push_back(table);
     }
-    pass.uniform = op_uniform(*op, kind, view.geometry);
-    pass.uniform.opacity = static_cast<float>(std::clamp(op->opacity, 0.0, kFullOpacity) / 100.0);
+    // A relight op is nothing without the scene's depth map, and the map is a job the user
+    // has to ask for: until depth.estimate has run, the op sits in the stack and renders
+    // as if it were not there — the same rule a generative op without its raster follows.
+    if (kind == OpKind::Relight) {
+      const Photo& photo = *photos_.at(view.photo_id);
+      if (photo.depth.image.pixels.empty()) return std::nullopt;
+      pass.relight_slot = static_cast<int>(relights.size());
+      relights.push_back(relight_uniform(op, view.map, view.geometry, 0));
+      relights.push_back(relight_uniform(op, view.map, view.geometry, 1));
+    }
+    pass.uniform = op_uniform(op, kind, view.geometry);
+    pass.uniform.opacity = static_cast<float>(std::clamp(op.opacity, 0.0, kFullOpacity) / 100.0);
+    // manual_denoise is three à trous levels, each with its own tap spacing: level 0 reads
+    // its five taps one pixel apart, level 1 two, level 2 four, so the support grows to
+    // twenty pixels while the cost stays five taps a pass. The levels run at full strength
+    // and unmasked — blend.wgsl puts the finished frame back through the mask and the
+    // opacity, which is the only way a half-covered pixel gets filtered once rather than
+    // three times.
+    if (kind == OpKind::ManualDenoise) {
+      pass.wavelet_slot = static_cast<int>(wavelets.size());
+      for (int level = 0; level < kWaveletLevels; ++level) {
+        OpUniform level_uniform = pass.uniform;
+        level_uniform.opacity = 1;
+        level_uniform.v[24] = static_cast<float>(1 << level);
+        level_uniform.v[25] = static_cast<float>(level);
+        wavelets.push_back(level_uniform);
+      }
+    }
     // A generative op is a cached raster, so it draws nothing until a job has produced one
     // and the engine has been handed it. `result_rect` is normalised over the content rect,
     // which the viewport's zoom and pan scale along with everything else.
     if (kind == OpKind::Generative) {
       const Photo& photo = *photos_.at(view.photo_id);
-      const auto stored = photo.results.find(op->id);
-      const std::optional<GenerativeRect> rect = rect_from_json(op->result_rect);
-      if (stored == photo.results.end() || stored->second.key != op->result) continue;
-      if (!rect.has_value()) continue;
+      const auto stored = photo.results.find(op.id);
+      const std::optional<GenerativeRect> rect = rect_from_json(op.result_rect);
+      if (stored == photo.results.end() || stored->second.key != op.result) return std::nullopt;
+      if (!rect.has_value()) return std::nullopt;
       pass.result_view = stored->second.view.get();
       const auto edge = [](double at, int32_t origin, uint32_t extent) {
         return static_cast<float>(origin + (at * extent));
@@ -1168,17 +1462,60 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
       pass.uniform.v[4] = static_cast<float>(stored->second.width);
       pass.uniform.v[5] = static_cast<float>(stored->second.height);
     }
-    // An empty component list is not a mask: the op still applies everywhere, at its
-    // opacity. A list whose components are all pending is, and rasterises to nothing.
-    if (op->mask.has_value() && op->mask->contains("components") &&
-        !(*op->mask)["components"].empty()) {
-      pass.mask_json = *op->mask;
-      pass.mask_hash =
-          mask_cache_key(pass.mask_json, view.map, view.geometry_params, view.geometry);
-      const auto found = view.masks.find(op->id);
-      pass.mask_dirty = found == view.masks.end() || found->second.hash != pass.mask_hash;
+    return pass;
+  };
+  // An empty component list is not a mask: the op still applies everywhere, at its opacity.
+  // A list whose components are all pending is, and rasterises to nothing.
+  const auto attach_mask = [&](Pass& pass, const Op& owner) {
+    if (!owner.mask.has_value() || !owner.mask->contains("components") ||
+        (*owner.mask)["components"].empty()) {
+      return;
     }
-    passes.push_back(std::move(pass));
+    pass.mask_json = *owner.mask;
+    pass.mask_hash = mask_cache_key(pass.mask_json, view.map, view.geometry_params, view.geometry,
+                                    view.base_generation);
+    const auto found = view.masks.find(owner.id);
+    pass.mask_dirty = found == view.masks.end() || found->second.hash != pass.mask_hash;
+    pass.mask_owner = &owner;
+  };
+
+  for (const Op* entry : in_stage_order(stack)) {
+    if (!entry->is_group()) {
+      std::optional<Pass> pass = build_pass(*entry);
+      if (!pass.has_value()) continue;
+      attach_mask(*pass, *entry);
+      passes.push_back(std::move(*pass));
+      continue;
+    }
+
+    // A group: its children render into the branch at full strength, and one Blend puts the
+    // branch back through the group's mask (PROMPT.md 3.7). A group whose children are all
+    // at their defaults has nothing to blend, so it costs nothing.
+    const size_t first = passes.size();
+    for (const Op* child : in_stage_order(entry->ops)) {
+      std::optional<Pass> pass = build_pass(*child);
+      if (!pass.has_value()) continue;
+      // The mask and the opacity are the group's: inside the branch a child applies whole.
+      pass->uniform.opacity = 1;
+      if (pass->relight_slot >= 0) {
+        relights[static_cast<size_t>(pass->relight_slot)].opacity = 1;
+        relights[static_cast<size_t>(pass->relight_slot) + 1].opacity = 1;
+      }
+      pass->group = entry;
+      passes.push_back(std::move(*pass));
+    }
+    if (passes.size() == first) continue;
+
+    Pass blend;
+    blend.kind = OpKind::Blend;
+    blend.op = entry;
+    blend.group = entry;
+    blend.uniform.kind = static_cast<uint32_t>(OpKind::Blend);
+    blend.uniform.opacity =
+        static_cast<float>(std::clamp(entry->opacity, 0.0, kFullOpacity) / 100.0);
+    attach_mask(blend, *entry);
+    passes[first].group_first = true;
+    passes.push_back(std::move(blend));
   }
 
   if (view.op_capacity < passes.size()) {
@@ -1199,45 +1536,168 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
     gpu_.write_buffer(view.curve_uniforms.get(), kCurveSlotStride * i, curves[i].data(),
                       kCurveSlotStride);
   }
+  if (!relights.empty()) {
+    if (view.relight_capacity < relights.size()) {
+      view.relight_uniforms =
+          gpu_.create_uniform_buffer(kOpUniformStride * relights.size(), "relight");
+      view.relight_capacity = static_cast<uint32_t>(relights.size());
+    }
+    for (size_t i = 0; i < relights.size(); ++i) {
+      gpu_.write_buffer(view.relight_uniforms.get(), kOpUniformStride * i, &relights[i],
+                        sizeof(RelightUniform));
+    }
+    // The depth map has to be on the GPU before anything is encoded, for the same reason a
+    // mask raster does: a queue write is not ordered against the passes of an open encoder.
+    ensure_depth(view);
+  }
+  if (!wavelets.empty()) {
+    if (view.wavelet_capacity < wavelets.size()) {
+      view.wavelet_uniforms =
+          gpu_.create_uniform_buffer(kOpUniformStride * wavelets.size(), "wavelet");
+      view.wavelet_capacity = static_cast<uint32_t>(wavelets.size());
+    }
+    for (size_t i = 0; i < wavelets.size(); ++i) {
+      gpu_.write_buffer(view.wavelet_uniforms.get(), kOpUniformStride * i, &wavelets[i],
+                        sizeof(OpUniform));
+    }
+    ensure_wavelet(view);
+  }
+
+  // Masks read the base, not the op's input, so every dirty one is built before the chain is
+  // encoded and a mask edit never splits the render. A cached one costs nothing.
+  for (const Pass& pass : passes) {
+    if (!pass.mask_dirty) continue;
+    build_mask(view, *pass.mask_owner, pass.mask_json, pass.mask_hash);
+  }
 
   std::vector<BindGroupHandle> bind_groups;
   WGPUCommandEncoder encoder = gpu_.begin_commands("view-render");
   WGPUTextureView source = view.base_view.get();
   size_t target_index = 0;
+  // The branch pair and what the group was handed, live only between a group_first pass and
+  // the Blend that closes it.
+  size_t branch_index = 0;
+  WGPUTextureView group_input = nullptr;
   for (size_t i = 0; i < passes.size(); ++i) {
     Pass& pass = passes[i];
-    // A luminance or colour component reads the op's input, so the chain below it has to
-    // have run. Everything already encoded goes out, the mask is built, and the encoder
-    // starts again. Only a mask edit lands here: a cached one costs nothing.
-    if (pass.mask_dirty) {
-      gpu_.submit(encoder);
-      gpu_.wait_idle();
-      gpu_.raise_pending_error();
-      bind_groups.clear();
-      build_mask(view, *pass.op, pass.mask_json, pass.mask_hash, source);
-      encoder = gpu_.begin_commands("view-render");
+    if (pass.group_first) {
+      ensure_branch(view);
+      group_input = source;
+      branch_index = 0;
     }
+    // A group's children run unmasked inside the branch; the Blend is where the mask lands.
+    const bool samples_mask =
+        pass.mask_owner != nullptr && (pass.group == nullptr || pass.kind == OpKind::Blend);
     pass.mask_view = white_mask_view_.get();
-    if (!pass.mask_hash.empty()) {
-      const MaskEntry& entry = view.masks.at(pass.op->id);
+    if (samples_mask) {
+      const MaskEntry& entry = view.masks.at(pass.mask_owner->id);
       pass.mask_view = entry.accum_view[entry.final_index].get();
     }
+    // Inside a group everything ping-pongs in the branch pair, so `group_input` — which is
+    // one of the main pair — is still intact when the Blend reads it.
+    const bool in_branch = pass.group != nullptr && pass.kind != OpKind::Blend;
+    WGPUTextureView target = in_branch ? view.branch_view[branch_index % 2].get()
+                                       : view.ping_view[target_index % 2].get();
+    const auto advance = [&]() {
+      source = target;
+      if (in_branch) {
+        ++branch_index;
+      } else {
+        ++target_index;
+      }
+    };
 
     const WGPUBindGroupEntry uniform =
         buffer_entry(1, view.op_uniforms.get(), kOpUniformStride * i, sizeof(OpUniform));
+    // The group's blend: the branch its children rendered, mixed back into what the group
+    // was handed (PROMPT.md 3.7). Tested before the neighbourhood branch, which would
+    // otherwise claim it — it is above Texture like every composited kind.
+    if (pass.kind == OpKind::Blend) {
+      const std::array<WGPUBindGroupEntry, 4> entries = {texture_entry(0, group_input), uniform,
+                                                         texture_entry(2, source),
+                                                         texture_entry(3, pass.mask_view)};
+      bind_groups.push_back(gpu_.create_bind_group(blend_pipeline_.get(), entries));
+      gpu_.encode_fullscreen_pass(encoder, blend_pipeline_.get(), bind_groups.back().get(), target);
+      advance();
+      group_input = nullptr;
+      continue;
+    }
     // The generative composite mixes a cached raster in at this op's position instead of
     // computing anything (PROMPT.md 3.5). It has to be tested before the neighbourhood
     // branch, which claims every kind above Texture.
     if (pass.kind == OpKind::Generative) {
-      const std::array<WGPUBindGroupEntry, 4> entries = {
-          texture_entry(0, source), uniform, texture_entry(2, pass.result_view),
-          texture_entry(3, pass.mask_view)};
+      const std::array<WGPUBindGroupEntry, 4> entries = {texture_entry(0, source), uniform,
+                                                         texture_entry(2, pass.result_view),
+                                                         texture_entry(3, pass.mask_view)};
       bind_groups.push_back(gpu_.create_bind_group(composite_pipeline_.get(), entries));
-      WGPUTextureView target = view.ping_view[target_index % 2].get();
       gpu_.encode_fullscreen_pass(encoder, composite_pipeline_.get(), bind_groups.back().get(),
                                   target);
-      source = target;
-      ++target_index;
+      advance();
+      continue;
+    }
+    // Relight: the shafts march into the scratch texture, then the shading reads it back
+    // alongside the depth map (PROMPT.md 3.8). Two passes rather than one because the
+    // second needs the first as a texture, and a nested march would be O(steps squared).
+    // Tested before the neighbourhood branch, which claims every kind above Texture.
+    if (pass.kind == OpKind::Relight) {
+      const auto slot = static_cast<uint64_t>(pass.relight_slot);
+      const std::array<WGPUBindGroupEntry, 5> shafts = {
+          texture_entry(0, source),
+          buffer_entry(1, view.relight_uniforms.get(), kOpUniformStride * slot,
+                       sizeof(RelightUniform)),
+          texture_entry(2, view.depth_view.get()),
+          // Pass 0 never reads the shaft buffer it is about to write; the placeholder is
+          // what keeps one bind group layout for both passes.
+          texture_entry(3, white_mask_view_.get()), texture_entry(4, pass.mask_view)};
+      bind_groups.push_back(gpu_.create_bind_group(relight_pipeline_.get(), shafts));
+      gpu_.encode_fullscreen_pass(encoder, relight_pipeline_.get(), bind_groups.back().get(),
+                                  view.scratch_view.get());
+
+      const std::array<WGPUBindGroupEntry, 5> composite = {
+          texture_entry(0, source),
+          buffer_entry(1, view.relight_uniforms.get(), kOpUniformStride * (slot + 1),
+                       sizeof(RelightUniform)),
+          texture_entry(2, view.depth_view.get()), texture_entry(3, view.scratch_view.get()),
+          texture_entry(4, pass.mask_view)};
+      bind_groups.push_back(gpu_.create_bind_group(relight_pipeline_.get(), composite));
+      gpu_.encode_fullscreen_pass(encoder, relight_pipeline_.get(), bind_groups.back().get(),
+                                  target);
+      advance();
+      continue;
+    }
+    // manual_denoise: three à trous levels in the wavelet pair, then one blend back through
+    // the mask. Tested before the neighbourhood branch, which would otherwise run it as a
+    // single level. The levels never touch the main pair, so `source` — the op's input — is
+    // still there for the blend, which is what a partly covered mask needs.
+    if (pass.kind == OpKind::ManualDenoise) {
+      WGPUTextureView level_source = source;
+      for (int level = 0; level < kWaveletLevels; ++level) {
+        const auto slot = static_cast<uint64_t>(pass.wavelet_slot + level);
+        const WGPUBindGroupEntry level_uniform = buffer_entry(
+            1, view.wavelet_uniforms.get(), kOpUniformStride * slot, sizeof(OpUniform));
+        const std::array<WGPUBindGroupEntry, 2> blur_entries = {texture_entry(0, level_source),
+                                                                level_uniform};
+        bind_groups.push_back(gpu_.create_bind_group(blur_pipeline_.get(), blur_entries));
+        gpu_.encode_fullscreen_pass(encoder, blur_pipeline_.get(), bind_groups.back().get(),
+                                    view.scratch_view.get());
+
+        WGPUTextureView level_target = view.wavelet_view[level % 2].get();
+        const std::array<WGPUBindGroupEntry, 4> combine = {
+            texture_entry(0, level_source), texture_entry(1, view.scratch_view.get()),
+            buffer_entry(2, view.wavelet_uniforms.get(), kOpUniformStride * slot,
+                         sizeof(OpUniform)),
+            texture_entry(3, white_mask_view_.get())};
+        bind_groups.push_back(gpu_.create_bind_group(neighborhood_pipeline_.get(), combine));
+        gpu_.encode_fullscreen_pass(encoder, neighborhood_pipeline_.get(),
+                                    bind_groups.back().get(), level_target);
+        level_source = level_target;
+      }
+      const std::array<WGPUBindGroupEntry, 4> entries = {texture_entry(0, source), uniform,
+                                                         texture_entry(2, level_source),
+                                                         texture_entry(3, pass.mask_view)};
+      bind_groups.push_back(gpu_.create_bind_group(blend_pipeline_.get(), entries));
+      gpu_.encode_fullscreen_pass(encoder, blend_pipeline_.get(), bind_groups.back().get(), target);
+      advance();
       continue;
     }
     if (pass.kind >= OpKind::Texture) {
@@ -1254,11 +1714,9 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
           buffer_entry(2, view.op_uniforms.get(), kOpUniformStride * i, sizeof(OpUniform)),
           texture_entry(3, pass.mask_view)};
       bind_groups.push_back(gpu_.create_bind_group(neighborhood_pipeline_.get(), entries));
-      WGPUTextureView target = view.ping_view[target_index % 2].get();
       gpu_.encode_fullscreen_pass(encoder, neighborhood_pipeline_.get(), bind_groups.back().get(),
                                   target);
-      source = target;
-      ++target_index;
+      advance();
       continue;
     }
     const std::array<WGPUBindGroupEntry, 4> entries = {
@@ -1267,10 +1725,8 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
                      kCurveSlotStride * static_cast<uint64_t>(pass.curve_slot), kCurveSlotStride),
         texture_entry(3, pass.mask_view)};
     bind_groups.push_back(gpu_.create_bind_group(ops_pipeline_.get(), entries));
-    WGPUTextureView target = view.ping_view[target_index % 2].get();
     gpu_.encode_fullscreen_pass(encoder, ops_pipeline_.get(), bind_groups.back().get(), target);
-    source = target;
-    ++target_index;
+    advance();
   }
   gpu_.submit(encoder);
   gpu_.wait_idle();
@@ -1318,8 +1774,30 @@ bool Renderer::has_mask_raster(int64_t photo_id, std::string_view component_id,
   return stored != found->second->rasters.end() && stored->second.hash == hash;
 }
 
-void Renderer::put_generative_result(int64_t photo_id, std::string_view op_id,
-                                     std::string_view key, const Rgb8Image& image) {
+void Renderer::put_depth_map(int64_t photo_id, std::string_view key, Gray16Image map) {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) return;
+  found->second->depth.key = std::string(key);
+  found->second->depth.image = std::move(map);
+  // Every view holding an upload of the old map has to redo it.
+  for (auto& [view_id, view] : views_) {
+    if (view->photo_id == photo_id) view->depth_key.clear();
+  }
+}
+
+bool Renderer::has_depth_map(int64_t photo_id) const {
+  const auto found = photos_.find(photo_id);
+  return found != photos_.end() && !found->second->depth.image.pixels.empty();
+}
+
+std::string Renderer::depth_map_key(int64_t photo_id) const {
+  const auto found = photos_.find(photo_id);
+  if (found == photos_.end()) return {};
+  return found->second->depth.key;
+}
+
+void Renderer::put_generative_result(int64_t photo_id, std::string_view op_id, std::string_view key,
+                                     const Rgb8Image& image) {
   const auto found = photos_.find(photo_id);
   if (found == photos_.end()) return;
   if (image.width == 0 || image.height == 0) return;
@@ -1358,7 +1836,7 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
                                 std::string_view component_id, std::vector<uint8_t>& out,
                                 size_t offset) {
   View& view = view_for(view_id);
-  WGPUTextureView last = run_passes(view, stack, false);
+  run_passes(view, stack, false);
 
   const Op* op = find_op(stack, op_id);
   if (op == nullptr) throw std::runtime_error("unknown opId '" + std::string(op_id) + "'");
@@ -1368,11 +1846,11 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
   }
   // A disabled or neutral op has no pass, so run_passes never built its mask; the overlay
   // still has to be able to show it.
-  const std::string hash =
-      mask_cache_key(*op->mask, view.map, view.geometry_params, view.geometry);
+  const std::string hash = mask_cache_key(*op->mask, view.map, view.geometry_params, view.geometry,
+                                          view.base_generation);
   const auto found = view.masks.find(op->id);
   if (found == view.masks.end() || found->second.hash != hash) {
-    build_mask(view, *op, *op->mask, hash, last);
+    build_mask(view, *op, *op->mask, hash);
   }
 
   const MaskEntry& entry = view.masks.at(op->id);
@@ -1456,8 +1934,13 @@ Rgb16Image Renderer::render_export(int64_t photo_id, const Stack& stack,
   const bool turned = (geometry_params.quadrant % 2) != 0;
   const double work_width = turned ? photo.height : photo.width;
   const double work_height = turned ? photo.width : photo.height;
-  const double native_width = work_width * (geometry_params.right - geometry_params.left);
-  const double native_height = work_height * (geometry_params.bottom - geometry_params.top);
+  // An `upscale` op with a raster has already made the photo bigger, so "native" is that
+  // many times larger and the export renders there: resampling a 4x raster back down to the
+  // sensor's pixel count would throw away the only thing the run produced (issue #52).
+  const double upscale = stack_upscale_factor(stack);
+  const double native_width = work_width * (geometry_params.right - geometry_params.left) * upscale;
+  const double native_height =
+      work_height * (geometry_params.bottom - geometry_params.top) * upscale;
 
   // build_base letterboxes the content inside the frame, so asking for exactly the
   // content's own aspect is what makes the two the same rectangle — an export has no bars.

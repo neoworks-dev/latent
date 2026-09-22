@@ -12,7 +12,7 @@
   import EyeIcon from "phosphor-svelte/lib/EyeIcon";
   import EyeSlashIcon from "phosphor-svelte/lib/EyeSlashIcon";
   import TrashIcon from "phosphor-svelte/lib/TrashIcon";
-  import { maskSummary, opacityOf, paramSummary } from "./layers";
+  import { groupSummary, isGroup, maskSummary, opacityOf, paramSummary, rowTitle } from "./layers";
 
   const {
     op,
@@ -43,7 +43,10 @@
   const panels = ctx.panels;
 
   const definition = $derived(panels.ops.find((entry) => entry.name === op.op));
-  const summary = $derived(paramSummary(op, definition));
+  const layer = $derived(isGroup(op));
+  const title = $derived(rowTitle(op, definition));
+  // A layer has no parameters of its own: what it does is what is under its mask.
+  const summary = $derived(layer ? groupSummary(op, panels.ops) : paramSummary(op, definition));
   const masks = $derived(maskSummary(op));
   const opacity = $derived(opacityOf(op));
   const thumbnail = $derived(layers.thumbnail(op));
@@ -110,7 +113,7 @@
         onclick={onSelect}
         data-layer-select={op.id}
       >
-        {definition?.label ?? op.op}
+        {title}
       </button>
       <Tooltip text="Visible (Alt: solo)" placement="left">
         <span data-layer-eye={op.id}>
@@ -146,5 +149,36 @@
         onCommit={(next) => void viewer.setOpacity(op.id, next, false)}
       />
     </div>
+    <!-- The adjustments under this layer's mask. They are not rows of their own: the stack
+         order that matters is the layers', and an adjustment belongs to its mask. -->
+    {#if layer && (op.ops ?? []).length > 0}
+      <ul class="mt-1 flex flex-col gap-0.5" data-layer-children={op.id}>
+        {#each op.ops ?? [] as child (child.id)}
+          <li class="flex items-center gap-1 pl-1 text-[10px]" data-layer-child={child.id}>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={child.enabled ? EyeIcon : EyeSlashIcon}
+              onclick={() => void viewer.setEnabled(child.id, !child.enabled)}
+            />
+            <button
+              type="button"
+              class="min-w-0 flex-1 truncate rounded-sm py-0.5 text-left text-muted
+                     transition-colors hover:text-default"
+              data-layer-child-select={child.id}
+              onclick={() => viewer.selectOp(child.id)}
+            >
+              {panels.ops.find((entry) => entry.name === child.op)?.label ?? child.op}
+            </button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={TrashIcon}
+              onclick={() => void viewer.removeOp(child.id)}
+            />
+          </li>
+        {/each}
+      </ul>
+    {/if}
   </div>
 </li>

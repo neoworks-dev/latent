@@ -12,6 +12,7 @@ import {
   progressLabel,
   showsHdrOptions,
   showsPanoramaOptions,
+  showsStarTrailOptions,
   trackJob,
   type MergeOptions,
 } from "../src/merge";
@@ -23,6 +24,11 @@ const options: MergeOptions = {
   projection: "cylindrical",
   boundaryWarp: 40,
   autoCrop: false,
+  blend: "average",
+  gapFill: 3,
+  foreground: "firstFrame",
+  foregroundThreshold: 8,
+  decay: 60,
 };
 
 function progress(overrides: Partial<JobProgressParams>): JobProgressParams {
@@ -250,5 +256,51 @@ describe("preview debounce and one in flight", () => {
     requester.request("a");
     await sleep(60);
     expect(control.sent).toEqual(["a"]);
+  });
+});
+
+describe("star trails", () => {
+  test("the night sequence options are their own half of the dialog", () => {
+    expect([
+      showsHdrOptions("starTrail"),
+      showsPanoramaOptions("starTrail"),
+      showsStarTrailOptions("starTrail"),
+    ]).toEqual([false, false, true]);
+    expect(showsStarTrailOptions("hdr")).toBe(false);
+  });
+
+  test("a star trail merge sends the stacking options and nothing else", () => {
+    expect(mergeMethod("starTrail")).toBe("merge.starTrail");
+    expect(mergeParams("starTrail", [4, 5, 6], options)).toEqual({
+      photoIds: [4, 5, 6],
+      blend: "average",
+      gapFill: 3,
+      foreground: "firstFrame",
+      foregroundThreshold: 8,
+      decay: 60,
+    });
+  });
+
+  test("a sequence is allowed to be long, and one frame is not a sequence", () => {
+    expect(countProblem("starTrail", 240)).toBe("");
+    expect(countProblem("starTrail", 1)).toContain("at least 2");
+    expect(countProblem("starTrail", 501)).toContain("at most 500");
+  });
+
+  test("the preview asks for the same stack at preview size", () => {
+    const params = previewParams("starTrail", [4, 5], options);
+    expect(params.kind).toBe("starTrail");
+    expect(params.decay).toBe(60);
+    expect(params.longEdge).toBe(1024);
+    // Switching to a kind that ignores the trail options and back is the same preview.
+    expect(previewSignature("starTrail", [4, 5], options)).toBe(
+      previewSignature("starTrail", [4, 5], { ...options }),
+    );
+  });
+
+  test("the defaults are a plain lighten stack", () => {
+    expect(defaultMergeOptions.blend).toBe("lighten");
+    expect(defaultMergeOptions.gapFill).toBe(0);
+    expect(defaultMergeOptions.decay).toBe(0);
   });
 });

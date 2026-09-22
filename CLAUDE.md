@@ -1,7 +1,8 @@
 # Latent — agent rules
 
-Read `PROMPT.md` first. It holds why + architecture. `NEXT.md` is the ordered backlog;
-strike a line there when its work commits. This file: how to work here.
+Read `PROMPT.md` first. It holds why + architecture. The backlog is the GitHub tracker on
+`neoworks-dev/latent` — `gh issue list`, ordered by the `priority:` labels. This file: how to
+work here.
 
 ## Voice
 
@@ -76,6 +77,19 @@ mirror Lightroom 1:1.
   `GenerativeBackend`. ComfyUI only via `comfy` CLI (`~/.local/bin/comfy`, skill at
   `~/.claude/skills/comfy`). Graphs in `engine/workflows/`: fragments + blueprint, `comfy
   workflow compose`; compiled JSON is a template, substitute by node id at runtime.
+- Relight (`PROMPT.md` §3.8) needs the photo's depth map: `depth.estimate` → Depth Anything
+  V2 Small → `<photo>.latent.d/depth.png`, **16-bit** (0 far / 65535 near), image space like
+  a mask raster but uploaded at its own size as `r16uint` and filtered in the shader — 8 bits
+  terraces a sky and the shadow march draws a contour on every terrace, and a nearest-
+  neighbour resample blocks it. An 8-bit map from an older build reads as absent.
+  Not edit state — no undo step, no staleness — and a `relight` op renders nothing until it
+  exists, like a generative op without its raster. `LATENT_DEPTH_STUB=1` swaps the model.
+  Two passes in `relight.wgsl`: the shafts march writes (shaft shape, visibility, front) and
+  the shading pass reads it. The march answers a 0..1 shape only; brightness is the light's
+  falloff applied once in the shading pass, windowed to zero past the reach ring — summing it
+  along the ray instead lifts every pixel and reads as haze. The `depth` mask kind stores the
+  map itself as its raster and bands it in the shader, so its range is a slider and not
+  another model run.
 - SAM 2 has no text input. Text select = Florence-2 box → SAM 2. ORT with CUDA EP.
   Florence-2 never abstains → only the `text` kind uses it; `subject`/`background` =
   BiRefNet-lite, `sky`/`people` = SegFormer-B2 ADE20K (classes 2/12). Models prepared by
@@ -160,11 +174,33 @@ Visual work: launch app (`bun run dev` spawns `latentd` + Electron), drive via
 Playwright-electron or CDP, capture PNG, show it. Engine-only: dump frame to PNG, show it.
 Preview beats description.
 
+## Issues, branches, PRs
+
+Backlog lives in GitHub (`neoworks-dev/latent`), not in a file. `gh issue list`,
+`gh issue view <n>`.
+
+Anything bigger than one simple change runs this loop:
+
+1. **Issue first.** `gh issue create` before writing code — symptom, files, what done looks
+   like, same shape as the existing bodies. Label it: one `type:`, one or more `area:`, one
+   `priority:`, `status:` only if it is blocked or unreproduced.
+2. **Branch off `main`**, named `<issue>-<slug>` (`31-job-queue`). Never work on `main`.
+3. **PR to `main`** when the work is verified — every check in _Verification_ green, and a
+   screenshot for visual work. Body ends with `Closes #<issue>`, so the merge closes it.
+4. Merge only after the checks pass. Never merge unverified into `main`.
+
+One simple change — typo, one-file fix, a comment — skips the issue and goes on a branch as
+asked. Splitting a large ask into several issues is fine and usually right; say which ones.
+
+Labels: `type:` bug / feature / polish / perf / decision / infra / docs. `area:` engine, ui,
+protocol, pipeline, masks, generative, merge, catalog, export, ai-models, color, geometry,
+python-mcp, viewer. `priority:` p0 (blocking real use) → p3. `status:` needs-repro, blocked.
+
 ## Git
 
 `git status --short` before edits. Dirty files = user-owned; don't stash/reset/commit them.
 Commit only when asked. Imperative subject, body only if diff doesn't explain. Identity: global
-config (`moritz.utcke@gmx.de`). Never force-push. Never merge unverified into `main`.
+config (`moritz.utcke@gmx.de`). Never force-push.
 
 ## Gotchas
 
@@ -186,6 +222,14 @@ config (`moritz.utcke@gmx.de`). Never force-push. Never merge unverified into `m
 - nlohmann reads `{{"a", x}, {"b", y}}` in a nested initialiser as an **array**; an op whose
   `mask` is an array silently renders unmasked. Parse a string literal in tests.
 - `structuredClone` refuses a Svelte `$state` proxy; copy a mask out of the stack via JSON.
+- `apps/desktop/scripts/screenshot.ts` spawns Electron itself and drives it over CDP with
+  `--remote-allow-origins=*`. Playwright's `_electron.launch` hangs forever on this Electron:
+  it attaches to the inspector and then waits on a DevTools websocket upgrade Chromium
+  refuses for an Origin it was not told to allow, and the failure is a bare timeout.
+- A driven run gives the engine a scratch `XDG_DATA_HOME`, which is also where the model
+  store resolves from — so `LATENT_MODEL_STORE` is pinned to the real one. Without that pin
+  every AI feature answers "model … not installed (run scripts/models/fetch.py)" in a flow
+  while the same build finds the models the moment the app is launched by hand.
 - Parallel agents share `engine/build/dev`: every engine build, ctest and real-engine run
   goes through `flock /tmp/latent-engine.lock`, and each agent works on its own copy of the
   sample raw (the sidecar next to it is clobbered otherwise).

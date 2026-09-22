@@ -13,8 +13,8 @@ using namespace latent;
 
 TEST_CASE("every registered op has a panel, a label and params") {
   // protocol/messages.schema.json#/definitions/OpDefinition.panel.
-  const std::set<std::string> panels = {"light",  "color",    "effects",   "detail",
-                                        "optics", "geometry", "generative"};
+  const std::set<std::string> panels = {"light",    "color",      "effects", "detail", "optics",
+                                        "geometry", "generative", "enhance", "relight"};
   const nlohmann::json described = describe_ops();
   REQUIRE(described.contains("ops"));
   REQUIRE(described["ops"].size() == op_definitions().size());
@@ -28,9 +28,11 @@ TEST_CASE("every registered op has a panel, a label and params") {
 }
 
 TEST_CASE("ops.describe lists Lightroom's sections in Lightroom's order") {
-  // Generative sits next to Effects: it is Latent's own section, not one of Lightroom's.
-  const std::vector<std::string> expected = {"Light",  "Color",  "Effects", "Generative",
-                                             "Detail", "Optics", "Geometry"};
+  // Generative and Relight sit next to Effects: both are Latent's own sections, neither is
+  // one of Lightroom's.
+  const std::vector<std::string> expected = {"Light",      "Color",   "Effects",
+                                             "Generative", "Enhance", "Relight",
+                                             "Detail",     "Optics",  "Geometry"};
   const nlohmann::json described = describe_ops();
   std::vector<std::string> seen;
   int order_in_section = 0;

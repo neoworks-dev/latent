@@ -9,6 +9,9 @@ three people and twenty-four shoes. These two models cover those kinds directly.
                        background = 1 - alpha. Matches Lightroom "Select Subject".
   segformer-b2-ade20k  NVIDIA source-code licence, 27 M params. 150-class ADE20K
                        semantic map; class 2 = sky, class 12 = person.
+
+The third export here is not a mask model at all: `depth-anything-v2-small` feeds
+the `relight` op and the `depth` mask kind with a relative depth map.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from common import MODEL_STORE, write_json
 BIREFNET_REPO = "ZhengPeng7/BiRefNet_lite"
 BIREFNET_ONNX_REPO = "onnx-community/BiRefNet_lite"
 SEGFORMER_REPO = "nvidia/segformer-b2-finetuned-ade-512-512"
+DEPTH_REPO = "depth-anything/Depth-Anything-V2-Small-hf"
+DEPTH_ONNX_REPO = "onnx-community/depth-anything-v2-small"
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -124,14 +129,58 @@ def export_segformer(out_dir: Path, image_size: int = 512) -> None:
     )
 
 
+def export_depth_anything(out_dir: Path, image_size: int = 518) -> None:
+    """Copy the upstream fp16 ONNX in: relative inverse depth for the relight op.
+
+    Depth Anything V2 Small is a DPT head on a DINOv2-S backbone, Apache-2.0,
+    25 M params. The fp16 graph is 49.6 MB against 99 MB for fp32 and answers the
+    same depth to three decimals after the per-image normalisation the engine
+    applies anyway. Its spatial dimensions are dynamic in multiples of 14; the
+    engine feeds a fixed 518x518 and resizes the answer back, which is what the
+    upstream DPTImageProcessor does with `keep_aspect_ratio` off.
+    """
+    import shutil
+
+    from huggingface_hub import hf_hub_download
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print("  fetching depth-anything-v2-small/model.onnx (fp16 weights) ...", flush=True)
+    source = hf_hub_download(DEPTH_ONNX_REPO, "onnx/model_fp16.onnx")
+    shutil.copyfile(source, out_dir / "model.onnx")
+    write_json(
+        out_dir / "config.json",
+        {
+            "model_name": "depth-anything-v2-small",
+            "checkpoint_id": DEPTH_REPO,
+            "onnx_source": f"{DEPTH_ONNX_REPO}/onnx/model_fp16.onnx",
+            "kind": "relative-inverse-depth",
+            "license": "Apache-2.0",
+            "model_path": "model.onnx",
+            "input_name": "pixel_values",
+            "output_name": "predicted_depth",
+            "image_size": image_size,
+            "image_mean": IMAGENET_MEAN,
+            "image_std": IMAGENET_STD,
+            "output": (
+                "float32 [1,518,518] relative inverse depth (big = near); bilinear-resize, "
+                "then normalise per image against its 1st/99th percentile"
+            ),
+            "weights_dtype": "float16",
+            "conversion_date": datetime.datetime.now(datetime.UTC).isoformat(),
+        },
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--only", choices=["birefnet", "segformer"], default=None)
+    parser.add_argument("--only", choices=["birefnet", "segformer", "depth"], default=None)
     arguments = parser.parse_args()
     if arguments.only in (None, "birefnet"):
         export_birefnet(MODEL_STORE / "birefnet-lite")
     if arguments.only in (None, "segformer"):
         export_segformer(MODEL_STORE / "segformer-b2-ade20k")
+    if arguments.only in (None, "depth"):
+        export_depth_anything(MODEL_STORE / "depth-anything-v2-small")
     print("done")
     return 0
 

@@ -59,7 +59,9 @@
 
   function chooseMask(): void {
     if (op) viewer.selectOp(op.id);
-    panes.setMode("masks");
+    // The Masks panel is the rail's flyout now: it opens beside this column rather than
+    // replacing it, which is what lets a region be drawn while this pane stays up.
+    panes.setRailPane("masks");
   }
 </script>
 

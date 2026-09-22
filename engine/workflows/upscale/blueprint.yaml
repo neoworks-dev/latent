@@ -1,0 +1,8 @@
+output_prefix: outputs/latent-upscale
+pipeline:
+  - fragment: upscale-esrgan
+    alias: upscale
+    inputs:
+      imageupscalewithmodel_image: inputs/crop.png
+    params:
+      upscalemodelloader_model_name: 4x-UltraSharp.pth

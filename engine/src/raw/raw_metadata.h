@@ -26,6 +26,11 @@ struct RawMetadata {
 // True for raf/nef/arw/cr2/cr3/dng/orf/rw2/pef, case-insensitive.
 bool is_raw_extension(const std::string& path);
 
+// An exposure time as a photographer reads it: "1/250" under a second, "2.5" at or above
+// one, empty for a non-positive value. Shared with image/import_image.h, which formats the
+// same EXIF field out of exiv2 rather than LibRaw.
+std::string format_shutter(double seconds);
+
 // Throws std::runtime_error with LibRaw's message when the file will not open.
 RawMetadata read_raw_metadata(const std::string& path);
 

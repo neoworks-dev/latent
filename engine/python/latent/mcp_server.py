@@ -225,10 +225,42 @@ def merge_panorama(
 
 
 @server.tool()
+def merge_star_trail(
+    photo_ids: list[int],
+    blend: str = "lighten",
+    gap_fill: int = 0,
+    foreground: str = "lighten",
+    foreground_threshold: float = 2,
+    decay: float = 0,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Stack 2 to 500 night frames, in shooting order, into one star trail photo.
+
+    Returns `{jobId}`; `result.photoId` arrives on the job's last job.progress. `blend` is
+    lighten (the brightest frame per pixel, which is what draws the trails) or average (one
+    long exposure with less noise and no trails). There is no alignment: the sequence is
+    assumed to be on a tripod, because registering it would straighten the trails.
+
+    `gap_fill` (0-8) bridges the camera's write time between frames, `foreground`
+    ("lighten" / "firstFrame") decides whether the ground collects every frame's noise, and
+    `decay` (0-100) fades the older end of each trail into a comet tail.
+    """
+    return latent.merge.star_trail(
+        photo_ids,
+        blend=blend,
+        gap_fill=gap_fill,
+        foreground=foreground,
+        foreground_threshold=foreground_threshold,
+        decay=decay,
+        output_path=output_path,
+    )
+
+
+@server.tool()
 def merge_preview(kind: str, photo_ids: list[int], long_edge: int = 1024) -> dict[str, Any]:
     """The same merge from the embedded JPEGs: seconds, a PNG, and no catalog row.
 
-    `kind` is hdr / panorama / hdrPanorama. The job's last job.progress carries
+    `kind` is hdr / panorama / hdrPanorama / starTrail. The job's last job.progress carries
     `result.previewPath`; read it with render_preview's sibling on disk, or just look at
     `result.width`/`height` to know whether the frames stitched at all.
     """

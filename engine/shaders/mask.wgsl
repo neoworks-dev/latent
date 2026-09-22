@@ -14,9 +14,10 @@
 //
 //   1 linear     v0 = start.xy, end.xy
 //   2 radial     v0 = centre.xy, radius.xy; v1.x = angle in radians
-//   3 luminance  v0 = lo, hi, smoothness     (over the op's input, display-referred)
+//   3 luminance  v0 = lo, hi, smoothness     (over the view's base: the photo before any op)
 //   4 color      v0 = sample count, range, smoothness; v1..v5 = samples in Oklab
 //   5 raster     the `raster` binding: a brush stroke list or an AI model's output
+//   6 depth      v0 = near, far, smoothness  (over the `raster` binding's depth map)
 //
 // `feather` softens the edge; `invert` flips; `opacity` scales. Everything else — the
 // add/subtract/intersect fold — is mask_combine.wgsl.
@@ -161,7 +162,8 @@ fn blurred_raster(uv: vec2f) -> f32 {
       let reach = length(turned / radius);
       value = 1.0 - smoothstep(1.0 - feather, 1.0, reach);
     }
-    // luminance: a band of the op's input, smoothness and feather both softening its ends.
+    // luminance: a band of the base (the photo before any op), smoothness and feather both
+    // softening its ends.
     case 3u: {
       let level = tone_position(textureLoad(src, vec2i(in.pos.xy), 0).rgb);
       let edge = max(mask.v[0].z, mask.feather) * 0.5 + 0.004;
@@ -185,6 +187,17 @@ fn blurred_raster(uv: vec2f) -> f32 {
     // raster: a brush stroke list or a model's output, both stored in image space.
     case 5u: {
       value = blurred_raster(uv);
+    }
+    // depth: a band of the depth map, 0 far and 1 near (engine/src/ai/depth.h). The same
+    // band arithmetic as luminance, over the raster instead of over the pixels, so the
+    // range is a live slider and never another model run.
+    case 6u: {
+      // Not the blurred read: `feather` widens the band below, and softening the map as
+      // well would feather the same edge twice.
+      let nearness = sample_raster(uv);
+      let edge = max(mask.v[0].z, mask.feather) * 0.5 + 0.004;
+      value = smoothstep(mask.v[0].x - edge, mask.v[0].x + edge, nearness) *
+              (1.0 - smoothstep(mask.v[0].y - edge, mask.v[0].y + edge, nearness));
     }
     default: {}
   }

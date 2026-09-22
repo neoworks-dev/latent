@@ -174,6 +174,8 @@ export class MockCatalog {
   private readonly byId = new Map<number, CatalogPhoto>();
   private readonly idByPath = new Map<string, number>();
   private readonly collectionsById = new Map<number, Collection>();
+  /** Absolute directory -> whether the watch covers what is under it. */
+  private readonly watchedRoots = new Map<string, boolean>();
   private nextPhotoId = 1;
   private nextCollectionId = 1;
   private thumbnailSeq = 0;
@@ -211,6 +213,23 @@ export class MockCatalog {
     return { photos: sorted.slice(offset, offset + limit), total: matched.length };
   }
 
+  /**
+   * Importing a directory also asks the engine to keep watching it (catalog/watcher.h).
+   * Anything that is not a directory is ignored: picking three files out of a folder is
+   * not asking to be told about the rest of it.
+   */
+  watchFolder(path: string, recursive: boolean): void {
+    let stats;
+    try {
+      stats = statSync(path);
+    } catch {
+      return;
+    }
+    if (!stats.isDirectory()) return;
+    const absolute = resolve(path);
+    this.watchedRoots.set(absolute, recursive || this.watchedRoots.get(absolute) === true);
+  }
+
   folders(): CatalogFoldersResult {
     const counts = new Map<string, number>();
     for (const photo of this.byId.values()) {
@@ -218,9 +237,17 @@ export class MockCatalog {
     }
     return {
       folders: [...counts.entries()]
-        .map(([path, count]) => ({ path, count }))
+        .map(([path, count]) => ({ path, count, watched: this.isWatched(path) }))
         .sort((a, b) => a.path.localeCompare(b.path)),
     };
+  }
+
+  private isWatched(folder: string): boolean {
+    for (const [root, recursive] of this.watchedRoots) {
+      if (folder === root) return true;
+      if (recursive && folder.startsWith(`${root}/`)) return true;
+    }
+    return false;
   }
 
   setRating(photoId: number, rating: number): CatalogPhoto {

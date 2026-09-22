@@ -164,6 +164,21 @@ std::vector<float> preprocess_square(const Rgb8Image& image, uint32_t size,
   return out;
 }
 
+Gray16Image plane_to_gray16(std::span<const float> plane, uint32_t width, uint32_t height) {
+  if (plane.size() != static_cast<size_t>(width) * height) {
+    throw std::runtime_error("plane_to_gray16: plane does not match its declared size");
+  }
+  Gray16Image image;
+  image.width = width;
+  image.height = height;
+  image.pixels.resize(plane.size());
+  for (size_t i = 0; i < plane.size(); ++i) {
+    const float clamped = std::clamp(plane[i], 0.0F, 1.0F);
+    image.pixels[i] = static_cast<uint16_t>(std::lround(clamped * 65535.0F));
+  }
+  return image;
+}
+
 GrayImage plane_to_gray(std::span<const float> plane, uint32_t width, uint32_t height) {
   if (plane.size() != static_cast<size_t>(width) * height) {
     throw std::runtime_error("plane_to_gray: plane does not match its declared size");

@@ -38,6 +38,13 @@ struct ComfyEnvelope {
   std::string failure() const;
 };
 
+// What to add to a failure the CLI reported without a hint of its own. A ComfyUI that is
+// not running is the common one, and every subcommand reports it in its own words — `comfy
+// upload` says "connection refused" against the file it was sending, which reads like a
+// broken file rather than a server that was never started. Empty when there is nothing to
+// add. Applied to every envelope, so it is `hint` by the time the UI sees it.
+std::string comfy_hint_for(const std::string& code, const std::string& message);
+
 // Called once per NDJSON line. Returning false asks the run to stop: the child is sent
 // SIGINT, which comfy turns into a `cancelled` envelope and exit 130.
 using ComfyEvent = std::function<bool(const nlohmann::json& event)>;

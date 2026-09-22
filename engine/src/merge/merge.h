@@ -9,6 +9,7 @@
 #include "merge/hdr.h"
 #include "merge/merge_image.h"
 #include "merge/pano.h"
+#include "merge/startrail.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -18,14 +19,17 @@
 
 namespace latent {
 
-enum class MergeKind { Hdr, Panorama, HdrPanorama };
+enum class MergeKind { Hdr, Panorama, HdrPanorama, StarTrail };
 
 MergeKind merge_kind_from_name(const std::string& name);
-// "hdr" | "panorama" | "hdrPanorama" — the protocol's spelling, and what the merged
-// file's sidecar records.
+// "hdr" | "panorama" | "hdrPanorama" | "starTrail" — the protocol's spelling, and what the
+// merged file's sidecar records.
 const char* merge_kind_name(MergeKind kind);
-// Lightroom's output suffix: HDR, Pano, HDRPano.
+// Lightroom's output suffix: HDR, Pano, HDRPano. Star trails is ours: Trails.
 const char* merge_suffix(MergeKind kind);
+// True for the one merge that folds its frames in one at a time (startrail.h): its caller
+// decodes into the stack instead of collecting the sequence first.
+bool merge_is_streaming(MergeKind kind);
 
 struct MergeFrame {
   LinearImage image;
@@ -44,6 +48,7 @@ struct MergeRequest {
   std::vector<std::string> paths;
   HdrOptions hdr;
   PanoOptions pano;
+  StarTrailOptions star_trail;
   // merge.preview: decode the embedded JPEGs instead of the raws, write a PNG, and put
   // nothing in the catalog.
   bool preview = false;

@@ -1,4 +1,5 @@
-"""Photo Merge: ``latent.merge.hdr(...)``, ``.panorama(...)``, ``.hdr_panorama(...)``.
+"""Photo Merge: ``latent.merge.hdr(...)``, ``.panorama(...)``, ``.hdr_panorama(...)``,
+``.star_trail(...)``.
 
 Thin keyword wrappers over the engine's ``_start_merge``. Each one queues a job and returns
 ``{"jobId": ...}`` at once — the merged photo's id arrives on that job's last
@@ -10,6 +11,7 @@ and so do the defaults: Auto Align on, Deghost off, Auto Crop on, Boundary Warp 
 
     latent.merge.hdr([12, 13, 14], deghost="medium")
     latent.merge.panorama([20, 21, 22], projection="cylindrical", boundary_warp=40)
+    latent.merge.star_trail(night_sequence, gap_fill=2, foreground="firstFrame")
     latent.merge.preview("hdr", [12, 13, 14])     # a PNG to look at first
 """
 
@@ -19,9 +21,9 @@ from typing import Any, Iterable
 
 import latent
 
-__all__ = ["hdr", "panorama", "hdr_panorama", "preview"]
+__all__ = ["hdr", "panorama", "hdr_panorama", "star_trail", "preview"]
 
-_KINDS = ("hdr", "panorama", "hdrPanorama")
+_KINDS = ("hdr", "panorama", "hdrPanorama", "starTrail")
 
 
 def _photo_ids(photos: Iterable[Any]) -> list[int]:
@@ -112,6 +114,40 @@ def hdr_panorama(
             projection=projection,
             boundaryWarp=boundary_warp,
             autoCrop=auto_crop,
+            outputPath=output_path,
+        )
+    )
+
+
+def star_trail(
+    photos: Iterable[Any],
+    blend: str = "lighten",
+    gap_fill: int = 0,
+    foreground: str = "lighten",
+    foreground_threshold: float = 2,
+    decay: float = 0,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    """Stack 2 to 500 frames of a night sequence, in shooting order, into one 16-bit TIFF.
+
+    `blend` is lighten (the brightest frame per pixel — the trails) or average (their mean,
+    which is one long exposure and no trails). `gap_fill` inserts that many sub-frames
+    between each pair to bridge the camera's write time; `foreground="firstFrame"` keeps the
+    ground from frame one so the stack does not collect every frame's hot pixels; `decay`
+    fades the older end of each trail into a comet tail.
+
+    The frames are decoded into the stack one at a time, so the sequence never has to fit in
+    memory — but they are decoded, so 300 raws is 300 decodes.
+    """
+    return latent._start_merge(
+        _request(
+            "starTrail",
+            photos,
+            blend=blend,
+            gapFill=gap_fill,
+            foreground=foreground,
+            foregroundThreshold=foreground_threshold,
+            decay=decay,
             outputPath=output_path,
         )
     )

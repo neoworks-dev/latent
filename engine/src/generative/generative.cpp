@@ -30,14 +30,13 @@ std::string hash_of(const nlohmann::json& value) {
 
 }  // namespace
 
-bool is_generative_op(std::string_view name) {
-  return name == "generative_fill" || name == "remove";
-}
-
 Stack generative_input_stack(const Stack& stack, std::string_view op_id) {
   size_t index = stack.size();
+  PipelineStage own = PipelineStage::Generative;
   for (size_t i = 0; i < stack.size(); ++i) {
-    if (stack[i].id == op_id) index = i;
+    if (stack[i].id != op_id) continue;
+    index = i;
+    own = stage_of(stack[i]);
   }
 
   Stack input;
@@ -49,9 +48,10 @@ Stack generative_input_stack(const Stack& stack, std::string_view op_id) {
       input.push_back(op);
       continue;
     }
-    if (stage > PipelineStage::Generative) continue;
-    // Two generative ops share one stage, so only the stack decides which is underneath.
-    if (stage == PipelineStage::Generative && i > index) continue;
+    if (stage > own) continue;
+    // Two ops can share one stage — the two generative ops do — and then only the stack
+    // decides which of them is underneath.
+    if (stage == own && i > index) continue;
     input.push_back(op);
   }
   return input;
@@ -84,6 +84,28 @@ void annotate_generative_stale(nlohmann::json& stack_json, const Stack& stack) {
 
 std::string generative_result_relative_path(std::string_view op_id) {
   return "generative/" + std::string(op_id) + ".png";
+}
+
+std::string generative_task(std::string_view op_name) {
+  if (op_name == "generative_fill") return "fill";
+  if (op_name == "remove") return "remove";
+  if (op_name == "denoise") return "denoise";
+  if (op_name == "upscale") return "upscale";
+  return {};
+}
+
+double upscale_factor(const Op& op) {
+  const std::string factor = op.params.value("factor", std::string("2x"));
+  return factor == "4x" ? 4.0 : 2.0;
+}
+
+double stack_upscale_factor(const Stack& stack) {
+  double factor = 1.0;
+  for (const Op& op : stack) {
+    if (op.name != "upscale" || !op.enabled || op.result.empty()) continue;
+    factor *= upscale_factor(op);
+  }
+  return factor;
 }
 
 std::optional<GenerativeRect> rect_from_json(const std::vector<double>& value) {

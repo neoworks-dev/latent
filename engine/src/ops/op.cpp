@@ -26,6 +26,9 @@ std::string make_op_id() {
 nlohmann::json op_to_json(const Op& op) {
   nlohmann::json value = {
       {"id", op.id}, {"op", op.name}, {"params", op.params}, {"enabled", op.enabled}};
+  // A group always carries its list, empty included: a mask with nothing under it yet is a
+  // layer the user is still building, not a group that lost its children.
+  if (op.is_group()) value["ops"] = stack_to_json(op.ops);
   if (op.mask.has_value()) value["mask"] = *op.mask;
   // Absent means 100 (protocol Op.opacity), so a stack nobody has touched stays terse.
   if (op.opacity != kFullOpacity) value["opacity"] = op.opacity;
@@ -74,6 +77,17 @@ Op op_from_json(const nlohmann::json& value) {
     if (!value["inputHash"].is_string()) throw OpError("op.inputHash must be a string");
     op.input_hash = value["inputHash"].get<std::string>();
   }
+  if (value.contains("ops") && !value["ops"].is_null()) {
+    if (!op.is_group()) throw OpError("only a group op holds nested ops");
+    if (!value["ops"].is_array()) throw OpError("op.ops must be an array");
+    for (const nlohmann::json& child : value["ops"]) {
+      Op nested = op_from_json(child);
+      // One level. A group inside a group would have two masks over the same pixels and no
+      // answer for which one the blend below belongs to.
+      if (nested.is_group()) throw OpError("a group cannot hold another group");
+      op.ops.push_back(std::move(nested));
+    }
+  }
   if (value.contains("resultRect") && !value["resultRect"].is_null()) {
     const nlohmann::json& rect = value["resultRect"];
     if (!rect.is_array() || rect.size() != 4) {
@@ -108,6 +122,7 @@ Stack stack_from_json(const nlohmann::json& value) {
 const Op* find_op(const Stack& stack, std::string_view id) {
   for (const Op& op : stack) {
     if (op.id == id) return &op;
+    if (const Op* child = find_op(op.ops, id); child != nullptr) return child;
   }
   return nullptr;
 }
@@ -115,8 +130,37 @@ const Op* find_op(const Stack& stack, std::string_view id) {
 Op* find_op(Stack& stack, std::string_view id) {
   for (Op& op : stack) {
     if (op.id == id) return &op;
+    if (Op* child = find_op(op.ops, id); child != nullptr) return child;
   }
   return nullptr;
+}
+
+const Op* find_parent_group(const Stack& stack, std::string_view id) {
+  for (const Op& op : stack) {
+    if (find_op(op.ops, id) != nullptr) return &op;
+  }
+  return nullptr;
+}
+
+Op* find_parent_group(Stack& stack, std::string_view id) {
+  for (Op& op : stack) {
+    if (find_op(op.ops, id) != nullptr) return &op;
+  }
+  return nullptr;
+}
+
+void for_each_op(Stack& stack, const std::function<void(Op&)>& visit) {
+  for (Op& op : stack) {
+    visit(op);
+    for_each_op(op.ops, visit);
+  }
+}
+
+void for_each_op(const Stack& stack, const std::function<void(const Op&)>& visit) {
+  for (const Op& op : stack) {
+    visit(op);
+    for_each_op(op.ops, visit);
+  }
 }
 
 }  // namespace latent

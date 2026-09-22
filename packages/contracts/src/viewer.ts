@@ -1,7 +1,7 @@
 // The open photo as the engine reports it. Every field is a mirror of the engine's
 // answer, never a local edit: a control calls `setParam`, the engine replies with the
 // new stack, the mirror updates and a frame is requested. Nothing here is edit state.
-import type { Mask, Op } from "@latent/protocol";
+import type { Histogram, Mask, Op } from "@latent/protocol";
 import type { EngineFrame } from "./engine";
 
 /** When the painter touched a frame, in `performance.now()` terms. */
@@ -11,8 +11,30 @@ export interface FrameDrawMarks {
   drawn: number;
 }
 
-/** Uploads and draws one frame, synchronously, and reports how long each part took. */
-export type FrameSink = (frame: EngineFrame) => FrameDrawMarks;
+/**
+ * Scale and translation in frame pixels, applied to the frame already on the GPU: what a
+ * zoom or a pan looks like before the engine has answered with pixels for it. Uniform,
+ * because both axes of the content rect grow with the viewport's scale.
+ */
+export interface FrameTransform {
+  scale: number;
+  x: number;
+  y: number;
+}
+
+export const IDENTITY_FRAME_TRANSFORM: FrameTransform = { scale: 1, x: 0, y: 0 };
+
+/**
+ * The canvas' painter. `draw` uploads one engine frame and reports how long each part took;
+ * `setTransform` redraws the frame already uploaded under a client-side zoom or pan, which
+ * is how a gesture reaches the screen in the event that caused it rather than a round trip
+ * later. A frame is drawn under whatever transform was last set, so the caller sets it
+ * first — usually back to the identity, because fresh pixels already carry the viewport.
+ */
+export interface FrameSink {
+  draw(frame: EngineFrame): FrameDrawMarks;
+  setTransform(transform: FrameTransform): void;
+}
 
 /**
  * Where the photo actually sits inside the viewer's box, in CSS pixels of the overlay
@@ -124,6 +146,30 @@ export function invertImageTransform(m: ImageTransform): ImageTransform {
 }
 
 /**
+ * A client-side zoom or pan folded into an `imageTransform`: the matrix the engine sent for
+ * the frame on screen, moved to where the painter is currently showing that frame. The
+ * bottom row is left alone — a scale and a translation in frame pixels do not touch the
+ * projective part.
+ */
+export function transformImageMatrix(
+  transform: FrameTransform,
+  matrix: ImageTransform,
+): ImageTransform {
+  const { scale, x, y } = transform;
+  return [
+    scale * matrix[0] + x * matrix[6],
+    scale * matrix[1] + x * matrix[7],
+    scale * matrix[2] + x * matrix[8],
+    scale * matrix[3] + y * matrix[6],
+    scale * matrix[4] + y * matrix[7],
+    scale * matrix[5] + y * matrix[8],
+    matrix[6],
+    matrix[7],
+    matrix[8],
+  ];
+}
+
+/**
  * Zoom and pan, exactly `view.render`'s `viewport`. `scale` 1 is fit-to-view; the centre is
  * the image-normalised point the view is centred on and means nothing while `fit` is set.
  * Not edit state — it never reaches the stack.
@@ -147,6 +193,18 @@ export interface ViewportFrame {
   transform: ImageTransform;
   /** The scale the rect and the matrix were rendered at. */
   scale: number;
+  /**
+   * What the client floats over the frame, in frame pixels — the same insets `view.render`
+   * was given. Zoom and pan are measured against the hole they leave rather than against
+   * the whole frame, exactly as the engine places the rect: a picture bigger than the hole
+   * can be dragged even while it is still smaller than the window.
+   */
+  insets: { left: number; top: number; right: number; bottom: number };
+}
+
+/** The hole the panels leave, as an origin and an extent on one axis. */
+function inner(extent: number, start: number, end: number): { start: number; extent: number } {
+  return { start, extent: Math.max(1, extent - start - end) };
 }
 
 export const MIN_VIEWPORT_SCALE = 1;
@@ -166,6 +224,16 @@ function clampCentre(centre: number, extent: number, view: number): number {
   if (extent <= view) return 0.5;
   const margin = view / (2 * extent);
   return Math.min(1 - margin, Math.max(margin, centre));
+}
+
+/** Where the picture is aimed: the middle of the hole the panels leave, in frame pixels. */
+function aim(frame: ViewportFrame): { x: number; y: number } {
+  const horizontal = inner(frame.frameWidth, frame.insets.left, frame.insets.right);
+  const vertical = inner(frame.frameHeight, frame.insets.top, frame.insets.bottom);
+  return {
+    x: horizontal.start + horizontal.extent / 2,
+    y: vertical.start + vertical.extent / 2,
+  };
 }
 
 /**
@@ -189,16 +257,11 @@ export function zoomViewport(
   const grown = scale / frame.scale;
   const nextWidth = width * grown;
   const nextHeight = height * grown;
-  const centreU = clampCentre(
-    u + (frame.frameWidth / 2 - anchorX) / nextWidth,
-    nextWidth,
-    frame.frameWidth,
-  );
-  const centreV = clampCentre(
-    v + (frame.frameHeight / 2 - anchorY) / nextHeight,
-    nextHeight,
-    frame.frameHeight,
-  );
+  const middle = aim(frame);
+  const horizontal = inner(frame.frameWidth, frame.insets.left, frame.insets.right);
+  const vertical = inner(frame.frameHeight, frame.insets.top, frame.insets.bottom);
+  const centreU = clampCentre(u + (middle.x - anchorX) / nextWidth, nextWidth, horizontal.extent);
+  const centreV = clampCentre(v + (middle.y - anchorY) / nextHeight, nextHeight, vertical.extent);
   // Back to image space through the frame that is on screen: the content → image half of
   // the map does not depend on the zoom, so the current rect and matrix are enough.
   const centre = applyImageTransform(
@@ -223,14 +286,92 @@ export function panViewport(
   if (current.fit) return current;
   const [x, y, width, height] = frame.contentRect;
   if (width <= 0 || height <= 0) return current;
-  const centreU = clampCentre((frame.frameWidth / 2 - x - dx) / width, width, frame.frameWidth);
-  const centreV = clampCentre((frame.frameHeight / 2 - y - dy) / height, height, frame.frameHeight);
+  const middle = aim(frame);
+  const horizontal = inner(frame.frameWidth, frame.insets.left, frame.insets.right);
+  const vertical = inner(frame.frameHeight, frame.insets.top, frame.insets.bottom);
+  const centreU = clampCentre((middle.x - x - dx) / width, width, horizontal.extent);
+  const centreV = clampCentre((middle.y - y - dy) / height, height, vertical.extent);
   const centre = applyImageTransform(
     invertImageTransform(frame.transform),
     x + centreU * width,
     y + centreV * height,
   );
   return { scale: current.scale, centerX: centre.x, centerY: centre.y, fit: false };
+}
+
+/**
+ * Where a rect of `extent` pixels sits on one axis — the mirror of `place()` in
+ * engine/src/ops/geometry.cpp, floor and clamp included, so a predicted rect lands on the
+ * pixel the engine will send rather than next to it.
+ */
+function place(
+  view: number,
+  extent: number,
+  centre: number,
+  fit: boolean,
+  insetStart: number,
+  insetEnd: number,
+): number {
+  const hole = Math.max(1, view - insetStart - insetEnd);
+  if (fit || extent <= hole) return Math.floor(insetStart + (hole - extent) / 2);
+  const wanted = insetStart + hole / 2 - centre * extent;
+  return Math.round(Math.min(insetStart, Math.max(insetStart + hole - extent, wanted)));
+}
+
+/**
+ * Where the photo would sit inside the frame under `viewport`, without asking the engine.
+ * The rect grows linearly with the scale, so the frame on screen is reference enough: the
+ * fit size is its own rect divided by the scale it was rendered at. Exact for the frame's
+ * own viewport, which is what makes it safe to measure a client-side gesture against.
+ */
+export function contentRectFor(frame: ViewportFrame, viewport: ViewportState): ContentRect {
+  const [x, y, width, height] = frame.contentRect;
+  if (width <= 0 || height <= 0 || frame.scale <= 0) return frame.contentRect;
+  const zoom = viewport.fit ? MIN_VIEWPORT_SCALE : clampViewportScale(viewport.scale);
+  const nextWidth = Math.max(1, Math.round((width / frame.scale) * zoom));
+  const nextHeight = Math.max(1, Math.round((height / frame.scale) * zoom));
+  // The viewport's centre is an image coordinate and `place` wants a content-normalised
+  // one. That half of the map does not depend on the zoom, so the frame on screen converts
+  // it however far the viewport has moved since.
+  const centre = applyImageTransform(frame.transform, viewport.centerX, viewport.centerY);
+  const insets = frame.insets;
+  return [
+    place(
+      frame.frameWidth,
+      nextWidth,
+      (centre.x - x) / width,
+      viewport.fit,
+      insets.left,
+      insets.right,
+    ),
+    place(
+      frame.frameHeight,
+      nextHeight,
+      (centre.y - y) / height,
+      viewport.fit,
+      insets.top,
+      insets.bottom,
+    ),
+    nextWidth,
+    nextHeight,
+  ];
+}
+
+/**
+ * What the painter has to do to the frame rendered under `from` to make it look like `to`.
+ * Both rects are predicted from the same reference, so whatever the prediction gets wrong
+ * cancels and the identity comes out whenever the two viewports agree.
+ */
+export function frameTransform(
+  frame: ViewportFrame,
+  from: ViewportState,
+  to: ViewportState,
+): FrameTransform {
+  const [fromX, fromY, fromWidth] = contentRectFor(frame, from);
+  const [toX, toY, toWidth] = contentRectFor(frame, to);
+  if (fromWidth <= 0) return IDENTITY_FRAME_TRANSFORM;
+  const scale = toWidth / fromWidth;
+  return { scale, x: toX - scale * fromX, y: toY - scale * fromY };
 }
 
 /**
@@ -364,6 +505,19 @@ export interface ViewerService {
   readonly canUndo: boolean;
   readonly canRedo: boolean;
   /**
+   * Where the cursor sits in the undo stack, and how deep it is. Not `revision`: that
+   * advances on every write the engine accepts, one per tick of a slider drag, while these
+   * count undo steps — a whole drag is one of them.
+   */
+  readonly historyIndex: number;
+  readonly historyDepth: number;
+  /**
+   * The engine's histogram of the last frame it sent, `null` before the first one. It
+   * comes off `view.render` rather than off the stack: a stack write is answered before
+   * the frame it causes, so the copy on `stack.get` is one render behind the edit.
+   */
+  readonly histogram: Histogram | null;
+  /**
    * Merge `params` into the op with this name, adding it to the stack when absent.
    * `transient` is true while a slider is dragged: no history snapshot, no sidecar.
    */
@@ -373,6 +527,25 @@ export interface ViewerService {
    * local adjustment needs, where the same op appears twice, once masked and once not.
    */
   setOpParams(opId: string, params: Record<string, unknown>, transient: boolean): Promise<void>;
+  /**
+   * A new layer: an empty group, `null` when the engine refused it. A mask lives on a group
+   * and the adjustments that share it are its children (PROMPT.md 3.7), so this is the
+   * first step of every mask the user creates — before any adjustment exists.
+   */
+  addGroup(): Promise<string | null>;
+  /**
+   * `setParam` aimed inside one layer: merges into that group's child with this op name,
+   * adding the child when the layer does not have it yet. The mask and the opacity stay the
+   * group's, so the write never carries either.
+   */
+  setGroupParam(
+    groupId: string,
+    op: string,
+    params: Record<string, unknown>,
+    transient: boolean,
+  ): Promise<void>;
+  /** Drops one entry — a child from its layer, or a layer with everything under it. */
+  removeOp(opId: string): Promise<void>;
   /** Layer opacity of one op, 0–100. `transient` while the readout is being dragged. */
   setOpacity(opId: string, value: number, transient: boolean): Promise<void>;
   /**
@@ -383,15 +556,36 @@ export interface ViewerService {
   setMask(opId: string, mask: Mask | undefined, transient?: boolean): Promise<void>;
   /** Enable or disable one op — the layer eye. */
   setEnabled(opId: string, enabled: boolean): Promise<void>;
-  /** Reorders, duplicates or drops ops: the whole stack, in the order it should be in. */
-  setStack(stack: Op[]): Promise<void>;
+  /**
+   * Reorders, duplicates or drops ops: the whole stack, in the order it should be in.
+   * `label` names the history step for a caller that knows more than the diff can see — a
+   * preset moves a dozen ops at once and "Golden hour applied" is what that step was.
+   */
+  setStack(stack: Op[], label?: string): Promise<void>;
   /** The op the Masks and Layers columns are pointed at; null when nothing is selected. */
   readonly selectedOpId: string | null;
   selectOp(opId: string | null): void;
+  /**
+   * The layer every unaimed write lands in. With one set, `setParam` — every slider of the
+   * Edit column — goes into that group instead of the base stack, which is what selecting a
+   * mask and then moving a slider means. Null edits the photo itself. Set by the Masks
+   * panel while it is open, and cleared when it closes: a write that goes somewhere other
+   * than the photo has to be visible on screen.
+   */
+  readonly maskTarget: string | null;
+  setMaskTarget(opId: string | null): void;
   /** The canvas' transparent overlay, for tools that draw on top of the frame. */
   readonly overlay: ViewerOverlay;
   /** Zoom and pan as the engine last confirmed them. Never edit state. */
   readonly viewport: ViewportState;
+  /**
+   * Counts how often the engine has answered with the photo in a different place: a zoom, a
+   * pan, a resize, a crop. A slider tick leaves it alone. Anything holding a view-space
+   * raster of its own — `mask.preview`'s overlay — is stale when this moves and has to ask
+   * the engine again, and only once this has moved does the engine hold the viewport that
+   * raster has to be rendered at.
+   */
+  readonly frameGeometry: number;
   /** `Fit`, `100%`, `250%`: the status bar's readout of the above. */
   readonly zoom: string;
   /** Zoom about a point of the canvas, in its CSS pixels; no point means its centre. */
@@ -413,6 +607,13 @@ export interface ViewerService {
   redo(): Promise<void>;
   /** Viewport changed: the next frame is rendered at this size, in device pixels. */
   resize(width: number, height: number): void;
+  /**
+   * What the shell floats over the canvas, in CSS pixels. A fitted photo is fitted into
+   * the canvas minus these so no panel covers it; a zoomed one still fills the canvas and
+   * runs on behind them. View state — it rides on `view.render` and never reaches the
+   * stack.
+   */
+  setInsets(insets: { left: number; top: number; right: number; bottom: number }): void;
   /** Coalesced: one render in flight, at most one queued behind it. */
   requestRender(): void;
 }

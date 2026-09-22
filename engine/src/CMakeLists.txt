@@ -1,15 +1,18 @@
-# latent_ops is pure: op registry, stack, history, sidecars. No GPU, no sockets, so the
-# Catch2 tests link it directly and run on a machine without a device.
+# latent_ops is pure: op registry, stack, history, sidecars, and the histogram of a frame
+# somebody else rendered. No GPU, no sockets, so the Catch2 tests link it directly and run
+# on a machine without a device.
 add_library(latent_ops STATIC
   ops/curve.cpp
   ops/geometry.cpp
   ops/history.cpp
+  ops/history_diff.cpp
   ops/mask.cpp
   ops/mask_raster.cpp
   ops/op.cpp
   ops/registry.cpp
   ops/sha256.cpp
-  ops/sidecar.cpp)
+  ops/sidecar.cpp
+  pipeline/histogram.cpp)
 target_include_directories(latent_ops PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(latent_ops PUBLIC nlohmann_json::nlohmann_json)
 
@@ -20,26 +23,33 @@ target_link_libraries(latent_ops PUBLIC nlohmann_json::nlohmann_json)
 add_library(latent_ai STATIC
   ai/bpe_tokenizer.cpp
   ai/dedicated.cpp
+  ai/denoise.cpp
+  ai/depth.cpp
   ai/florence2.cpp
   ai/mask_detect.cpp
   ai/model_store.cpp
   ai/ort_session.cpp
   ai/preprocess.cpp
-  ai/sam2.cpp)
+  ai/sam2.cpp
+  ai/trails.cpp)
 target_include_directories(latent_ai PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(latent_ai PUBLIC latent_ops onnxruntime)
 
-# latent_catalog is the other headless half: SQLite, LibRaw metadata, JPEG. The catalog
-# tests link it without pulling in a GPU device.
+# latent_catalog is the other headless half: SQLite, LibRaw metadata, JPEG, and the PNG/JPEG
+# importer (libexif for EXIF, lcms2 for the ICC profile). The catalog tests link it without
+# pulling in a GPU device.
 add_library(latent_catalog STATIC
   catalog/catalog.cpp
+  catalog/preview.cpp
   catalog/thumbnail.cpp
+  catalog/watcher.cpp
+  image/import_image.cpp
   image/jpeg.cpp
   image/png.cpp
   jobs/worker.cpp
   raw/raw_metadata.cpp)
 target_link_libraries(latent_catalog PUBLIC latent_ops latent_ai unofficial::sqlite3::sqlite3
-  PkgConfig::LIBRAW PNG::PNG
+  PkgConfig::LIBRAW PNG::PNG TIFF::TIFF unofficial::libexif::libexif lcms2::lcms2
   $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>)
 
 # latent_export is the encoders, the output colour transform and the job runner. No GPU:
@@ -70,23 +80,27 @@ add_library(latent_merge STATIC
   merge/merge.cpp
   merge/merge_image.cpp
   merge/pano.cpp
-  merge/source_image.cpp)
+  merge/source_image.cpp
+  merge/startrail.cpp)
 target_include_directories(latent_merge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(latent_merge PUBLIC latent_ops latent_catalog PkgConfig::LIBRAW TIFF::TIFF)
 
-# latent_generative is the ComfyUI half (PROMPT.md 3.5): the op-stack arithmetic behind a
-# cached raster, the graphs Latent ships, the colour PNG codec the crop and the result move
-# as, and the two backends. No GPU and no sockets — it spawns the `comfy` CLI and nothing
-# else — so the generative tests run headless with the stub backend.
+# latent_generative is the model-raster half (PROMPT.md 3.5): the op-stack arithmetic behind
+# a cached raster, the graphs Latent ships, the colour PNG codec the crop and the result move
+# as, and the backends. No GPU (wgpu) and no sockets — it spawns the `comfy` CLI, or runs the
+# local denoise graph through latent_ai — so the generative tests run headless with the stub
+# backend.
 add_library(latent_generative STATIC
   generative/comfy_backend.cpp
   generative/comfy_cli.cpp
   generative/generative.cpp
   generative/image_io.cpp
+  generative/onnx_backend.cpp
+  generative/sky_backend.cpp
   generative/stub_backend.cpp
   generative/workflow.cpp)
 target_include_directories(latent_generative PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(latent_generative PUBLIC latent_ops latent_catalog PNG::PNG)
+target_link_libraries(latent_generative PUBLIC latent_ops latent_ai latent_catalog PNG::PNG)
 target_compile_definitions(latent_generative PRIVATE
   LATENT_WORKFLOW_DIR="${CMAKE_SOURCE_DIR}/workflows")
 
@@ -95,7 +109,6 @@ get_filename_component(LATENT_PYTHON_HOME "${Python3_STDLIB}/../.." ABSOLUTE)
 
 add_library(latent_core STATIC
   gpu/gpu.cpp
-  pipeline/histogram.cpp
   pipeline/renderer.cpp
   python/interpreter.cpp
   python/json_convert.cpp
@@ -118,7 +131,9 @@ latent_embed_shaders(latent_core
   ${CMAKE_SOURCE_DIR}/shaders/mask.wgsl
   ${CMAKE_SOURCE_DIR}/shaders/mask_combine.wgsl
   ${CMAKE_SOURCE_DIR}/shaders/export.wgsl
-  ${CMAKE_SOURCE_DIR}/shaders/composite.wgsl)
+  ${CMAKE_SOURCE_DIR}/shaders/composite.wgsl
+  ${CMAKE_SOURCE_DIR}/shaders/blend.wgsl
+  ${CMAKE_SOURCE_DIR}/shaders/relight.wgsl)
 
 # The MCP SDK is pip-installed into the bundled interpreter; vcpkg has no port for it.
 # The stamp keeps it to once per build directory, and the script never fails the build.
@@ -143,7 +158,7 @@ add_dependencies(latentd latent_python_deps)
 # runtime-compiled kernels (Florence-2 in the daemon, never in a probe without -rdynamic).
 # Every archive except libpython stays private.
 target_link_options(latentd PRIVATE -rdynamic
-  "-Wl,--exclude-libs,libz.a:liblzma.a:libbz2.a:libjpeg.a:libturbojpeg.a:libpng16.a:libpng.a:libtiff.a:libaom.a:libavif.a:libyuv.a:liblcms2.a:libcrypto.a:libssl.a:libexpat.a:libffi.a:libuuid.a:libb2.a:libjasper.a:libraw_r.a:libsqlite3.a:libuSockets.a")
+  "-Wl,--exclude-libs,libz.a:liblzma.a:libbz2.a:libjpeg.a:libturbojpeg.a:libpng16.a:libpng.a:libtiff.a:libaom.a:libavif.a:libyuv.a:liblcms2.a:libcrypto.a:libssl.a:libexpat.a:libffi.a:libuuid.a:libb2.a:libjasper.a:libraw_r.a:libsqlite3.a:libuSockets.a:libexif.a")
 # apps/desktop looks for engine/build/dev/latentd, so the binary sits in the build root.
 set_target_properties(latentd PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
   BUILD_RPATH "${ORT_LIB_DIR}" INSTALL_RPATH "${ORT_LIB_DIR}")

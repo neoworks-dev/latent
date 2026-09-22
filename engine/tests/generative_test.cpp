@@ -7,6 +7,7 @@
 #include "generative/generative.h"
 
 #include "generative/backend.h"
+#include "generative/comfy_cli.h"
 #include "generative/image_io.h"
 #include "generative/workflow.h"
 #include "image/gray.h"
@@ -14,9 +15,13 @@
 #include "ops/registry.h"
 #include "ops/sidecar.h"
 
+#include <cmath>
 #include <cstdlib>
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <random>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -62,6 +67,53 @@ GrayImage half_mask(uint32_t width, uint32_t height) {
   mask.pixels.assign(static_cast<size_t>(width) * height, 0);
   for (uint32_t y = 0; y < height; ++y) {
     for (uint32_t x = width / 2; x < width; ++x) {
+      mask.pixels[(static_cast<size_t>(y) * width) + x] = 255;
+    }
+  }
+  return mask;
+}
+
+// The crop the sky backend is for: a sky gradient with grain in it, a scatter of stars, and
+// one bright streak across the middle. The mask is the streak plus a two-pixel margin, which
+// is what the `grow` param produces on a real detection.
+constexpr uint32_t kStreakTop = 30;
+constexpr uint32_t kStreakBottom = 33;
+constexpr uint32_t kMaskTop = 28;
+constexpr uint32_t kMaskBottom = 35;
+
+uint8_t sky_value(uint32_t y) {
+  return static_cast<uint8_t>(24 + (y / 4));
+}
+
+Rgb8Image night_crop(uint32_t width, uint32_t height) {
+  Rgb8Image image;
+  image.width = width;
+  image.height = height;
+  image.pixels.assign(static_cast<size_t>(width) * height * 3, 0);
+  std::mt19937 noise(7);
+  std::normal_distribution<double> grain(0.0, 3.0);
+  for (uint32_t y = 0; y < height; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const size_t pixel = (static_cast<size_t>(y) * width) + x;
+      double value = sky_value(y) + grain(noise);
+      if (pixel % 37 == 0) value = 200;                        // a star
+      if (y >= kStreakTop && y <= kStreakBottom) value = 230;  // the trail
+      const auto stored = static_cast<uint8_t>(std::lround(std::clamp(value, 0.0, 255.0)));
+      for (size_t channel = 0; channel < 3; ++channel) {
+        image.pixels[(pixel * 3) + channel] = stored;
+      }
+    }
+  }
+  return image;
+}
+
+GrayImage streak_mask(uint32_t width, uint32_t height) {
+  GrayImage mask;
+  mask.width = width;
+  mask.height = height;
+  mask.pixels.assign(static_cast<size_t>(width) * height, 0);
+  for (uint32_t y = kMaskTop; y <= kMaskBottom; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
       mask.pixels[(static_cast<size_t>(y) * width) + x] = 255;
     }
   }
@@ -367,7 +419,7 @@ TEST_CASE("the stub backend repaints only what the mask covers", "[generative]")
   request.image = encode_rgb_png(solid(64, 32, 200));
   request.mask = encode_gray_png(half_mask(64, 32));
 
-  const GenerativeResult result = backend->inpaint(request, {});
+  const GenerativeResult result = backend->run(request, {});
   REQUIRE(result.ok);
   const std::optional<Rgb8Image> out = decode_rgb_png(result.png);
   REQUIRE(out.has_value());
@@ -395,12 +447,91 @@ TEST_CASE("the stub backend is deterministic per seed and differs across seeds",
   request.image = encode_rgb_png(solid(32, 32, 120));
   request.mask = encode_gray_png(half_mask(32, 32));
   request.seed = 1;
-  const std::vector<uint8_t> first = backend->inpaint(request, {}).png;
-  const std::vector<uint8_t> again = backend->inpaint(request, {}).png;
+  const std::vector<uint8_t> first = backend->run(request, {}).png;
+  const std::vector<uint8_t> again = backend->run(request, {}).png;
   request.seed = 180;
-  const std::vector<uint8_t> other = backend->inpaint(request, {}).png;
+  const std::vector<uint8_t> other = backend->run(request, {}).png;
   CHECK(first == again);
   CHECK(first != other);
+}
+
+TEST_CASE("the sky backend puts sky where the streak was", "[generative]") {
+  const std::unique_ptr<GenerativeBackend> backend = make_sky_backend();
+  REQUIRE(backend->name() == "sky");
+
+  const uint32_t width = 96;
+  const uint32_t height = 64;
+  GenerativeRequest request;
+  request.task = "remove";
+  request.seed = 3;
+  const Rgb8Image crop = night_crop(width, height);
+  request.image = encode_rgb_png(crop);
+  request.mask = encode_gray_png(streak_mask(width, height));
+
+  const GenerativeResult result = backend->run(request, {});
+  REQUIRE(result.ok);
+  CHECK(result.model == "sky-fill");
+  const std::optional<Rgb8Image> out = decode_rgb_png(result.png);
+  REQUIRE(out.has_value());
+
+  // Outside the mask nothing moved, stars included.
+  for (uint32_t y = 0; y < height; ++y) {
+    if (y >= kMaskTop && y <= kMaskBottom) continue;
+    for (uint32_t x = 0; x < width; ++x) {
+      const size_t at = ((static_cast<size_t>(y) * width) + x) * 3;
+      REQUIRE(out->pixels[at] == crop.pixels[at]);
+    }
+  }
+
+  // Inside it: the streak is gone, and what replaced it is the sky the rows either side
+  // have — not a smear of the stars the interpolation had to reach over.
+  double total = 0;
+  double squares = 0;
+  double count = 0;
+  uint8_t brightest = 0;
+  for (uint32_t y = kMaskTop; y <= kMaskBottom; ++y) {
+    for (uint32_t x = 0; x < width; ++x) {
+      const double value = out->pixels[(((static_cast<size_t>(y) * width) + x)) * 3];
+      total += value;
+      squares += value * value;
+      count += 1;
+      brightest = std::max(brightest, out->pixels[(((static_cast<size_t>(y) * width) + x)) * 3]);
+    }
+  }
+  const double mean = total / count;
+  CHECK(mean == Catch::Approx(sky_value((kStreakTop + kStreakBottom) / 2)).margin(5));
+  CHECK(brightest < 120);
+  // Grain, at something like the frame's own amplitude: a perfectly flat patch is as
+  // visible as the trail was.
+  const double deviation = std::sqrt(std::max(0.0, (squares / count) - (mean * mean)));
+  CHECK(deviation > 1.0);
+  CHECK(deviation < 8.0);
+}
+
+TEST_CASE("the sky backend repeats itself and owns up to a mask with no sky in it",
+          "[generative]") {
+  const std::unique_ptr<GenerativeBackend> backend = make_sky_backend();
+  GenerativeRequest request;
+  request.image = encode_rgb_png(night_crop(48, 48));
+  request.mask = encode_gray_png(streak_mask(48, 48));
+  request.seed = 5;
+  // A cached result is keyed on an input hash, so two runs that differ only in grain would
+  // read as the op having changed.
+  CHECK(backend->run(request, {}).png == backend->run(request, {}).png);
+
+  GrayImage everything;
+  everything.width = 48;
+  everything.height = 48;
+  everything.pixels.assign(48 * 48, 255);
+  request.mask = encode_gray_png(everything);
+  const GenerativeResult covered = backend->run(request, {});
+  CHECK_FALSE(covered.ok);
+  CHECK(covered.code == "no_sky");
+
+  request.mask = encode_gray_png(streak_mask(16, 16));
+  const GenerativeResult mismatched = backend->run(request, {});
+  CHECK_FALSE(mismatched.ok);
+  CHECK(mismatched.code == "bad_input");
 }
 
 TEST_CASE("a backend run stops when the progress callback says so", "[generative]") {
@@ -409,18 +540,68 @@ TEST_CASE("a backend run stops when the progress callback says so", "[generative
   request.image = encode_rgb_png(solid(16, 16, 10));
   request.mask = encode_gray_png(half_mask(16, 16));
   const GenerativeResult result =
-      backend->inpaint(request, [](double, const std::string&) { return false; });
+      backend->run(request, [](double, const std::string&) { return false; });
   CHECK_FALSE(result.ok);
   CHECK(result.code == "cancelled");
 }
 
 TEST_CASE("LATENT_GENERATIVE_STUB picks the stub and the param overrides it", "[generative]") {
-  CHECK(make_generative_backend("stub")->name() == "stub");
-  CHECK(make_generative_backend("comfy")->name() == "comfy");
+  CHECK(make_generative_backend("stub", "fill")->name() == "stub");
+  CHECK(make_generative_backend("sky", "fill")->name() == "sky");
+  CHECK(make_generative_backend("comfy", "fill")->name() == "comfy");
   setenv("LATENT_GENERATIVE_STUB", "1", 1);
-  CHECK(make_generative_backend("auto")->name() == "stub");
+  CHECK(make_generative_backend("auto", "fill")->name() == "stub");
+  CHECK(make_generative_backend("auto", "denoise")->name() == "stub");
   unsetenv("LATENT_GENERATIVE_STUB");
-  CHECK(make_generative_backend("auto")->name() == "comfy");
+  CHECK(make_generative_backend("auto", "fill")->name() == "comfy");
+}
+
+TEST_CASE("auto sends a denoise to the local model when it is installed", "[generative]") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "latent-denoise-store-test";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const char* previous = std::getenv("LATENT_MODEL_STORE");
+  const std::string restore = previous == nullptr ? std::string() : previous;
+  setenv("LATENT_MODEL_STORE", root.string().c_str(), 1);
+
+  // An empty store: there is no local model, so auto is still the graph.
+  CHECK(resolve_generative_backend("auto", "denoise") == "comfy");
+
+  std::filesystem::create_directories(root / "scunet-color-real");
+  std::ofstream(root / "scunet-color-real" / "config.json") << "{\"tile\": 512}";
+  CHECK(resolve_generative_backend("auto", "denoise") == "onnx");
+  // Only a denoise: nothing else here is a restoration problem, and the model answers no
+  // other task.
+  CHECK(resolve_generative_backend("auto", "fill") == "comfy");
+  CHECK(resolve_generative_backend("auto", "upscale") == "comfy");
+  // An explicit choice is still the user's.
+  CHECK(resolve_generative_backend("comfy", "denoise") == "comfy");
+  CHECK(make_generative_backend("onnx", "denoise")->name() == "onnx");
+
+  // The local backend refuses the tasks it cannot do rather than returning something.
+  GenerativeRequest request;
+  request.task = "upscale";
+  const GenerativeResult refused =
+      make_onnx_denoise_backend()->run(request, [](double, const std::string&) { return true; });
+  CHECK_FALSE(refused.ok);
+  CHECK(refused.code == "no_workflow");
+
+  if (restore.empty()) {
+    unsetenv("LATENT_MODEL_STORE");
+  } else {
+    setenv("LATENT_MODEL_STORE", restore.c_str(), 1);
+  }
+  std::filesystem::remove_all(root);
+}
+
+TEST_CASE("a ComfyUI that is not running is named as such", "[generative]") {
+  // `comfy upload` reports an unreachable server against the file it was sending, which
+  // reads like a broken file rather than a daemon nobody started.
+  CHECK(comfy_hint_for("upload_failed", "Failed to upload latent-2-crop.png, connection refused")
+            .find("comfy launch") != std::string::npos);
+  CHECK(comfy_hint_for("server_not_running", "").find("comfy launch") != std::string::npos);
+  CHECK(comfy_hint_for("execution_error", "the sampler ran out of memory").empty());
 }
 
 TEST_CASE("colour PNGs round-trip through the generative codec", "[generative]") {
@@ -454,4 +635,154 @@ TEST_CASE("status says what is missing instead of failing a run silently", "[gen
   }
   // Not ready is a state with a reason, never an empty answer.
   if (!status["ready"].get<bool>()) CHECK(status.contains("message"));
+}
+
+// ---- the whole-frame ops (issues #51, #52) ---------------------------------------------
+//
+// `denoise` and `upscale` are the same cached-raster machine as the two above with three
+// differences: no mask, the whole frame, and a position under everything a slider can do.
+// `upscale` adds a fourth — it is the one op in the engine that changes how many pixels the
+// photo has, which only the export renders at.
+
+TEST_CASE("the registry knows the two whole-frame ops", "[generative]") {
+  for (const char* name : {"denoise", "upscale"}) {
+    const OpDefinition* definition = find_op_definition(name);
+    REQUIRE(definition != nullptr);
+    CHECK(definition->section == "Enhance");
+    CHECK(is_generative_op(name));
+    CHECK(is_whole_frame_op(name));
+    // There is no region to choose: the raster covers the frame, so a mask would be a
+    // second, contradictory answer to the same question.
+    CHECK_FALSE(definition->maskable());
+  }
+  CHECK_FALSE(is_whole_frame_op("generative_fill"));
+  CHECK_FALSE(is_whole_frame_op("noise_reduction"));
+
+  // Denoise first, always: an upscaler turns leftover noise into detail that was never
+  // there. Both sit under the parametric noise reduction, which is the cheap cleanup on top
+  // of what the model left rather than a second opinion about the same pixels.
+  CHECK(PipelineStage::Optics < find_op_definition("denoise")->stage);
+  CHECK(find_op_definition("denoise")->stage < find_op_definition("upscale")->stage);
+  CHECK(find_op_definition("upscale")->stage < PipelineStage::NoiseReduction);
+}
+
+TEST_CASE("each generative op names the graph it runs", "[generative]") {
+  CHECK(generative_task("generative_fill") == "fill");
+  CHECK(generative_task("remove") == "remove");
+  CHECK(generative_task("denoise") == "denoise");
+  CHECK(generative_task("upscale") == "upscale");
+  CHECK(generative_task("exposure").empty());
+}
+
+TEST_CASE("a whole-frame op's input is everything that renders under it", "[generative]") {
+  Stack stack = {make_op("crop", "crop", {{"left", 0.1}}), make_op("d", "denoise"),
+                 make_op("u", "upscale"), make_op("e", "exposure", {{"value", 1.0}})};
+
+  const auto ids = [](const Stack& input) {
+    std::vector<std::string> out;
+    for (const Op& op : input) {
+      out.push_back(op.id);
+    }
+    return out;
+  };
+  // Geometry is framing and comes wherever it sits; the upscale renders above the denoise,
+  // so it is not part of what the denoise model is handed.
+  CHECK(ids(generative_input_stack(stack, "d")) == std::vector<std::string>{"crop"});
+  // The upscale is handed the denoised frame, which is the whole point of the ordering.
+  CHECK(ids(generative_input_stack(stack, "u")) == std::vector<std::string>{"crop", "d"});
+  // And a fill above both sees them both, whatever the stack order is.
+  stack.push_back(make_fill("g"));
+  CHECK(ids(generative_input_stack(stack, "g")) == std::vector<std::string>{"crop", "d", "u"});
+}
+
+TEST_CASE("only an upscale with a raster changes the export's size", "[generative]") {
+  Stack stack = {make_op("u", "upscale", {{"factor", "4x"}})};
+  CHECK(upscale_factor(stack[0]) == 4.0);
+  // Asked for but never run: the op renders nothing, so the export is native size.
+  CHECK(stack_upscale_factor(stack) == 1.0);
+
+  stack[0].result = generative_result_relative_path("u");
+  CHECK(stack_upscale_factor(stack) == 4.0);
+
+  stack[0].enabled = false;
+  CHECK(stack_upscale_factor(stack) == 1.0);
+  stack[0].enabled = true;
+
+  // Two of them compound, because each one really did make the raster below it bigger.
+  Op second = make_op("u2", "upscale", {{"factor", "2x"}});
+  second.result = generative_result_relative_path("u2");
+  stack.push_back(second);
+  CHECK(stack_upscale_factor(stack) == 8.0);
+
+  // An unparseable factor is the param's first value, which is what normalize_params does
+  // with anything outside the enum.
+  CHECK(upscale_factor(make_op("u3", "upscale")) == 2.0);
+}
+
+TEST_CASE("the stub backend answers the whole-frame tasks without a mask", "[generative]") {
+  const std::unique_ptr<GenerativeBackend> backend = make_stub_backend();
+  GenerativeRequest request;
+  request.task = "denoise";
+  request.image = encode_rgb_png(solid(64, 32, 200));
+  request.strength = 0.3;
+
+  const GenerativeResult denoised = backend->run(request, {});
+  REQUIRE(denoised.ok);
+  const std::optional<Rgb8Image> denoised_image = decode_rgb_png(denoised.png);
+  REQUIRE(denoised_image.has_value());
+  // A denoise hands back the same frame, at the same size: the composite puts it back over
+  // the whole content rect.
+  CHECK(denoised_image->width == 64);
+  CHECK(denoised_image->height == 32);
+
+  request.task = "upscale";
+  request.scale = 4;
+  const GenerativeResult enlarged = backend->run(request, {});
+  REQUIRE(enlarged.ok);
+  const std::optional<Rgb8Image> enlarged_image = decode_rgb_png(enlarged.png);
+  REQUIRE(enlarged_image.has_value());
+  CHECK(enlarged_image->width == 256);
+  CHECK(enlarged_image->height == 128);
+
+  request.scale = 2;
+  const std::optional<Rgb8Image> half = decode_rgb_png(backend->run(request, {}).png);
+  REQUIRE(half.has_value());
+  CHECK(half->width == 128);
+}
+
+TEST_CASE("the whole-frame graphs take no mask and are the ones for their task", "[generative]") {
+  const std::vector<Workflow> workflows = load_workflows();
+  for (const char* name : {"denoise", "upscale"}) {
+    const auto found = std::find_if(workflows.begin(), workflows.end(),
+                                    [name](const Workflow& entry) { return entry.name == name; });
+    REQUIRE(found != workflows.end());
+    CHECK(found->task == name);
+    CHECK(found->bindings.mask.empty());
+
+    WorkflowValues values;
+    values.image = "crop.png";
+    values.strength = 0.42;
+    values.seed = 7;
+    const nlohmann::json filled = fill_workflow(*found, values);
+    const auto widget = [&filled](const std::string& binding) {
+      const size_t dot = binding.find('.');
+      return filled.at(binding.substr(0, dot))["inputs"].at(binding.substr(dot + 1));
+    };
+    CHECK(widget(found->bindings.image) == "crop.png");
+    CHECK(filled.contains(found->bindings.output));
+  }
+
+  // Strength is the sampler's denoise widget, and only the denoise graph has one: an
+  // upscale model has no such knob and must not be handed one.
+  const auto denoise = std::find_if(workflows.begin(), workflows.end(),
+                                    [](const Workflow& entry) { return entry.name == "denoise"; });
+  REQUIRE(denoise != workflows.end());
+  REQUIRE_FALSE(denoise->bindings.strength.empty());
+  WorkflowValues values;
+  values.image = "crop.png";
+  values.strength = 0.42;
+  const nlohmann::json filled = fill_workflow(*denoise, values);
+  const size_t dot = denoise->bindings.strength.find('.');
+  CHECK(filled.at(denoise->bindings.strength.substr(0, dot))["inputs"].at(
+            denoise->bindings.strength.substr(dot + 1)) == 0.42);
 }

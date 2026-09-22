@@ -73,6 +73,16 @@ MODELS = {
         "present": lambda directory: (directory / "model.onnx").exists(),
         "install": lambda directory: __import__("export_dedicated").export_segformer(directory),
     },
+    "depth-anything-v2-small": {
+        "role": "relative depth -> the relight op and the depth mask kind",
+        "present": lambda directory: (directory / "model.onnx").exists(),
+        "install": lambda directory: __import__("export_dedicated").export_depth_anything(directory),
+    },
+    "scunet-color-real": {
+        "role": "whole-frame denoise -> the `denoise` op's local backend",
+        "present": lambda directory: (directory / "model.onnx").exists(),
+        "install": lambda directory: __import__("export_denoise").export_scunet(directory),
+    },
 }
 
 
@@ -215,6 +225,25 @@ def verify(runs: int = 10) -> int:
         [semantic],
         f"sky {float(segformer.sky(image, logits).mean()):.4f}"
         f"  people {float(segformer.people(image, logits).mean()):.4f}",
+    )
+    del segformer
+
+    from depth import DepthAnythingV2
+
+    load = Timer("load")
+    with load:
+        depth_model = DepthAnythingV2()
+    depth_stage = Timer("depth-anything-v2-small (518x518)")
+    depth_model.depth(image)
+    for _ in range(runs):
+        with depth_stage:
+            depth = depth_model.depth(image)
+    report(
+        "depth-anything-v2-small",
+        load,
+        [depth_stage],
+        f"near {float(depth.max()):.3f}  far {float(depth.min()):.3f}"
+        f"  mean {float(depth.mean()):.3f}",
     )
     return 0
 

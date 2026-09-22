@@ -1,5 +1,5 @@
-// The catalog: a filmstrip at the bottom, folders and collections on the left, and a job
-// status line in the footer. Rows, ratings, flags and thumbnails all belong to the engine —
+// The catalog: a filmstrip at the bottom under its own filter bar, the library inside the
+// grid, and a job status line in the footer. Rows, ratings, flags and thumbnails all belong to the engine —
 // this plugin lists, selects and asks; it never stores an edit.
 import type { MergeKind } from "@latent/protocol";
 import type { Context, Plugin } from "@neoworks/extension-system";
@@ -8,7 +8,7 @@ import Filmstrip from "./Filmstrip.svelte";
 import Grid from "./Grid.svelte";
 import Info from "./Info.svelte";
 import JobStatus from "./JobStatus.svelte";
-import Library from "./Library.svelte";
+import StripFilter from "./StripFilter.svelte";
 import { CatalogState } from "./state.svelte";
 
 declare module "@neoworks/extension-system" {
@@ -38,15 +38,9 @@ export const catalogPlugin: Plugin.Object<void> = {
     ctx.provide("catalog", state);
     ctx.effect(() => () => state.dispose());
 
-    ctx.effect(() =>
-      ctx.panes.register({
-        id: "library",
-        title: "Library",
-        region: "left",
-        order: 0,
-        component: Library,
-      }),
-    );
+    // The library is not a pane of its own any more: it is drawn inside the grid, where
+    // choosing which photos you are looking at belongs. The left column is the open
+    // photo's — navigator, presets, history.
     // The grid covers the viewer's canvas while it is open; it draws nothing otherwise,
     // so the centre region keeps one pane per feature instead of a mode switch.
     ctx.effect(() =>
@@ -63,9 +57,22 @@ export const catalogPlugin: Plugin.Object<void> = {
         id: "info",
         title: "Info",
         region: "right",
+        // Folded into the Edit column rather than a rail mode of its own: it is a readout
+        // of the open photo, not a tool, and a whole tab for one card is a tab too many.
         order: 5,
-        mode: "info",
+        mode: "edit",
         component: Info,
+      }),
+    );
+    // Above the strip: search, the quick filters and the sort, so the page can be narrowed
+    // without opening the grid.
+    ctx.effect(() =>
+      ctx.panes.register({
+        id: "strip-filter",
+        title: "Filter",
+        region: "bottom",
+        order: 5,
+        component: StripFilter,
       }),
     );
     ctx.effect(() =>

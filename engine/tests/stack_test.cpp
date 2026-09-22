@@ -67,6 +67,68 @@ TEST_CASE("find_op matches by id") {
   REQUIRE(find_op(stack, "nope") == nullptr);
 }
 
+TEST_CASE("a group carries its children through a JSON round trip") {
+  Op group;
+  group.id = "g0000001";
+  group.name = std::string(kGroupOpName);
+  group.mask = nlohmann::json{{"components", nlohmann::json::array()}};
+  group.opacity = 60;
+  group.ops.push_back(make_op("child001", "exposure", 1.5));
+  group.ops.push_back(make_op("child002", "clarity", 20));
+  Stack stack;
+  stack.push_back(std::move(group));
+
+  const nlohmann::json encoded = stack_to_json(stack);
+  REQUIRE(encoded[0]["op"] == kGroupOpName);
+  REQUIRE(encoded[0]["ops"].size() == 2);
+  REQUIRE(encoded[0]["ops"][1]["op"] == "clarity");
+  REQUIRE(encoded[0]["opacity"] == 60);
+
+  const Stack decoded = stack_from_json(encoded);
+  REQUIRE(decoded[0].is_group());
+  REQUIRE(decoded[0].ops.size() == 2);
+  REQUIRE(stack_to_json(decoded) == encoded);
+
+  // An empty group is a layer whose mask has nothing under it yet, not a group that lost
+  // its children: the list goes out either way.
+  Op empty;
+  empty.id = "g0000002";
+  empty.name = std::string(kGroupOpName);
+  REQUIRE(op_to_json(empty)["ops"].empty());
+}
+
+TEST_CASE("groups are one level deep, and their children are reachable by id") {
+  const nlohmann::json nested =
+      nlohmann::json::array({{{"id", "g1"},
+                              {"op", "group"},
+                              {"ops", nlohmann::json::array({{{"id", "g2"}, {"op", "group"}}})}}});
+  REQUIRE_THROWS_AS(stack_from_json(nested), OpError);
+  // Only a group holds children.
+  REQUIRE_THROWS_AS(stack_from_json(nlohmann::json::array(
+                        {{{"id", "e1"}, {"op", "exposure"}, {"ops", nlohmann::json::array()}}})),
+                    OpError);
+
+  Stack stack;
+  Op group;
+  group.id = "g0000001";
+  group.name = std::string(kGroupOpName);
+  group.ops.push_back(make_op("child001", "exposure", 1));
+  stack.push_back(std::move(group));
+  stack.push_back(make_op("top00001", "contrast", 10));
+
+  // An id is unique across the whole stack, so every message that names one reaches a
+  // child without knowing it is one.
+  REQUIRE(find_op(stack, "child001") != nullptr);
+  REQUIRE(find_parent_group(stack, "child001") != nullptr);
+  REQUIRE(find_parent_group(stack, "child001")->id == "g0000001");
+  REQUIRE(find_parent_group(stack, "top00001") == nullptr);
+  REQUIRE(find_parent_group(stack, "g0000001") == nullptr);
+
+  std::vector<std::string> visited;
+  for_each_op(stack, [&](const Op& op) { visited.push_back(op.id); });
+  REQUIRE(visited == std::vector<std::string>{"g0000001", "child001", "top00001"});
+}
+
 TEST_CASE("history appends a snapshot per commit") {
   History history;
   REQUIRE(history.size() == 1);

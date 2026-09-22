@@ -66,6 +66,17 @@ struct CatalogPage {
 struct CatalogFolder {
   std::string path;
   int64_t count = 0;
+  // True when a watched root covers this folder, so photos dropped into it appear on their
+  // own. False means the folder is only ever as fresh as its last rescan.
+  bool watched = false;
+};
+
+// A folder Latent keeps a live watch on (catalog/watcher.h), remembered so the watch comes
+// back with the daemon. Imported folders land here; imported single files do not, because
+// picking three photos out of a folder is not asking for the rest of it.
+struct WatchedFolder {
+  std::string path;
+  bool recursive = true;
 };
 
 struct CatalogCollection {
@@ -95,6 +106,12 @@ class Catalog {
   std::optional<CatalogPhoto> get(int64_t photo_id);
   CatalogPage list(const CatalogQuery& query);
   std::vector<CatalogFolder> folders();
+
+  // Remembers `path` as watched, widening an existing row to recursive but never narrowing
+  // it. `unwatch_folder` is what a root that has left the disk gets at startup.
+  void watch_folder(const std::string& path, bool recursive);
+  void unwatch_folder(const std::string& path);
+  std::vector<WatchedFolder> watched_folders();
 
   // Deletes rows and their collection memberships. Files on disk are never touched.
   // Returns how many rows actually went away.

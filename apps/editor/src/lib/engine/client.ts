@@ -1,6 +1,7 @@
 // WebSocket client for latentd: JSON-RPC 2.0 on text frames, LFRM pixels on binary
 // frames. Reconnects on its own; pending calls reject when the socket drops.
 import type {
+  DepthListener,
   EngineClient,
   EngineConnectionState,
   FrameListener,
@@ -9,6 +10,7 @@ import type {
 } from "@latent/contracts";
 import {
   FRAME_HEADER_BYTES,
+  FRAME_MAGIC_DEPTH,
   FRAME_MAGIC_MASK,
   FRAME_MAGIC_THUMBNAIL,
   frameBody,
@@ -40,6 +42,7 @@ export class WebSocketEngineClient implements EngineClient {
   private readonly frameListeners = new Map<number, Set<FrameListener>>();
   private readonly thumbnailListeners = new Map<number, Set<ThumbnailListener>>();
   private readonly maskListeners = new Set<MaskListener>();
+  private readonly depthListeners = new Set<DepthListener>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
   private readonly openWaiters = new Set<() => void>();
@@ -108,6 +111,13 @@ export class WebSocketEngineClient implements EngineClient {
     };
   }
 
+  onDepth(listener: DepthListener): () => void {
+    this.depthListeners.add(listener);
+    return () => {
+      this.depthListeners.delete(listener);
+    };
+  }
+
   private connect(): void {
     const socket = new WebSocket(this.url);
     socket.binaryType = "arraybuffer";
@@ -163,10 +173,12 @@ export class WebSocketEngineClient implements EngineClient {
       for (const listener of listeners) listener(header, jpeg);
       return;
     }
-    if (header.magic === FRAME_MAGIC_MASK) {
-      // r8: one coverage byte per pixel, a view into the socket's buffer like LFRM's.
-      const coverage = new Uint8Array(buffer, FRAME_HEADER_BYTES, header.width * header.height);
-      for (const listener of this.maskListeners) listener(header, coverage);
+    if (header.magic === FRAME_MAGIC_MASK || header.magic === FRAME_MAGIC_DEPTH) {
+      // r8: one byte per pixel, a view into the socket's buffer like LFRM's.
+      const plane = new Uint8Array(buffer, FRAME_HEADER_BYTES, header.width * header.height);
+      const listeners =
+        header.magic === FRAME_MAGIC_MASK ? this.maskListeners : this.depthListeners;
+      for (const listener of listeners) listener(header, plane);
       return;
     }
     const listeners = this.frameListeners.get(header.target);

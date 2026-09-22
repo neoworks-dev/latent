@@ -2,6 +2,7 @@
 // itself lives on the op in the engine's stack — this plugin edits parameters and asks for
 // rasters, and never holds a pixel of its own beyond the preview it was sent.
 import type { Context, Plugin } from "@neoworks/extension-system";
+import MaskActions from "./MaskActions.svelte";
 import MasksPane from "./MasksPane.svelte";
 import { MasksState } from "./state.svelte";
 
@@ -19,12 +20,14 @@ export const masksPlugin: Plugin.Object<void> = {
     ctx.provide("masks", state);
     ctx.effect(() => () => state.dispose());
     ctx.effect(() =>
+      // Not a column and not a mode: the panel hangs off the rail and stays open while the
+      // Edit column is used, because a selected mask is what those sliders write into.
       ctx.panes.register({
         id: "masks",
         title: "Masks",
-        region: "right",
+        region: "rail",
         order: 10,
-        mode: "masks",
+        headerActions: MaskActions,
         component: MasksPane,
       }),
     );
@@ -36,4 +39,4 @@ export const masksPlugin: Plugin.Object<void> = {
 // with the call that asked for it.
 export { MaskPreviewQueue, type MaskPreview } from "./preview";
 export { default as KindIcon } from "./KindIcon.svelte";
-export { maskSignature } from "./masks";
+export { maskSignature, tintPixels, tintStyle, type MaskTint } from "./masks";

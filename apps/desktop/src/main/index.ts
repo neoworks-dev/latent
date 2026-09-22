@@ -35,9 +35,27 @@ ipcMain.handle("dialog:pickFiles", async (event): Promise<string[]> => {
     properties: ["openFile", "multiSelections"],
     filters: [
       {
+        name: "Photos",
+        extensions: [
+          "raf",
+          "nef",
+          "arw",
+          "cr2",
+          "cr3",
+          "dng",
+          "orf",
+          "rw2",
+          "pef",
+          "png",
+          "jpg",
+          "jpeg",
+        ],
+      },
+      {
         name: "Raw photos",
         extensions: ["raf", "nef", "arw", "cr2", "cr3", "dng", "orf", "rw2", "pef"],
       },
+      { name: "PNG and JPEG", extensions: ["png", "jpg", "jpeg"] },
     ],
   };
   const result = parent

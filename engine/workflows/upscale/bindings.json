@@ -1,0 +1,10 @@
+{
+  "task": "upscale",
+  "label": "ESRGAN 4x",
+  "requires": ["4x-UltraSharp.pth"],
+  "bindings": {
+    "image": "152.image",
+    "model": "101.model_name",
+    "output": "203"
+  }
+}

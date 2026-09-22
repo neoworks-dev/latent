@@ -1,5 +1,6 @@
 #include "ops/mask.h"
 
+#include "ops/registry.h"
 #include "ops/sha256.h"
 
 #include <cmath>
@@ -16,9 +17,9 @@ namespace latent {
 
 namespace {
 
-constexpr std::array<std::string_view, 12> kKindNames = {
-    "subject", "sky",    "background", "objects",   "people", "text",
-    "brush",   "linear", "radial",     "luminance", "color",  "depth"};
+constexpr std::array<std::string_view, 13> kKindNames = {
+    "subject", "sky",    "background", "objects", "people", "text",  "brush",
+    "linear",  "radial", "luminance",  "color",   "depth",  "trails"};
 constexpr std::array<std::string_view, 3> kModeNames = {"add", "subtract", "intersect"};
 constexpr std::array<std::string_view, 4> kStateNames = {"ready", "pending", "stale", "failed"};
 constexpr std::array<std::string_view, 2> kSpaceNames = {"image", "content"};
@@ -29,6 +30,9 @@ constexpr std::array<std::string_view, 2> kSpaceNames = {"image", "content"};
 constexpr double kCoordinateLow = -1.0;
 constexpr double kCoordinateHigh = 2.0;
 constexpr size_t kMaxColorSamples = 5;
+// A hand-drawn seed stroke, thinned by the client. Far more than a gesture produces, and
+// small enough that the stack, the sidecar and the cache key stay readable.
+constexpr size_t kMaxSeedPoints = 256;
 
 [[noreturn]] void reject(const std::string& message) {
   throw OpError("mask: " + message);
@@ -174,6 +178,31 @@ nlohmann::json normalize_objects(const nlohmann::json& params, const std::string
   return out;
 }
 
+// The seed is the stroke the user drew along one streak; everything else describes how far
+// the detector may stray from it (ai/trails.h).
+nlohmann::json normalize_trails(const nlohmann::json& params, const std::string& where) {
+  nlohmann::json out = nlohmann::json::object();
+  if (params.contains("seed") && !params["seed"].is_null()) {
+    const nlohmann::json& seed = params["seed"];
+    if (!seed.is_array()) reject(where + ".seed must be a list of [x, y] points");
+    if (seed.size() > kMaxSeedPoints) {
+      reject(where + ".seed takes at most " + std::to_string(kMaxSeedPoints) + " points");
+    }
+    nlohmann::json path = nlohmann::json::array();
+    for (const nlohmann::json& point : seed) {
+      if (!point.is_array() || point.size() != 2) reject(where + ".seed holds [x, y] pairs");
+      path.push_back(nlohmann::json::array(
+          {number_in(point[0], kCoordinateLow, kCoordinateHigh, where + ".seed.x"),
+           number_in(point[1], kCoordinateLow, kCoordinateHigh, where + ".seed.y")}));
+    }
+    out["seed"] = std::move(path);
+  }
+  out["sensitivity"] = optional_number(params, "sensitivity", 50.0, 0.0, 100.0, where);
+  out["minLength"] = optional_number(params, "minLength", 10.0, 1.0, 100.0, where);
+  out["grow"] = optional_number(params, "grow", 25.0, 0.0, 100.0, where);
+  return out;
+}
+
 nlohmann::json normalize_params_for_kind(MaskKind kind, const nlohmann::json& params,
                                          const std::string& where) {
   switch (kind) {
@@ -189,6 +218,8 @@ nlohmann::json normalize_params_for_kind(MaskKind kind, const nlohmann::json& pa
       return normalize_brush(params, where);
     case MaskKind::Objects:
       return normalize_objects(params, where);
+    case MaskKind::Trails:
+      return normalize_trails(params, where);
     case MaskKind::People: {
       nlohmann::json out = nlohmann::json::object();
       out["person"] = static_cast<int64_t>(
@@ -203,6 +234,12 @@ nlohmann::json normalize_params_for_kind(MaskKind kind, const nlohmann::json& pa
       out["prompt"] = params["prompt"];
       return out;
     }
+    // The band of the depth map this component selects, 0 being the farthest thing in the
+    // frame and 1 the nearest (ai/depth.h). The raster is the map itself, so moving the
+    // range is a shader pass and never another model run — unlike every other AI kind,
+    // where the params are what the model is asked.
+    case MaskKind::Depth:
+      return normalize_luminance(params, where);
     default:
       return nlohmann::json::object();
   }
@@ -554,9 +591,35 @@ nlohmann::json migrate_mask_space(const nlohmann::json& mask, const GeometryMap&
 void migrate_mask_space(Stack& stack, uint32_t photo_width, uint32_t photo_height) {
   const GeometryMap map = geometry_map(geometry_from_stack(stack), photo_width, photo_height,
                                        photo_width, photo_height);
-  for (Op& op : stack) {
-    if (!op.mask.has_value()) continue;
+  for_each_op(stack, [&](Op& op) {
+    if (!op.mask.has_value()) return;
     op.mask = migrate_mask_space(*op.mask, map);
+  });
+}
+
+void migrate_mask_groups(Stack& stack) {
+  for (Op& entry : stack) {
+    if (entry.is_group() || !entry.mask.has_value()) continue;
+    // A generative op owns its mask: the region is what the backend was asked to paint, not
+    // a layer over an adjustment (PROMPT.md 3.5). It stays as it is.
+    if (is_generative_op(entry.name)) continue;
+    if (!entry.mask->contains("components") || (*entry.mask)["components"].empty()) continue;
+
+    Op group;
+    group.id = make_op_id();
+    group.name = std::string(kGroupOpName);
+    group.mask = entry.mask;
+    group.opacity = entry.opacity;
+    group.enabled = entry.enabled;
+
+    Op child = std::move(entry);
+    child.mask.reset();
+    child.opacity = kFullOpacity;
+    // The group carries what the op was toggled to; the adjustment under it starts on, so
+    // re-enabling the layer brings back what the sidecar held.
+    child.enabled = true;
+    group.ops.push_back(std::move(child));
+    entry = std::move(group);
   }
 }
 

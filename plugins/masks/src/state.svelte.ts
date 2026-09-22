@@ -17,8 +17,10 @@ import {
   componentId as nextComponentId,
   defaultComponent,
   isAiKind,
+  needsSeedGesture,
   kindSpec,
-  lastMaskedOp,
+  layerOf,
+  layersOf,
   maskSignature,
   nextTint,
   opById,
@@ -64,6 +66,16 @@ export class MasksState {
   private strokeHandle: number | null = null;
   private strokeComponentId: string | null = null;
   private strokeErasing = false;
+  /** A `mask.stroke` is on the wire; the next segments wait in the buffer behind it. */
+  private strokeInFlight = false;
+  /**
+   * The stroke under the pointer, in image points. The engine's raster is one round trip
+   * behind the brush — 80–150 ms of it is the frame on the socket — so the overlay draws the
+   * path itself until the preview that contains it lands. Feedback only: nothing is masked
+   * by it, and it is dropped the moment the engine's own coverage arrives.
+   */
+  private live: Point[] = [];
+  private liveStale = false;
 
   constructor(
     private readonly engine: EngineClient,
@@ -84,13 +96,27 @@ export class MasksState {
     this.queue.dispose();
   }
 
-  /** The op the column is pointed at: the selection, else the last layer in the stack. */
-  get op(): Op | undefined {
-    return opById(this.viewer.stack, this.viewer.selectedOpId) ?? lastMaskedOp(this.viewer.stack);
+  /** Every layer of this photo, bottom-up: the list the column shows. */
+  get layers(): Op[] {
+    return layersOf(this.viewer.stack);
+  }
+
+  /**
+   * The mask being edited: the one this panel selected, else the layer holding whatever the
+   * Layers column points at. Undefined means the photo itself — no mask is selected, and
+   * nothing here writes into one until the user picks it.
+   */
+  get layer(): Op | undefined {
+    return layerOf(this.viewer.stack, this.viewer.maskTarget ?? this.viewer.selectedOpId);
+  }
+
+  /** The adjustments under the selected layer's mask, in the order they were added. */
+  get adjustments(): Op[] {
+    return this.layer?.ops ?? [];
   }
 
   get mask(): Mask | undefined {
-    return this.op?.mask;
+    return this.layer?.mask;
   }
 
   get components(): MaskComponent[] {
@@ -135,15 +161,63 @@ export class MasksState {
   }
 
   /**
-   * Adds a component to the selected op's mask. AI kinds are rasterised by a job, so the
-   * write is followed by `mask.detect`; `objects` waits for a box drawn on the overlay.
+   * Clicking a mask leaves it selected and aims the Edit column at it: from here a slider
+   * there writes into this layer rather than into the photo. Nothing deselects it but the
+   * photo row or closing the panel — the whole point is to move those sliders next.
    */
-  async createComponent(kind: MaskComponentKind): Promise<MaskComponent | null> {
-    const op = this.op;
-    if (!op) {
-      this.status = "select an adjustment first";
+  selectLayer(opId: string | null): void {
+    this.viewer.selectOp(opId);
+    this.viewer.setMaskTarget(opId);
+    this.selectComponent(null);
+  }
+
+  /** Back to the photo itself: no mask selected, the Edit column global again. */
+  selectPhoto(): void {
+    this.viewer.selectOp(null);
+    this.viewer.setMaskTarget(null);
+    this.selectComponent(null);
+  }
+
+  /** The layer the Edit column is aimed at, which is only ever one this panel selected. */
+  get targetId(): string | null {
+    return this.viewer.maskTarget;
+  }
+
+  /**
+   * A new layer with its first component — Lightroom's Create New Mask. The mask comes
+   * first and the adjustments under it come later, which is the order a mask is actually
+   * made in: nothing has to be adjusted before a region can be selected.
+   */
+  async createLayer(kind: MaskComponentKind): Promise<MaskComponent | null> {
+    const layerId = await this.viewer.addGroup();
+    if (!layerId) {
+      this.status = "could not create the mask";
       return null;
     }
+    this.selectLayer(layerId);
+    return this.createComponent(kind);
+  }
+
+  async removeLayer(opId: string): Promise<void> {
+    if (this.layer?.id === opId) this.selectPhoto();
+    await this.viewer.removeOp(opId);
+  }
+
+  // Nothing here adds an adjustment: a slider in the Edit column does, because this panel
+  // aims that column at the selected mask (`ViewerService.maskTarget`).
+
+  async removeAdjustment(opId: string): Promise<void> {
+    await this.viewer.removeOp(opId);
+  }
+
+  /**
+   * Adds a component to the selected layer's mask, making the layer first when the photo
+   * has none. AI kinds are rasterised by a job, so the write is followed by `mask.detect`;
+   * `objects` waits for a box drawn on the overlay.
+   */
+  async createComponent(kind: MaskComponentKind): Promise<MaskComponent | null> {
+    const op = this.layer ?? (await this.ensureLayer());
+    if (!op) return null;
     const component = defaultComponent(kind, nextComponentId(op.mask, kind));
     if (kind === "text") component.params = { prompt: this.textPrompt };
     if (kind === "brush") {
@@ -152,12 +226,25 @@ export class MasksState {
     }
     await this.viewer.setMask(op.id, addComponent(op.mask, component));
     this.selectComponent(component.id);
-    if (isAiKind(kind) && kind !== "objects") await this.detect(component.id);
+    if (isAiKind(kind) && !needsSeedGesture(kind)) await this.detect(component.id);
     return component;
   }
 
+  /** The layer every mask edit needs. Making one is the first thing the column ever does. */
+  private async ensureLayer(): Promise<Op | undefined> {
+    const existing = this.layer;
+    if (existing) return existing;
+    const layerId = await this.viewer.addGroup();
+    if (!layerId) {
+      this.status = "could not create the mask";
+      return undefined;
+    }
+    this.selectLayer(layerId);
+    return opById(this.viewer.stack, layerId);
+  }
+
   async detect(componentId: string, hint?: Record<string, unknown>): Promise<void> {
-    const op = this.op;
+    const op = this.layer;
     const photoId = this.viewer.photoId;
     if (!op || photoId === null) return;
     const params: MaskDetectParams = { photoId, opId: op.id, componentId };
@@ -180,7 +267,7 @@ export class MasksState {
     patch: Partial<MaskComponent>,
     transient = false,
   ): Promise<void> {
-    const op = this.op;
+    const op = this.layer;
     if (!op?.mask) return;
     await this.viewer.setMask(op.id, patchComponent(op.mask, componentId, patch), transient);
   }
@@ -190,13 +277,13 @@ export class MasksState {
     params: Record<string, unknown>,
     transient = false,
   ): Promise<void> {
-    const op = this.op;
+    const op = this.layer;
     if (!op?.mask) return;
     await this.viewer.setMask(op.id, patchComponentParams(op.mask, componentId, params), transient);
   }
 
   async remove(componentId: string): Promise<void> {
-    const op = this.op;
+    const op = this.layer;
     if (!op?.mask) return;
     if (this.selectedComponentId === componentId) this.selectComponent(null);
     await this.viewer.setMask(op.id, removeComponent(op.mask, componentId));
@@ -209,10 +296,19 @@ export class MasksState {
     this.strokeComponentId = componentId;
     this.strokeErasing = erasing;
     this.strokes.reset();
+    this.live = [];
+    this.liveStale = false;
+  }
+
+  /** The path the pointer has drawn since the press, for the overlay to paint meanwhile. */
+  get livePoints(): readonly Point[] {
+    return this.live;
   }
 
   addStrokePoint(point: Point): void {
     if (!this.strokeComponentId) return;
+    // Painted straight away, whether or not the point is far enough to be worth sending.
+    if (!this.strokeErasing) this.live.push(point);
     if (!this.strokes.push(point, strokeSpacing(this.brushSize))) return;
     if (this.strokeHandle !== null) return;
     // One call per animation frame at most: a fast mouse fires far above 60 Hz.
@@ -230,13 +326,22 @@ export class MasksState {
     await this.flushStroke(false);
     this.strokeComponentId = null;
     this.strokes.reset();
+    // The path stays on screen until the preview that holds it arrives; dropping it here
+    // would blank the stroke for the round trip it takes to come back.
+    this.liveStale = true;
   }
 
   private async flushStroke(transient: boolean): Promise<void> {
     const componentId = this.strokeComponentId;
-    const op = this.op;
+    const op = this.layer;
     const photoId = this.viewer.photoId;
     if (!componentId || !op || photoId === null) return;
+    // One segment on the wire at a time. Each one is answered with a stack, a frame and a
+    // mask preview, which together outlast the 16 ms between animation frames: sending one
+    // per frame regardless puts the brush behind the pointer by the whole backlog, and the
+    // backlog grows for as long as the drag does. The points wait in the buffer instead and
+    // go out together in the next call, which is also fewer, longer segments to rasterise.
+    if (transient && this.strokeInFlight) return;
     const points = this.strokes.take();
     // Mid-drag with nothing new there is nothing to send. On release the call has to go out
     // even so — it is the non-transient one that snapshots, and without it the whole stroke
@@ -246,6 +351,7 @@ export class MasksState {
     const sending = points.length > 0 ? points : this.anchorPoints();
     const [first, ...rest] = sending;
     if (!first) return;
+    this.strokeInFlight = true;
     try {
       await this.engine.call("mask.stroke", {
         photoId,
@@ -259,6 +365,13 @@ export class MasksState {
       });
     } catch (error) {
       this.status = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.strokeInFlight = false;
+    }
+    // Whatever the pointer drew while that was out goes now rather than at the next
+    // animation frame, so the brush keeps up with a drag that never pauses.
+    if (transient && this.strokeComponentId !== null && this.strokes.pending > 0) {
+      await this.flushStroke(true);
     }
   }
 
@@ -286,12 +399,14 @@ export class MasksState {
   }
 
   /**
-   * Re-asks for the preview when the selected op's mask changed, and not otherwise. Reads
-   * reactive state on purpose: the pane calls it from an `$effect`.
+   * Re-asks for the preview when the selected op's mask changed, or when the engine moved
+   * the photo inside the frame: the raster is view-space and only holds the mask where that
+   * frame showed it, so the one drawn at 4:1 covers a quarter of the photo once the view is
+   * back to fit. Reads reactive state on purpose: the pane calls it from an `$effect`.
    */
   syncPreview(): void {
-    const op = this.op;
-    const signature = maskSignature(op, this.selectedComponentId);
+    const op = this.layer;
+    const signature = `${maskSignature(op, this.selectedComponentId)}@${this.viewer.frameGeometry}`;
     if (signature === this.previewSignature) return;
     this.previewSignature = signature;
     if (!op?.mask || op.mask.components.length === 0) {
@@ -306,7 +421,7 @@ export class MasksState {
 
   /** One preview in flight, one queued behind it — the render loop's rule. */
   requestPreview(): void {
-    const op = this.op;
+    const op = this.layer;
     const photoId = this.viewer.photoId;
     if (!op || photoId === null) return;
     if (this.previewInFlight) {
@@ -350,6 +465,12 @@ export class MasksState {
     const canvas = this.rasterFor(width, height);
     const context = canvas.getContext("2d");
     if (!context) return;
+    // This raster was rendered after the stroke was committed, so it holds it: the hand-drawn
+    // path can go, and the two never both show.
+    if (this.liveStale) {
+      this.live = [];
+      this.liveStale = false;
+    }
     context.putImageData(new ImageData(tintPixels(coverage, this.tint), width, height), 0, 0);
     this.lastCoverage = coverage;
     this.viewer.overlay.redraw();

@@ -21,6 +21,12 @@ struct Rgb8Image {
 std::vector<uint8_t> encode_jpeg(const Rgb8Image& image, int quality);
 Rgb8Image decode_jpeg(std::span<const uint8_t> jpeg);
 
+// The same decode, shrunk during the DCT rather than after it: TurboJPEG picks the smallest
+// of its scaling factors whose output still has `min_long_edge` on the long side. Zero
+// decodes at full size. A thumbnail or a proxy of a 50 MP JPEG costs a fraction of the full
+// decode this way, so the result is whatever size was cheapest and the caller reads it back.
+Rgb8Image decode_jpeg_scaled(std::span<const uint8_t> jpeg, uint32_t min_long_edge);
+
 // Header only: the size of a JPEG without decoding its pixels.
 struct ImageSize {
   uint32_t width = 0;

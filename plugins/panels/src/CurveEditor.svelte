@@ -3,7 +3,7 @@
   // four separate arrays the engine describes. @neoworks-dev/ui has no 2-D point editor —
   // its nearest controls, Select and WheelColumn, are pickers — and a curve is a
   // drag-to-shape control with its own hit testing, so this is the third hand-built
-  // control beside Slider and ValueField. Tokens only, no hex: the graph is an SVG whose
+  // control beside BoxedSlider and ValueField. Tokens only, no hex: the graph is an SVG whose
   // strokes are `var(--color-…)`.
   //
   // It owns no edit state. The points are read back out of `viewer.stack` on every render
@@ -39,7 +39,7 @@
     type CurvePoint,
     type SplitName,
   } from "./curve";
-  import { curveStroke, paramValue, sliderRange, type CurveParams } from "./panels";
+  import { controlValue, curveStroke, sliderRange, type CurveParams } from "./panels";
   import ParamControl from "./ParamControl.svelte";
 
   const {
@@ -90,7 +90,7 @@
     Object.fromEntries(
       op.params.map((spec): [string, unknown] => [
         spec.name,
-        paramValue(viewer.stack, op, spec, opId),
+        controlValue(viewer.stack, op, spec, opId, viewer.maskTarget),
       ]),
     ),
   );

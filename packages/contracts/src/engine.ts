@@ -32,6 +32,13 @@ export type ThumbnailListener = (header: FrameHeader, jpeg: Blob) => void;
  */
 export type MaskListener = (header: FrameHeader, coverage: Uint8Array) => void;
 
+/**
+ * One `LDPT` frame: the photo's depth map, r8, 0 the farthest thing in it and 255 the
+ * nearest. Same borrowed-buffer rule as the two above. Unlike a mask raster it is in image
+ * space and is not sized to any view, so it is drawn through `imageTransform`.
+ */
+export type DepthListener = (header: FrameHeader, depth: Uint8Array) => void;
+
 export interface EngineClient {
   readonly state: EngineConnectionState;
   /** Resolves on the next open socket, immediately when already open. */
@@ -63,4 +70,10 @@ export interface EngineClient {
    * the frame with the call it belongs to. Returns the unsubscribe.
    */
   onMask(listener: MaskListener): () => void;
+  /**
+   * Binary depth maps (LDPT), sent before the `depth.preview` result. One photo has one
+   * map, so unlike a mask there is nothing to pair: the newest frame is the answer.
+   * Returns the unsubscribe.
+   */
+  onDepth(listener: DepthListener): () => void;
 }

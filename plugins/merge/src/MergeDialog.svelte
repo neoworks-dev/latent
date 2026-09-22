@@ -9,15 +9,22 @@
   // like every other slider in the app; the kind switch is three buttons in one raised
   // track, the same shape the library's quick filters use.
   import { kernelContext } from "@latent/contracts";
-  import { Slider } from "@latent/plugin-panels";
+  import { BoxedSlider } from "@latent/plugin-panels";
   import { Button, Card, Checkbox, LoadingSpinner, SectionHeader, Select } from "@neoworks-dev/ui";
   import ImagesIcon from "phosphor-svelte/lib/ImagesIcon";
   import XIcon from "phosphor-svelte/lib/XIcon";
   import {
+    blendOptions,
     boundaryWarpRange,
+    decayRange,
     deghostOptions,
+    foregroundOptions,
+    foregroundThresholdRange,
+    gapFillRange,
     isDeghost,
     isProjection,
+    isTrailBlend,
+    isTrailForeground,
     kindLabels,
     kindSuffixes,
     mergeKinds,
@@ -26,6 +33,7 @@
     projectionOptions,
     showsHdrOptions,
     showsPanoramaOptions,
+    showsStarTrailOptions,
   } from "./merge";
 
   const { paneId: _paneId }: { paneId: string } = $props();
@@ -53,6 +61,16 @@
 
   function onProjection(value: string | string[]): void {
     if (typeof value === "string" && isProjection(value)) merge.setOptions({ projection: value });
+  }
+
+  function onBlend(value: string | string[]): void {
+    if (typeof value === "string" && isTrailBlend(value)) merge.setOptions({ blend: value });
+  }
+
+  function onForeground(value: string | string[]): void {
+    if (typeof value === "string" && isTrailForeground(value)) {
+      merge.setOptions({ foreground: value });
+    }
   }
 </script>
 
@@ -161,6 +179,63 @@
             </div>
           {/if}
 
+          {#if showsStarTrailOptions(merge.kind)}
+            <div data-merge-section="starTrail">
+              <SectionHeader title="Star Trails" />
+              <div class="px-1">
+                <span class="text-2xs text-dim">Blend</span>
+                <div class="mt-1" data-merge-blend={merge.options.blend}>
+                  <Select value={merge.options.blend} options={blendOptions} onChange={onBlend} />
+                </div>
+              </div>
+              <div class="px-1 pt-2" data-merge-gap-fill={merge.options.gapFill}>
+                <BoxedSlider
+                  value={merge.options.gapFill}
+                  range={gapFillRange}
+                  label="Gap Fill"
+                  onInput={(value) => merge.setOptions({ gapFill: value })}
+                  onCommit={(value) => merge.setOptions({ gapFill: value })}
+                  onReset={() => merge.setOptions({ gapFill: 0 })}
+                />
+              </div>
+              <div class="px-1 pt-2" data-merge-decay={merge.options.decay}>
+                <BoxedSlider
+                  value={merge.options.decay}
+                  range={decayRange}
+                  label="Comet Decay"
+                  onInput={(value) => merge.setOptions({ decay: value })}
+                  onCommit={(value) => merge.setOptions({ decay: value })}
+                  onReset={() => merge.setOptions({ decay: 0 })}
+                />
+              </div>
+              <div class="px-1 pt-2">
+                <span class="text-2xs text-dim">Foreground</span>
+                <div class="mt-1" data-merge-foreground={merge.options.foreground}>
+                  <Select
+                    value={merge.options.foreground}
+                    options={foregroundOptions}
+                    onChange={onForeground}
+                  />
+                </div>
+              </div>
+              {#if merge.options.foreground === "firstFrame"}
+                <div
+                  class="px-1 pt-2"
+                  data-merge-foreground-threshold={merge.options.foregroundThreshold}
+                >
+                  <BoxedSlider
+                    value={merge.options.foregroundThreshold}
+                    range={foregroundThresholdRange}
+                    label="Threshold"
+                    onInput={(value) => merge.setOptions({ foregroundThreshold: value })}
+                    onCommit={(value) => merge.setOptions({ foregroundThreshold: value })}
+                    onReset={() => merge.setOptions({ foregroundThreshold: 2 })}
+                  />
+                </div>
+              {/if}
+            </div>
+          {/if}
+
           {#if showsPanoramaOptions(merge.kind)}
             <div data-merge-section="panorama">
               <SectionHeader title="Panorama" />
@@ -174,14 +249,8 @@
                   />
                 </div>
               </div>
-              <div class="px-1 pt-2">
-                <div class="flex items-baseline justify-between text-2xs">
-                  <span class="text-dim">Boundary Warp</span>
-                  <span class="tabular-nums text-muted" data-merge-warp
-                    >{merge.options.boundaryWarp}</span
-                  >
-                </div>
-                <Slider
+              <div class="px-1 pt-2" data-merge-warp={merge.options.boundaryWarp}>
+                <BoxedSlider
                   value={merge.options.boundaryWarp}
                   range={boundaryWarpRange}
                   label="Boundary Warp"

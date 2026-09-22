@@ -10,8 +10,10 @@
 //     server thread has run the work.
 #pragma once
 
+#include "ai/depth.h"
 #include "ai/mask_detect.h"
 #include "catalog/catalog.h"
+#include "catalog/watcher.h"
 #include "export/export_job.h"
 #include "generative/backend.h"
 #include "jobs/worker.h"
@@ -89,6 +91,8 @@ class Server : public EngineApi {
   nlohmann::json catalog_list(int limit) override;
   int64_t detect_mask(int64_t photo_id, const std::string& op_id,
                       const std::string& component_id) override;
+  int64_t estimate_depth(int64_t photo_id) override;
+  bool has_depth(int64_t photo_id) const override;
   std::vector<uint8_t> render_mask_png(int64_t photo_id, const std::string& op_id,
                                        const std::string& component_id, uint32_t max_size) override;
   nlohmann::json start_export(const nlohmann::json& params) override;
@@ -116,6 +120,10 @@ class Server : public EngineApi {
     uint32_t width = 0;
     uint32_t height = 0;
     bool sidecar_loaded = false;
+    // False while the renderer holds only the cached preview (catalog/preview.h). The
+    // photo's own width and height are the real ones either way — only the pixels behind
+    // them are provisional — so nothing downstream has to know which it is looking at.
+    bool full_resolution = false;
     History history;
   };
 
@@ -141,7 +149,10 @@ class Server : public EngineApi {
                                                   const Responder& responder);
   void finish_photo_open(const std::string& path, const std::shared_ptr<DecodedRaw>& raw,
                          const RawMetadata& metadata, const std::string& hash,
-                         const Responder& responder);
+                         const Responder& responder, bool full_resolution);
+  // Replaces a photo opened from its cached preview with the real decode, and tells the
+  // UI its frame is stale. A no-op for a photo that was opened at full resolution.
+  void upgrade_to_full_resolution(int64_t photo_id);
   nlohmann::json photo_open_result(const PhotoState& photo);
   nlohmann::json handle_photo_close(const nlohmann::json& params);
   nlohmann::json handle_stack_get(const nlohmann::json& params);
@@ -150,6 +161,9 @@ class Server : public EngineApi {
   nlohmann::json handle_op_update(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_op_remove(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_history(const nlohmann::json& params, bool redo, Peer* peer);
+  nlohmann::json handle_history_list(const nlohmann::json& params);
+  nlohmann::json handle_history_jump(const nlohmann::json& params, Peer* peer);
+  nlohmann::json handle_history_revert_op(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_view_open(const nlohmann::json& params);
   nlohmann::json handle_view_close(const nlohmann::json& params);
   nlohmann::json handle_view_render(const nlohmann::json& params, Peer* peer);
@@ -168,12 +182,16 @@ class Server : public EngineApi {
                                                           const Responder& responder);
   nlohmann::json handle_catalog_remove(const nlohmann::json& params);
   nlohmann::json handle_job_cancel(const nlohmann::json& params);
+  nlohmann::json handle_preview_prioritize(const nlohmann::json& params);
   // merge.hdr / merge.panorama / merge.hdrPanorama / merge.preview. All four validate here
   // and answer a jobId; the decode and the merge itself run on the worker.
   nlohmann::json handle_merge(MergeKind kind, const nlohmann::json& params, bool preview);
   static MergeKind merge_kind_from_params(const nlohmann::json& params);
   nlohmann::json handle_mask_preview(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_mask_detect(const nlohmann::json& params, Peer* peer);
+  nlohmann::json handle_depth_estimate(const nlohmann::json& params);
+  nlohmann::json handle_depth_status(const nlohmann::json& params);
+  nlohmann::json handle_depth_preview(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_mask_stroke(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_export_run(const nlohmann::json& params);
   nlohmann::json handle_generative_run(const nlohmann::json& params);
@@ -185,6 +203,14 @@ class Server : public EngineApi {
   // thread that owns the device; the backend runs on the worker for as long as it takes;
   // the result lands back here as a stack.changed. Never automatic — only this call.
   int64_t start_generative(PhotoState& photo, const std::string& op_id);
+  // The same call for `denoise` and `upscale` (issues #51, #52): no mask, no crop, the
+  // whole frame rendered once and handed over as it is.
+  GenerativeRequest whole_frame_request(const PhotoState& photo, const Op& op, const Stack& input);
+  // Hands `request` to the worker and wires its progress, cancellation and result back.
+  // Both paths above end here, so a job behaves the same whichever op started it.
+  int64_t submit_generative(const PhotoState& photo, const std::string& op_id,
+                            const GenerativeRequest& request, const std::string& backend_name,
+                            const std::string& input_hash, const std::vector<double>& rect);
   void finish_generative(int64_t photo_id, const std::string& op_id, int64_t job_id,
                          const std::string& input_hash, const std::vector<double>& rect,
                          const GenerativeResult& result);
@@ -221,11 +247,38 @@ class Server : public EngineApi {
   // Reloads the PNG cache of every AI component a freshly opened sidecar carries.
   void load_mask_rasters(const PhotoState& photo);
 
+  // One depth.estimate run (PROMPT.md 3.8): renders the photo on the server thread, runs
+  // the model on the worker, and lands the map back here as a PNG next to the sidecar plus
+  // a `depth.changed` notification. The map is the scene's, not the stack's, so it is not
+  // edit state and never touches history; re-running it is always the user's ask.
+  int64_t start_depth_estimate(PhotoState& photo);
+  void finish_depth_estimate(int64_t photo_id, int64_t job_id, const DepthResult& result);
+  // Reloads `<photo>.latent.d/depth.png` when a photo is opened.
+  void load_depth_map(const PhotoState& photo);
+
+  // The body behind catalog.import, and behind a folder watch that has just seen files
+  // land: three job ids and one import on the worker. Answers catalog.import's result.
+  nlohmann::json start_import(const std::vector<std::string>& paths, bool recursive);
+  // Re-arms the watches the catalog remembers. Called once the loop is up, because the
+  // watcher answers on its own thread and its answers are posted back here.
+  void arm_folder_watches();
+  // The watcher's callback, on the watcher thread: keep the photos, drop everything else,
+  // and hand the rest to the same import a catalog.import would have run.
+  void on_watched_files(std::vector<std::string> paths);
+
   // `thumbnail_job_id` was handed out with catalog.import's result, so the thumbnail job
   // always reports — with total 0 when the import found nothing or was cancelled.
-  void import_job(int64_t job_id, int64_t thumbnail_job_id, const std::vector<std::string>& paths,
-                  bool recursive);
+  void import_job(int64_t job_id, int64_t thumbnail_job_id, int64_t preview_job_id,
+                  const std::vector<std::string>& paths, bool recursive);
   void thumbnail_job(int64_t job_id, int64_t parent_job_id, const std::vector<int64_t>& photo_ids);
+  // The prewarm (catalog/preview.h): one full decode per imported photo, scaled into the
+  // preview cache so opening any of them later costs a file read instead of LibRaw. Runs
+  // on `preview_worker_` — hundreds of decodes long, and nothing may queue behind it.
+  void preview_job(int64_t job_id, int64_t parent_job_id, std::vector<int64_t> photo_ids);
+  // Pulls the next photo out of a preview job's queue: whatever preview.prioritize last
+  // named and is still pending, else the head. The photo you are looking at is the one
+  // whose preview you are about to want.
+  std::optional<int64_t> take_next_preview(std::vector<int64_t>& pending);
   // A job is running from the moment it is queued until its `finished` progress goes out.
   void job_started(int64_t job_id);
   void job_finished(int64_t job_id);
@@ -261,9 +314,10 @@ class Server : public EngineApi {
 
   nlohmann::json stack_state(const PhotoState& photo);
   // `client` is the stack.changed label one step finer than `source` ("mcp:run_python");
-  // empty means "same as source".
+  // empty means "same as source". `label` is what the history row should call this step
+  // when the caller knows better than the diff does ("Golden hour applied").
   void commit(PhotoState& photo, Stack next, bool transient, std::string_view source, Peer* origin,
-              std::string_view client = {});
+              std::string_view client = {}, std::string label = {});
   void save_sidecar(PhotoState& photo);
   OffscreenFrame render_offscreen(int64_t photo_id, uint32_t max_size);
   // The same, over a stack the caller chose rather than the photo's current one: what
@@ -314,10 +368,22 @@ class Server : public EngineApi {
   std::mutex jobs_mutex_;
   std::set<int64_t> running_jobs_;
   std::set<int64_t> cancelled_jobs_;
+  // photoIds the UI is looking at, newest first: what preview.prioritize last named.
+  // Written by the server thread, read by the preview worker.
+  std::mutex preview_priority_mutex_;
+  std::vector<int64_t> preview_priority_;
   Catalog catalog_;
+  // Torn down first in ~Server: its thread can be mid-callback into the worker.
+  std::unique_ptr<FolderWatcher> watcher_;
   // The stub or the "model not installed" one, picked once at startup (ai/mask_detect.h).
   std::unique_ptr<MaskDetector> mask_detector_;
+  // The same seam for monocular depth (ai/depth.h).
+  std::unique_ptr<DepthEstimator> depth_estimator_;
   Worker worker_;
+  // A second thread for the prewarm only. The one `worker_` runs tasks in submission
+  // order on purpose (jobs/worker.h), so an import's preview queue on it would park every
+  // photo.open behind several hundred decodes.
+  Worker preview_worker_;
   std::unique_ptr<PythonHost> python_;
 };
 

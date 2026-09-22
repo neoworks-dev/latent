@@ -1,9 +1,11 @@
 #include "raw/raw_decode.h"
 
+#include "image/import_image.h"
 #include "merge/source_image.h"
 
 #include <chrono>
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 
@@ -21,7 +23,7 @@ using ProcessedImage = std::unique_ptr<libraw_processed_image_t, ProcessedImageD
 
 }  // namespace
 
-DecodedRaw decode_raw(const std::string& path) {
+DecodedRaw decode_raw(const std::string& path, uint32_t min_long_edge) {
   using clock = std::chrono::steady_clock;
   const auto started = clock::now();
 
@@ -32,6 +34,14 @@ DecodedRaw decode_raw(const std::string& path) {
   // so a TIFF-based raw still goes to LibRaw.
   if (is_source_tiff(path)) {
     DecodedRaw out = read_source_tiff(path);
+    out.decode_ms = std::chrono::duration<double, std::milli>(clock::now() - started).count();
+    return out;
+  }
+
+  // A PNG or a JPEG is developed already: no Bayer pattern to interpolate and no camera
+  // matrix to apply, only a transfer function and an ICC profile to undo (image/import_image.h).
+  if (is_rendered_extension(path)) {
+    DecodedRaw out = decode_rendered_image(path, min_long_edge);
     out.decode_ms = std::chrono::duration<double, std::milli>(clock::now() - started).count();
     return out;
   }
@@ -52,6 +62,12 @@ DecodedRaw decode_raw(const std::string& path) {
   if (status != LIBRAW_SUCCESS) {
     throw std::runtime_error(std::string("open_file: ") + libraw_strerror(status));
   }
+  // Only decidable once identify() has run, so it sits between open_file and unpack rather
+  // than with the other params above. `half_size` is read by dcraw_process, not by unpack.
+  const auto& sizes = raw.imgdata.sizes;
+  const uint32_t long_edge = std::max(sizes.width, sizes.height);
+  if (min_long_edge > 0 && long_edge / 2 >= min_long_edge) params.half_size = 1;
+
   status = raw.unpack();
   if (status != LIBRAW_SUCCESS) {
     throw std::runtime_error(std::string("unpack: ") + libraw_strerror(status));

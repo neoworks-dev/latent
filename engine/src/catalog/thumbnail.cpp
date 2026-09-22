@@ -1,7 +1,7 @@
 #include "catalog/thumbnail.h"
 
+#include "image/import_image.h"
 #include "image/jpeg.h"
-#include "raw/raw_metadata.h"
 
 #include <cstdlib>
 
@@ -57,9 +57,9 @@ void forget_thumbnails(const std::string& key) {
   }
 }
 
-Thumbnail make_thumbnail(const std::string& raw_path, const std::string& cache_path,
+Thumbnail make_thumbnail(const std::string& photo_path, const std::string& cache_path,
                          uint32_t size) {
-  const Rgb8Image image = load_raw_preview(raw_path, size);
+  const Rgb8Image image = load_photo_preview(photo_path, size);
   Thumbnail thumbnail;
   thumbnail.width = image.width;
   thumbnail.height = image.height;

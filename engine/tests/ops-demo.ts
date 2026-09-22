@@ -42,6 +42,7 @@ const strongValues: Record<string, Record<string, unknown>> = {
   sharpening: { amount: 100, radius: 1.2, detail: 40, masking: 30 },
   noise_reduction: { luminance: 40, detail: 50, contrast: 20 },
   color_noise_reduction: { amount: 50, detail: 50, smoothness: 50 },
+  manual_denoise: { luminance: 50, detail: 50, color: 70, colorDetail: 50 },
   chromatic_aberration: { enabled: true },
   lens_correction: { distortion: 30, vignetting: 40 },
   defringe: { purpleAmount: 60, greenAmount: 40 },

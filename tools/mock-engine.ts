@@ -7,6 +7,9 @@
 //   bun run mock-engine [--port 0]
 import type {
   EngineHelloResult,
+  Histogram,
+  HistoryListResult,
+  HistoryStep,
   Mask,
   MaskComponent,
   NotificationName,
@@ -19,6 +22,7 @@ import type {
   PhotoOpenResult,
   PythonRunResult,
   StackChangedParams,
+  OpAddResult,
   StackGetResult,
 } from "@latent/protocol";
 import { FRAME_HEADER_BYTES } from "@latent/protocol";
@@ -42,7 +46,9 @@ import {
   FIT,
   geometryMap,
   type MockGeometryMap,
+  type MockInsets,
   type MockViewport,
+  NO_INSETS,
   coverageOf,
   isAiKind,
   maskFrame,
@@ -292,6 +298,68 @@ export const opDefinitions: OpDefinition[] = [
   ...generativeDefinitions,
 ];
 
+/** Every op of a stack, group children included: an id is unique across the photo. */
+function flattenOps(stack: Op[]): Op[] {
+  return stack.flatMap((op) => [op, ...(op.ops ?? [])]);
+}
+
+/**
+ * One rewrite over every op, children included. `inGroup` says the op is under a layer's
+ * mask, which is what decides whether a write may carry a mask or an opacity of its own.
+ */
+function mapOps(stack: Op[], rewrite: (op: Op, inGroup: boolean) => Op): Op[] {
+  return stack.map((op) => {
+    const mapped = rewrite(op, false);
+    if (!mapped.ops) return mapped;
+    return { ...mapped, ops: mapped.ops.map((child) => rewrite(child, true)) };
+  });
+}
+
+/** Only a scalar can be printed in a history row; a curve's point list is left off. */
+function scalarOr(value: unknown): number | string | boolean | undefined {
+  if (typeof value === "number" || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * What one commit changed, the engine's `describe_step` (engine/src/ops/history_diff.cpp)
+ * in the mock's terms: the first difference in stack order, because one commit is one user
+ * action.
+ */
+function describeStep(before: Op[], after: Op[]): Omit<HistoryStep, "index"> {
+  const old = flattenOps(before);
+  const next = flattenOps(after);
+  const added = next.find((op) => !old.some((entry) => entry.id === op.id));
+  if (added) return { kind: "add", op: added.op, opId: added.id };
+  const removed = old.find((op) => !next.some((entry) => entry.id === op.id));
+  if (removed) return { kind: "remove", op: removed.op, opId: removed.id };
+  for (const op of next) {
+    const was = old.find((entry) => entry.id === op.id);
+    if (!was) continue;
+    if (JSON.stringify(was.mask ?? null) !== JSON.stringify(op.mask ?? null)) {
+      return { kind: "mask", op: op.op, opId: op.id };
+    }
+    const keys = [...new Set([...Object.keys(was.params), ...Object.keys(op.params)])];
+    const changes = keys
+      .filter((key) => JSON.stringify(was.params[key]) !== JSON.stringify(op.params[key]))
+      .map((param) => ({
+        param,
+        from: scalarOr(was.params[param]),
+        to: scalarOr(op.params[param]),
+      }));
+    if (was.enabled !== op.enabled) {
+      changes.push({ param: "enabled", from: was.enabled, to: op.enabled });
+    }
+    if ((was.opacity ?? 100) !== (op.opacity ?? 100)) {
+      changes.push({ param: "opacity", from: was.opacity ?? 100, to: op.opacity ?? 100 });
+    }
+    if (changes.length > 0) return { kind: "update", op: op.op, opId: op.id, changes };
+  }
+  return { kind: "reorder" };
+}
+
 /**
  * The op-stack with the engine's history semantics: snapshots plus a cursor, never a
  * pop. A transient mutation (slider being dragged) changes the live stack without
@@ -320,6 +388,10 @@ export class PhotoState {
       revision: this.revision,
       canUndo: this.canUndo,
       canRedo: this.canRedo,
+      // Undo steps, not writes: a drag moves the cursor once however many transient
+      // mutations it made, which is what the Stack readout shows.
+      historyIndex: this.cursor,
+      historyDepth: this.history.length,
     };
   }
 
@@ -337,10 +409,30 @@ export class PhotoState {
     index?: number,
     transient = false,
     layer: LayerWrite = {},
+    parentId?: string,
   ): Op {
     const entry: Op = { id: `op${this.nextOpId++}`, op, params: { ...params }, enabled: true };
+    // A group is a layer: no params of its own, and always a list, empty included.
+    if (op === "group") entry.ops = [];
     if (layer.mask) entry.mask = { components: layer.mask.components.map(seedState) };
     if (layer.opacity !== undefined) entry.opacity = layer.opacity;
+    // Into a layer: the child shares that group's mask, so it carries neither mask nor
+    // opacity of its own (protocol OpAddParams.parentId).
+    if (parentId !== undefined) {
+      const parent = this.stack.find((candidate) => candidate.id === parentId);
+      if (!parent?.ops) throw new Error(`op ${parentId} is not a group`);
+      delete entry.mask;
+      delete entry.opacity;
+      const children = [...parent.ops];
+      children.splice(index ?? children.length, 0, entry);
+      this.commit(
+        this.stack.map((candidate) =>
+          candidate.id === parentId ? { ...candidate, ops: children } : candidate,
+        ),
+        transient,
+      );
+      return entry;
+    }
     const next = [...this.stack];
     next.splice(index ?? next.length, 0, entry);
     this.commit(next, transient);
@@ -359,13 +451,16 @@ export class PhotoState {
     transient: boolean,
     layer: LayerWrite = {},
   ): void {
-    const next = this.stack.map((entry) => {
+    const next = mapOps(this.stack, (entry, inGroup) => {
       if (entry.id !== opId) return entry;
       const updated: Op = {
         ...entry,
         params: { ...entry.params, ...params },
         enabled: enabled ?? entry.enabled,
       };
+      // Inside a group the mask and the opacity belong to the group, so a write that
+      // carries either is ignored, the way the engine ignores it with a warning.
+      if (inGroup) return updated;
       if (layer.opacity !== undefined) updated.opacity = layer.opacity;
       if (layer.mask === null) delete updated.mask;
       else if (layer.mask) updated.mask = layer.mask;
@@ -374,11 +469,15 @@ export class PhotoState {
     this.commit(mergeEngineOwned(this.stack, next), transient);
   }
 
+  /** A layer goes with everything under it; a child goes from its layer. */
   removeOp(opId: string): void {
-    this.commit(
-      this.stack.filter((entry) => entry.id !== opId),
-      false,
-    );
+    const next = this.stack
+      .filter((entry) => entry.id !== opId)
+      .map((entry) => {
+        if (!entry.ops) return entry;
+        return { ...entry, ops: entry.ops.filter((child) => child.id !== opId) };
+      });
+    this.commit(next, false);
   }
 
   setStack(stack: Op[]): void {
@@ -396,11 +495,11 @@ export class PhotoState {
     patch: (component: MaskComponent) => MaskComponent,
     transient: boolean,
   ): MaskComponent {
-    const op = this.stack.find((entry) => entry.id === opId);
+    const op = flattenOps(this.stack).find((entry) => entry.id === opId);
     const component = op?.mask?.components.find((entry) => entry.id === componentId);
     if (!op || !component) throw new Error(`unknown mask component ${componentId}`);
     const patched = patch(component);
-    const next = this.stack.map((entry) => {
+    const next = mapOps(this.stack, (entry) => {
       if (entry.id !== opId || !entry.mask) return entry;
       const components = entry.mask.components.map((candidate) =>
         candidate.id === componentId ? patched : candidate,
@@ -412,14 +511,14 @@ export class PhotoState {
   }
 
   component(opId: string, componentId: string): MaskComponent {
-    const op = this.stack.find((entry) => entry.id === opId);
+    const op = flattenOps(this.stack).find((entry) => entry.id === opId);
     const component = op?.mask?.components.find((entry) => entry.id === componentId);
     if (!component) throw new Error(`unknown mask component ${componentId}`);
     return component;
   }
 
   maskOf(opId: string): Mask {
-    const op = this.stack.find((entry) => entry.id === opId);
+    const op = flattenOps(this.stack).find((entry) => entry.id === opId);
     if (!op) throw new Error(`unknown opId ${opId}`);
     if (!op.mask) throw new Error(`op ${opId} has no mask`);
     return op.mask;
@@ -428,6 +527,24 @@ export class PhotoState {
   undo(): void {
     if (!this.canUndo) return;
     this.moveCursor(this.cursor - 1);
+  }
+
+  /** The undo stack described: one row per snapshot, oldest first, plus where the cursor is. */
+  historyList(): HistoryListResult {
+    const entries = this.history.map((stack, index) => {
+      const previous = this.history[index - 1];
+      if (index === 0 || !previous) return { index, kind: "initial" as const };
+      return { ...describeStep(previous, stack), index };
+    });
+    return { entries, index: this.cursor };
+  }
+
+  /** Straight to one snapshot: clicking a row of the history list. */
+  jump(index: number): void {
+    if (!Number.isInteger(index) || index < 0 || index >= this.history.length) {
+      throw new Error(`no history step ${index}`);
+    }
+    this.moveCursor(index);
   }
 
   redo(): void {
@@ -570,6 +687,8 @@ interface View {
   seq: number;
   /** Zoom and pan, sticky per view exactly as in the engine. */
   viewport: MockViewport;
+  /** The client's floating panels, sticky in the same way. */
+  insets: MockInsets;
 }
 
 interface RpcRequest {
@@ -620,6 +739,54 @@ const maskPreviewMaxEdge = 512;
  * The mask and opacity of an `op.add` / `op.update`. `mask: null` is a clear and has to be
  * told apart from an absent one, which leaves the mask alone.
  */
+/**
+ * The engine's histogram of a rendered frame: 256 bins a channel over the image rect, the
+ * letterbox left out, with the rect clipped to the frame the way a zoomed view needs.
+ */
+export function histogramOf(
+  frame: ArrayBuffer,
+  width: number,
+  height: number,
+  content: ContentRect,
+): Histogram {
+  const pixels = new Uint8Array(frame, FRAME_HEADER_BYTES);
+  const red = new Array<number>(256).fill(0);
+  const green = new Array<number>(256).fill(0);
+  const blue = new Array<number>(256).fill(0);
+  const left = Math.max(0, Math.round(content[0]));
+  const top = Math.max(0, Math.round(content[1]));
+  const right = Math.min(width, Math.round(content[0] + content[2]));
+  const bottom = Math.min(height, Math.round(content[1] + content[3]));
+  let clippedLow = 0;
+  let clippedHigh = 0;
+  for (let y = top; y < bottom; y++) {
+    for (let x = left; x < right; x++) {
+      const texel = (y * width + x) * 4;
+      const r = pixels[texel] ?? 0;
+      const g = pixels[texel + 1] ?? 0;
+      const b = pixels[texel + 2] ?? 0;
+      red[r] = (red[r] ?? 0) + 1;
+      green[g] = (green[g] ?? 0) + 1;
+      blue[b] = (blue[b] ?? 0) + 1;
+      const high = Math.max(r, g, b);
+      if (high <= 1) clippedLow += 1;
+      if (high >= 254) clippedHigh += 1;
+    }
+  }
+  const total = Math.max(0, right - left) * Math.max(0, bottom - top);
+  if (total === 0) {
+    return { bins: 256, r: red, g: green, b: blue, clippedShadowsPct: 0, clippedHighlightsPct: 0 };
+  }
+  return {
+    bins: 256,
+    r: red,
+    g: green,
+    b: blue,
+    clippedShadowsPct: (100 * clippedLow) / total,
+    clippedHighlightsPct: (100 * clippedHigh) / total,
+  };
+}
+
 function layerWrite(params: Record<string, unknown>): LayerWrite {
   const write: LayerWrite = {};
   if (params.mask === null) write.mask = null;
@@ -793,6 +960,7 @@ export class MockEngine {
         height: Number(params.height),
         seq: 0,
         viewport: FIT,
+        insets: NO_INSETS,
       });
       return { result: { viewId } };
     }
@@ -821,6 +989,11 @@ export class MockEngine {
     }
     if (method === "job.cancel")
       return { result: { cancelled: this.cancelJob(Number(params.jobId)) } };
+    // The mock has no preview queue to reorder; it answers so the UI's hint is not an error.
+    if (method === "preview.prioritize") {
+      const photoIds = params.photoIds as number[] | undefined;
+      return { result: { prioritized: photoIds?.length ?? 0 } };
+    }
     if (method.startsWith("catalog.")) return this.handleCatalog(method, params);
     if (method === "generative.status") return { result: generativeStatus() };
     if (method === "generative.run") {
@@ -829,6 +1002,10 @@ export class MockEngine {
         result: { jobId: this.startGenerative(photoId, idOf(params.opId)) },
         changed: photoId,
       };
+    }
+    // Read-only, and its result is not a stack snapshot, so it never reaches handleStack.
+    if (method === "history.list") {
+      return { result: this.photo(Number(params.photoId)).historyList() };
     }
     if (method.startsWith("mask.")) return this.handleMask(method, params);
     if (method.startsWith("merge.")) return this.merges.handle(method, params);
@@ -853,6 +1030,7 @@ export class MockEngine {
     revision: number;
     map: MockGeometryMap;
     viewport: MockViewport;
+    histogram: Histogram;
   } {
     const view = this.views.get(viewId);
     if (!view) throw new Error(`unknown viewId ${viewId}`);
@@ -866,7 +1044,7 @@ export class MockEngine {
     const fitted = applyGeometry(frame, FRAME_HEADER_BYTES, view.width, view.height, resolved);
     // Zoom and pan are one more scale of the picture that is now in the buffer, and the
     // matrix that goes out carries both halves (tools/mock-masks.ts).
-    const map = geometryMap(resolved, fitted, view.width, view.height, view.viewport);
+    const map = geometryMap(resolved, fitted, view.width, view.height, view.viewport, view.insets);
     applyViewport(frame, FRAME_HEADER_BYTES, view.width, view.height, fitted, map);
     return {
       frame,
@@ -880,6 +1058,8 @@ export class MockEngine {
       // The state these pixels came from: a client compares it with the revision of the
       // last stack.changed to know whether its canvas is current.
       revision: photo.revision,
+      // Counted off the pixels that are about to go out, as the engine does.
+      histogram: histogramOf(frame, view.width, view.height, map.content),
     };
   }
 
@@ -888,6 +1068,19 @@ export class MockEngine {
     if (!view || !width || !height) return;
     view.width = width;
     view.height = height;
+  }
+
+  /** `view.render`'s insets: what the client floats over the frame, sticky per view. */
+  setInsets(viewId: number, given: unknown): void {
+    const view = this.views.get(viewId);
+    if (!view || !given || typeof given !== "object") return;
+    const fields = given as Record<string, unknown>;
+    view.insets = {
+      left: Math.max(0, numberOf(fields.left, 0)),
+      top: Math.max(0, numberOf(fields.top, 0)),
+      right: Math.max(0, numberOf(fields.right, 0)),
+      bottom: Math.max(0, numberOf(fields.bottom, 0)),
+    };
   }
 
   /** `view.render`'s viewport: sticky per view, absent leaves it where it was. */
@@ -916,7 +1109,10 @@ export class MockEngine {
   private handleCatalog(method: string, params: Record<string, unknown>): HandledCall {
     if (method === "catalog.import") {
       const paths = (params.paths ?? []) as string[];
-      return { result: this.startImport(paths, params.recursive !== false) };
+      const recursive = params.recursive !== false;
+      // Directories become watched roots, files never do — same rule as the engine's.
+      for (const path of paths) this.catalog.watchFolder(path, recursive);
+      return { result: this.startImport(paths, recursive) };
     }
     if (method === "catalog.list") return { result: this.catalog.list(params) };
     if (method === "catalog.get") return { result: this.catalog.photo(Number(params.photoId)) };
@@ -1226,13 +1422,16 @@ export class MockEngine {
   private startImport(
     paths: string[],
     recursive: boolean,
-  ): { jobId: number; thumbnailJobId: number } {
+  ): { jobId: number; thumbnailJobId: number; previewJobId: number } {
     const jobId = this.nextJobId++;
     const thumbnailJobId = this.nextJobId++;
+    const previewJobId = this.nextJobId++;
     const job: Job = { cancelled: false, finished: false };
     const thumbnailJob: Job = { cancelled: false, finished: false };
+    const previewJob: Job = { cancelled: false, finished: false };
     this.jobs.set(jobId, job);
     this.jobs.set(thumbnailJobId, thumbnailJob);
+    this.jobs.set(previewJobId, previewJob);
     const files = scanRawFiles(paths, recursive);
     const total = files.length;
     let done = 0;
@@ -1261,6 +1460,19 @@ export class MockEngine {
         finished: true,
         state,
         message: `${thumbnails} thumbnails`,
+      });
+      // The real engine decodes every imported photo into its preview cache on a thread of
+      // its own; here it is instant, so the job exists only to drive the same badge.
+      previewJob.finished = true;
+      this.broadcast("job.progress", {
+        jobId: previewJobId,
+        parentJobId: jobId,
+        kind: "previews",
+        done: thumbnails,
+        total: thumbnails,
+        finished: true,
+        state,
+        message: `${thumbnails} previews`,
       });
     };
 
@@ -1292,10 +1504,10 @@ export class MockEngine {
 
     if (total === 0) {
       this.timer(() => finish("done", "no raw files found"), 30);
-      return { jobId, thumbnailJobId };
+      return { jobId, thumbnailJobId, previewJobId };
     }
     this.timer(tick, 60);
-    return { jobId, thumbnailJobId };
+    return { jobId, thumbnailJobId, previewJobId };
   }
 
   /** A cancellable job id, for work that runs outside this class (Photo Merge). */
@@ -1382,7 +1594,12 @@ export class MockEngine {
     this.timers.add(handle);
   }
 
-  private handleStack(method: string, params: Record<string, unknown>): StackGetResult {
+  // `op.add` answers with the new op's id beside the snapshot (protocol OpAddResult);
+  // every other method here answers with the snapshot alone.
+  private handleStack(
+    method: string,
+    params: Record<string, unknown>,
+  ): StackGetResult | OpAddResult {
     const photo = this.photo(Number(params.photoId));
     const opParams = (params.params ?? {}) as Record<string, unknown>;
     if (method === "stack.get") return photo.snapshot();
@@ -1394,14 +1611,17 @@ export class MockEngine {
       return photo.snapshot();
     }
     if (method === "op.add") {
-      photo.addOp(
+      const added = photo.addOp(
         String(params.op),
         opParams,
         params.index as number | undefined,
         params.transient === true,
         layerWrite(params),
+        params.parentId === undefined ? undefined : idOf(params.parentId),
       );
-      return photo.snapshot();
+      // The id goes back with the stack: a caller that added into a layer cannot find the
+      // op by position (protocol OpAddResult).
+      return { ...photo.snapshot(), opId: added.id };
     }
     if (method === "op.update") {
       const enabled = typeof params.enabled === "boolean" ? params.enabled : undefined;
@@ -1424,6 +1644,10 @@ export class MockEngine {
     }
     if (method === "history.redo") {
       photo.redo();
+      return photo.snapshot();
+    }
+    if (method === "history.jump") {
+      photo.jump(Number(params.index));
       return photo.snapshot();
     }
     throw new Error(`unknown method ${method}`);
@@ -1468,6 +1692,7 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
               params.height as number | undefined,
             );
             engine.setViewport(viewId, params.viewport);
+            engine.setInsets(viewId, params.insets);
             const rendered = engine.render(viewId, params.geometry === "full" ? "full" : "stack");
             socket.send(new Uint8Array(rendered.frame));
             reply(socket, request.id, {
@@ -1482,6 +1707,7 @@ export function startMockEngine(port: number): { port: number; stop: () => void 
               renderMs: rendered.renderMs,
               readbackMs: 0,
               revision: rendered.revision,
+              histogram: rendered.histogram,
             });
             return;
           }

@@ -7,15 +7,43 @@ import type { Component } from "svelte";
 export interface PaneDefinition {
   id: string;
   title: string;
-  /** Which shell region the pane belongs to. */
-  region: "center" | "right" | "bottom" | "left";
+  /**
+   * Which shell region the pane belongs to. `rail` is not a column: the rail draws a button
+   * for the pane and opens it as a flyout beside itself, which is what a panel needs that
+   * has to stay open while the Edit column is being used — Masks is one.
+   */
+  region: "center" | "right" | "bottom" | "left" | "rail";
   order?: number;
   /**
    * Rail mode this pane belongs to — "edit", "info", later "crop", "masks". A pane
    * without one is not mode-specific and shows whatever the rail is on.
    */
   mode?: string;
+  /**
+   * Draw the pane without the card's title bar. For a pane that is already a list of
+   * headed sections — the Edit column is one — a second heading above it says nothing.
+   * It also gives up the drag handle, so such a pane neither reorders nor detaches.
+   */
+  untitled?: boolean;
+  /**
+   * Drawn in the card's title bar, right of the heading: the pane's own controls. A
+   * generated panel puts its Reset there, so the card keeps one header rather than
+   * growing a second one under the first.
+   */
+  headerActions?: Component<{ paneId: string }>;
   component: Component<{ paneId: string }>;
+}
+
+/**
+ * What the shell floats over the viewer, in CSS pixels: the cards' own edges. The viewer
+ * hands it to the engine as `view.render`'s insets, so a fitted photo sits in the hole
+ * between the panels while a zoomed one runs on behind them. Layout, never edit state.
+ */
+export interface SafeArea {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
 }
 
 export interface PaneRegistry {
@@ -28,6 +56,16 @@ export interface PaneRegistry {
    */
   readonly mode: string;
   setMode(mode: string): void;
+  /**
+   * The `rail` pane whose flyout is open, null when none is. It is not a mode: the flyout
+   * stays open across every mode, because the point of it is to edit a mask with the Edit
+   * column's own sliders. A plugin sets it to hand over — the Edit column's mask badge does.
+   */
+  readonly railPane: string | null;
+  setRailPane(id: string | null): void;
+  /** The area the floating cards leave clear. The shell measures it; the viewer reads it. */
+  readonly safeArea: SafeArea;
+  setSafeArea(area: SafeArea): void;
 }
 
 /** The panes a rail mode shows: its own, plus everything that is not mode-specific. */

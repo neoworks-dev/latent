@@ -11,10 +11,23 @@ const aiKinds: readonly MaskComponentKind[] = [
   "objects",
   "people",
   "text",
+  "trails",
 ];
 
 export function isAiKind(kind: MaskComponentKind): boolean {
   return aiKinds.includes(kind);
+}
+
+/**
+ * Kinds whose detection needs a gesture first: creating one arms a tool instead of running
+ * a detection that would only answer that it has nothing to go on. `trails` is one of them
+ * and is not in the menu below: its gesture is a freehand stroke along one aircraft trail,
+ * and the Planes rail mode (`plugins/planes`) owns both the stroke and what follows it.
+ */
+const seededKinds: readonly MaskComponentKind[] = ["objects", "trails"];
+
+export function needsSeedGesture(kind: MaskComponentKind): boolean {
+  return seededKinds.includes(kind);
 }
 
 export type KindGroup = "ai" | "manual" | "range";
@@ -143,9 +156,37 @@ export function opById(stack: Op[], opId: string | null): Op | undefined {
   return stack.find((op) => op.id === opId);
 }
 
-/** The op the column opens on: the last one carrying a mask, the way a layer list reads. */
-export function lastMaskedOp(stack: Op[]): Op | undefined {
-  return [...stack].reverse().find((op) => (op.mask?.components.length ?? 0) > 0);
+/**
+ * A layer: one mask, one opacity, and the adjustments that share them. The engine calls the
+ * stack entry a group (protocol Op.ops); this column calls it a mask, because that is what
+ * the user made.
+ */
+export function isLayer(op: Op): boolean {
+  return op.op === "group";
+}
+
+export function layersOf(stack: Op[]): Op[] {
+  return stack.filter(isLayer);
+}
+
+/**
+ * The layer the panel is pointed at: the selected one, or the one holding the selected
+ * adjustment — the Layers column can point at a child. Nothing selected is the photo itself
+ * and not the topmost mask: the Edit column's sliders follow this, and a slider must never
+ * land in a mask the user did not pick.
+ */
+export function layerOf(stack: Op[], selectedOpId: string | null): Op | undefined {
+  const layers = layersOf(stack);
+  const selected = layers.find((layer) => layer.id === selectedOpId);
+  if (selected) return selected;
+  return layers.find((layer) => (layer.ops ?? []).some((op) => op.id === selectedOpId));
+}
+
+/** "Mask 2 · Subject, Brush" — the number the list shows, then what is in it. */
+export function layerLabel(layer: Op, index: number): string {
+  const kinds = [...new Set((layer.mask?.components ?? []).map((component) => component.kind))];
+  if (kinds.length === 0) return `Mask ${index + 1}`;
+  return `Mask ${index + 1} · ${kinds.join(", ")}`;
 }
 
 /**

@@ -460,16 +460,28 @@ export function maskFrame(
  */
 export function mergeEngineOwned(previous: Op[], next: Op[]): Op[] {
   const known = new Map<string, MaskComponent>();
-  for (const op of previous) {
+  for (const op of withChildren(previous)) {
     for (const component of op.mask?.components ?? []) known.set(component.id, component);
   }
-  return next.map((op) => {
+  const carry = (op: Op): Op => {
     if (!op.mask) return op;
     const components = op.mask.components.map((component) =>
       seedState(carryEngineOwned(known.get(component.id), component)),
     );
     return { ...op, mask: { components } };
+  };
+  return next.map((op) => {
+    const carried = carry(op);
+    // A layer's children have no mask of their own, but they still have to survive the
+    // round trip (protocol Op.ops).
+    if (!carried.ops) return carried;
+    return { ...carried, ops: carried.ops.map(carry) };
   });
+}
+
+/** A stack read flat: every op, a layer's children included. */
+function withChildren(stack: Op[]): Op[] {
+  return stack.flatMap((op) => [op, ...(op.ops ?? [])]);
 }
 
 function carryEngineOwned(
@@ -499,9 +511,14 @@ export function seedState(component: MaskComponent): MaskComponent {
 
 /** Every component of every op given a state, for a stack that arrived from a client. */
 export function seedComponentStates(stack: Op[]): Op[] {
-  return stack.map((op) => {
+  const seed = (op: Op): Op => {
     if (!op.mask) return op;
     return { ...op, mask: { components: op.mask.components.map(seedState) } };
+  };
+  return stack.map((op) => {
+    const seeded = seed(op);
+    if (!seeded.ops) return seeded;
+    return { ...seeded, ops: seeded.ops.map(seed) };
   });
 }
 
@@ -565,6 +582,16 @@ export interface MockViewport {
 
 export const FIT: MockViewport = { scale: 1, centerX: 0.5, centerY: 0.5, fit: true };
 
+/** `view.render`'s insets: what the client floats over the frame, in frame pixels. */
+export interface MockInsets {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+export const NO_INSETS: MockInsets = { left: 0, top: 0, right: 0, bottom: 0 };
+
 export interface MockGeometryMap {
   /** `[x, y, width, height]` of the image inside the frame, zoom included. */
   content: ContentRect;
@@ -623,8 +650,21 @@ function contentToImage(geometry: Geometry, frameWidth: number, frameHeight: num
   );
 }
 
-function place(view: number, extent: number, centre: number, fit: boolean): number {
-  if (fit || extent <= view) return Math.round((view - extent) / 2);
+function place(
+  view: number,
+  extent: number,
+  centre: number,
+  fit: boolean,
+  insetStart = 0,
+  insetEnd = 0,
+): number {
+  // Fitted, the rect is centred in the view minus the client's panels; zoomed, it is
+  // placed over the whole view and may run behind them.
+  if (fit) {
+    const inner = Math.max(1, view - insetStart - insetEnd);
+    return Math.round(insetStart + (inner - extent) / 2);
+  }
+  if (extent <= view) return Math.round((view - extent) / 2);
   return Math.round(Math.min(0, Math.max(view - extent, view / 2 - centre * extent)));
 }
 
@@ -638,16 +678,27 @@ export function geometryMap(
   frameWidth: number,
   frameHeight: number,
   viewport: MockViewport = FIT,
+  insets: MockInsets = NO_INSETS,
 ): MockGeometryMap {
   const toImage = contentToImage(geometry, frameWidth, frameHeight);
   const scale = Math.min(32, Math.max(1, viewport.scale));
-  const width = Math.max(1, Math.round(fitted[2] * scale));
-  const height = Math.max(1, Math.round(fitted[3] * scale));
+  // `fitted` fills the frame; the insets shrink it into the hole between the client's
+  // panels, and the zoom multiplies whatever is left. The first zoom notch therefore grows
+  // the picture that is on screen instead of jumping to the un-inset fit.
+  const innerWidth = Math.max(1, frameWidth - insets.left - insets.right);
+  const innerHeight = Math.max(1, frameHeight - insets.top - insets.bottom);
+  const inner = Math.min(
+    1,
+    innerWidth / Math.max(1, fitted[2]),
+    innerHeight / Math.max(1, fitted[3]),
+  );
+  const width = Math.max(1, Math.round(fitted[2] * inner * scale));
+  const height = Math.max(1, Math.round(fitted[3] * inner * scale));
   const centre = viewport.fit
     ? [0.5, 0.5]
     : apply(invert(toImage), viewport.centerX, viewport.centerY);
-  const x = place(frameWidth, width, centre[0] ?? 0.5, viewport.fit);
-  const y = place(frameHeight, height, centre[1] ?? 0.5, viewport.fit);
+  const x = place(frameWidth, width, centre[0] ?? 0.5, viewport.fit, insets.left, insets.right);
+  const y = place(frameHeight, height, centre[1] ?? 0.5, viewport.fit, insets.top, insets.bottom);
   const viewToContent: Mat3 = [1 / width, 0, -x / width, 0, 1 / height, -y / height, 0, 0, 1];
   const viewToImage = multiply(toImage, viewToContent);
   return { content: [x, y, width, height], viewToImage, imageToView: invert(viewToImage) };

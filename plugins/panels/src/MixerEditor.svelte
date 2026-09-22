@@ -9,7 +9,7 @@
   import type { OpDefinition } from "@latent/protocol";
   import { Button, Tooltip } from "@neoworks-dev/ui";
   import ArrowCounterClockwiseIcon from "phosphor-svelte/lib/ArrowCounterClockwiseIcon";
-  import { mixerChannels, paramValue, type MixerParams } from "./panels";
+  import { controlValue, mixerChannels, type MixerParams } from "./panels";
   import ParamControl from "./ParamControl.svelte";
 
   const {
@@ -31,7 +31,9 @@
   const sliders = $derived(mixer.bands.flatMap((band) => band.sliders));
   const edited = $derived(
     sliders.some(
-      (slider) => paramValue(viewer.stack, op, slider.spec, opId) !== slider.spec.default,
+      (slider) =>
+        controlValue(viewer.stack, op, slider.spec, opId, viewer.maskTarget) !==
+        slider.spec.default,
     ),
   );
 

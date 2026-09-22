@@ -60,9 +60,18 @@ describe("catalog rows", () => {
     catalog.ensurePhoto("/photos/trip/b.arw");
     catalog.ensurePhoto("/photos/city/c.arw");
     expect(catalog.folders().folders).toEqual([
-      { path: "/photos/city", count: 1 },
-      { path: "/photos/trip", count: 2 },
+      { path: "/photos/city", count: 1, watched: false },
+      { path: "/photos/trip", count: 2, watched: false },
     ]);
+  });
+
+  test("only a real directory becomes a watched root", () => {
+    const catalog = new MockCatalog();
+    catalog.ensurePhoto(join(import.meta.dir, "a.arw"));
+    catalog.watchFolder(join(import.meta.dir, "a.arw"), true);
+    expect(catalog.folders().folders[0]?.watched).toBe(false);
+    catalog.watchFolder(import.meta.dir, true);
+    expect(catalog.folders().folders[0]?.watched).toBe(true);
   });
 });
 

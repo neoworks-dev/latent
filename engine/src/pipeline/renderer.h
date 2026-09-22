@@ -53,10 +53,20 @@ enum class OpKind : uint32_t {
   Sharpening = 105,
   Defringe = 106,
   ChromaticAberration = 107,
+  // manual_denoise is the one kind here that is not a single blur/combine pair: it runs
+  // three à trous levels, each of them such a pair, and one blend.wgsl pass puts the result
+  // back through the op's mask. Renderer::run_passes has the loop.
+  ManualDenoise = 108,
   // 200+: no pass of its own; folded into the proxy's sampling pass (downscale.wgsl).
   Geometry = 200,
   // 300+: composite.wgsl, which mixes a cached raster back in rather than computing one.
   Generative = 300,
+  // 400+: blend.wgsl, the pass that closes a group — the branch its children rendered,
+  // mixed back into the group's input through the group's mask (PROMPT.md 3.7).
+  Blend = 400,
+  // 500+: relight.wgsl, two passes over the photo's depth map — the shafts march, then the
+  // shading that reads it (PROMPT.md 3.8).
+  Relight = 500,
 };
 
 OpKind op_kind(std::string_view name);
@@ -142,14 +152,21 @@ class Renderer {
   bool has_mask_raster(int64_t photo_id, std::string_view component_id,
                        std::string_view hash) const;
 
+  // The photo's depth map (ai/depth.h): what `relight` shades against, and what a `depth`
+  // mask component bands. One per photo, not per op — it describes the scene, so no slider
+  // can make it stale — and held and uploaded at the model's own size, 16-bit, with the
+  // shader filtering it. `key` names the file it came from and changes with the pixels.
+  void put_depth_map(int64_t photo_id, std::string_view key, Gray16Image map);
+  bool has_depth_map(int64_t photo_id) const;
+  std::string depth_map_key(int64_t photo_id) const;
+
   // A generative op's cached raster (PROMPT.md 3.5): the crop a backend repainted, held per
   // photo and uploaded once. `key` is the op's `result` path, which changes whenever the
   // pixels do, so a stale upload cannot outlive them. An op whose result the renderer has
   // not been handed composites nothing and renders as if it were not there.
   void put_generative_result(int64_t photo_id, std::string_view op_id, std::string_view key,
                              const Rgb8Image& image);
-  bool has_generative_result(int64_t photo_id, std::string_view op_id,
-                             std::string_view key) const;
+  bool has_generative_result(int64_t photo_id, std::string_view op_id, std::string_view key) const;
 
   // Renders the stack into the view — which builds any mask it needs — then reads one r8
   // mask back into `out`: `op_id`'s combined mask, or one component's raster when
@@ -165,7 +182,7 @@ class Renderer {
   // One texture, never tiled: a 24 MP frame is far inside `maxTextureDimension2D` (32768
   // on this adapter). A photo whose cropped size exceeds that limit throws instead — a
   // tiled fallback would need the neighbourhood passes to overlap their tiles and is
-  // deliberately out of scope (NEXT.md).
+  // deliberately out of scope (issue #4).
   Rgb16Image render_export(int64_t photo_id, const Stack& stack,
                            const ExportRenderOptions& options);
 
@@ -179,11 +196,19 @@ class Renderer {
   // Runs the op chain into the view's ping-pong textures and returns the texture the last
   // pass wrote (the base when the stack had nothing to do).
   WGPUTextureView run_passes(View& view, const Stack& stack, bool bypass_crop);
-  // Rasterises and folds one op's mask into a cached r8 texture. Called between passes,
-  // because a luminance or colour component reads the op's input, which only exists once
-  // everything below it has been submitted.
+  // Rasterises and folds one op's mask into a cached r8 texture. Luminance and colour
+  // components sample the view's base, so it runs before the op chain is encoded.
   void build_mask(View& view, const Op& op, const nlohmann::json& canonical,
-                  const std::string& hash, WGPUTextureView input);
+                  const std::string& hash);
+  // The second ping-pong pair, the one a group's children render into so the group's input
+  // survives to be blended against. Made on the first frame that holds a group and resized
+  // with the view; a stack without groups never pays for it.
+  void ensure_branch(View& view);
+  void ensure_wavelet(View& view);
+  // Uploads the photo's depth map into the view at the size an image-space raster has
+  // there, if it is not already the one on the GPU. Before any encoder is open: a queue
+  // write between two render passes of the same encoder is not ordered against them.
+  void ensure_depth(View& view);
 
   Gpu gpu_;
   RenderPipelineHandle linearize_pipeline_;
@@ -195,6 +220,8 @@ class Renderer {
   RenderPipelineHandle mask_pipeline_;
   RenderPipelineHandle mask_combine_pipeline_;
   RenderPipelineHandle composite_pipeline_;
+  RenderPipelineHandle blend_pipeline_;
+  RenderPipelineHandle relight_pipeline_;
   // Built on the first export: nothing else writes rgba16uint, and a daemon that never
   // exports should not pay for the pipeline.
   RenderPipelineHandle export_pipeline_;

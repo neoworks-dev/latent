@@ -1,6 +1,7 @@
-# AI mask models
+# AI models
 
-Everything Phase 1 masking needs, prepared and measured on this machine
+Everything Phase 1 masking needs plus the depth model the `relight` op runs on
+(PROMPT.md 3.8), prepared and measured on this machine
 (RTX 4080 SUPER 16 GB, CUDA 13.3, cuDNN 9.26, onnxruntime 1.30.0 cuda13 — the same
 build `engine/cmake/onnxruntime.cmake` pins).
 
@@ -12,7 +13,7 @@ the C++ ORT API.
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python numpy pillow rawpy requests onnx onnxruntime-gpu==1.30.0 \
     torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install --python .venv/bin/python transformers timm einops kornia huggingface_hub
+uv pip install --python .venv/bin/python transformers timm einops kornia huggingface_hub spandrel
 
 LD_LIBRARY_PATH=/opt/cuda/lib64 .venv/bin/python fetch.py --verify
 ```
@@ -27,13 +28,15 @@ Torch is CPU-only on purpose: it is used for exporting, never for inference, and
 `~/.local/share/latent/models` (override with `LATENT_MODEL_STORE`). `manifest.json`
 at the top carries sha256 + size of every file.
 
-| Model                   | Size          | Role                          | Mask kinds                                        |
-| ----------------------- | ------------- | ----------------------------- | ------------------------------------------------- |
-| `sam2-hiera-base-plus/` | 360.4 MB      | box or points -> mask         | `objects`, `text`, and the SAM half of any prompt |
-| `florence-2-base/`      | 1248.3 MB     | text -> box                   | `text`                                            |
-| `birefnet-lite/`        | 114.5 MB      | salient-object alpha matte    | `subject`, `background`                           |
-| `segformer-b2-ade20k/`  | 110.4 MB      | 150-class ADE20K semantic map | `sky`, `people`                                   |
-|                         | **1833.6 MB** |                               |                                                   |
+| Model                      | Size          | Role                          | Mask kinds                                        |
+| -------------------------- | ------------- | ----------------------------- | ------------------------------------------------- |
+| `sam2-hiera-base-plus/`    | 360.4 MB      | box or points -> mask         | `objects`, `text`, and the SAM half of any prompt |
+| `florence-2-base/`         | 1248.3 MB     | text -> box                   | `text`                                            |
+| `birefnet-lite/`           | 114.5 MB      | salient-object alpha matte    | `subject`, `background`                           |
+| `segformer-b2-ade20k/`     | 110.4 MB      | 150-class ADE20K semantic map | `sky`, `people`                                   |
+| `depth-anything-v2-small/` | 49.6 MB       | relative depth of the scene   | `depth`, and the `relight` op (PROMPT.md 3.8)     |
+| `scunet-color-real/`       | 161.9 MB      | noisy frame -> clean frame    | none; the `denoise` op (issue #51)             |
+|                            | **2045.1 MB** |                               |                                                   |
 
 ```
 sam2-hiera-base-plus/   config.json encoder.onnx decoder.onnx
@@ -43,7 +46,41 @@ florence-2-base/        config.json tokenizer.json tokenizer_config.json vocab.j
                         onnx/{vision_encoder,embed_tokens,encoder_model,decoder_model}.onnx
 birefnet-lite/          config.json model.onnx
 segformer-b2-ade20k/    config.json labels.json model.onnx
+depth-anything-v2-small/ config.json model.onnx
+scunet-color-real/      config.json model.onnx
 ```
+
+## SCUNet — color real
+
+Exported by `export_denoise.py` from `scunet_color_real_psnr.pth` (cszn/SCUNet,
+Apache-2.0, 17.9 M params). The architecture comes from `spandrel`, which carries a
+clean-room copy of every restoration arch and picks the right one out of the state
+dict; it is an export-time dependency only.
+
+| Dir | Name       | Type    | Shape              |
+| --- | ---------- | ------- | ------------------ |
+| in  | `image`    | float32 | `[1, 3, 512, 512]` |
+| out | `denoised` | float32 | `[1, 3, 512, 512]` |
+
+0..1 RGB, NCHW, no normalisation — the frame as it is displayed, not linear light.
+There is no noise-level input: SCUNet estimates how much noise is there, so the op's
+Strength slider is a blend between the frame and the answer, not a knob on the model
+(`engine/src/generative/onnx_backend.cpp`).
+
+**The shape is static on purpose.** SCUNet's swin blocks window their attention, and a
+dynamic height/width export traces reshapes that only hold at the size they were traced
+at: ORT then either refuses the shape or returns a seam through the middle of the frame.
+The engine tiles at 512 with 32 px of overlap and feathers the joins
+(`engine/src/ai/denoise.cpp`), which a 24 MP frame would need anyway.
+
+Padding at the frame edge is **mirrored, not clamped**. A clamped edge is a band of
+identical rows, which no sensor produces; SCUNet answers it with a smear that reaches
+tens of pixels back into the real picture, and it shows as a bar along the bottom of any
+image smaller than one tile.
+
+Measured on this machine: 124 ms per 512 tile after warm-up (610 ms for the first, which
+is cuDNN's exhaustive algorithm search), so a 640x480 frame is ~2 s end to end through
+the daemon including session load.
 
 ## SAM 2 — hiera-base-plus
 
@@ -251,6 +288,31 @@ single class that is two resizes, not 150: take `L[c]` and `max(L[k != c])`, res
 both, compare. Agreed with the full 150-plane path to within 0.04 % coverage on all
 test images.
 
+## Depth Anything V2 Small — `depth` and the `relight` op
+
+Apache-2.0, 25 M params, DINOv2-S backbone with a DPT head,
+`depth-anything/Depth-Anything-V2-Small-hf`. **Not exported from torch here**: `fetch.py`
+copies `onnx-community/depth-anything-v2-small/onnx/model_fp16.onnx` into the store, which
+is 49.6 MB against 99 MB for fp32 and answers the same depth to three decimals once the
+per-image normalisation below has run.
+
+| Dir | Name              | Type    | Shape                                   |
+| --- | ----------------- | ------- | --------------------------------------- |
+| in  | `pixel_values`    | float32 | `[b, 3, h, w]`, h and w multiples of 14 |
+| out | `predicted_depth` | float32 | `[b, h, w]` — no channel axis           |
+
+Preprocess like the mask models: bilinear squash to 518x518, /255, ImageNet mean/std.
+(Upstream's `DPTImageProcessor` can keep the aspect ratio and pad to a multiple of 14; the
+squash is what both this reference and the engine do, and the answer is resized back.)
+
+**The output is relative _inverse_ depth**: big where something is near, small where it is
+far, with no unit and no zero point. Normalise per image against its own 1st/99th
+percentile — not its min and max, where one blown pixel of sky or one lens flare takes the
+whole range and flattens the scene into a handful of levels — and do it on the 518x518
+plane, before the resize, so the engine does not have to sort a megapixel twice. What the
+rest of Latent stores is that 0..1 nearness at 8 bits: 0 is the farthest thing in the frame,
+255 the nearest.
+
 ## Timings — CUDA EP, p50 of 10 after warm-up
 
 Sample raw `~/Downloads/DSC00120.ARW` decoded to 1026x1536 (rawpy, `half_size=True`,
@@ -267,10 +329,17 @@ alone in the process.
 | — of which per decode step                    | 2.7 ms   |          |                     |                 |           |
 | BiRefNet-lite 1024x1024                       | 201.1 ms | 214.3 ms | 1130 ms             | 546 MB          | 6214 MB   |
 | SegFormer-B2 512x512                          | 21.4 ms  | 22.1 ms  | 194 ms              | 368 MB          | 868 MB    |
+| Depth Anything V2 Small 518x518 (CPU EP)      | 53.8 ms  | 72.0 ms  | —                   | —               | —         |
 
 End to end: text prompt -> mask is **Florence 70 ms + SAM 2 encode 102 ms + decode
 6 ms ≈ 180 ms**, plus ~2 s of session load on the first call. `subject` is 200 ms,
 `sky`/`people` are 21 ms. All are jobs, none are in a slider tick.
+
+Depth is the one row measured on the **CPU** provider: the wheel in this venv did not
+register a CUDA device on the day it was added (2026-09-17) and fell back. The engine loads
+the same graph through the CUDA EP like every other model here, and one `depth.estimate`
+there is 0.8–0.9 s end to end on a 24 MP raw — the input render, the session load, the
+inference and the PNG cache write together.
 
 ## Quality — is Florence-2 -> SAM 2 enough?
 
@@ -383,14 +452,15 @@ duplicated`** comes from SAM 2's decoder. Also harmless — the indices are the 
 
 | File                   | What                                                                                                                         |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `fetch.py`             | idempotent install of all four models, `manifest.json`, `--verify`                                                           |
+| `fetch.py`             | idempotent install of all five models, `manifest.json`, `--verify`                                                           |
 | `segment.py`           | reference pipeline: `--prompt` / `--box` / `--points` / `--kind`                                                             |
 | `evaluate.py`          | contact sheets for the quality assessment                                                                                    |
 | `sam2.py`              | SAM 2 preprocessing, prompts, decode, upsample                                                                               |
 | `florence2.py`         | task tokens, prompt build, greedy decode, box parsing                                                                        |
 | `dedicated.py`         | BiRefNet-lite and SegFormer-ADE20K runtimes                                                                                  |
+| `depth.py`             | Depth Anything V2 runtime: the normalisation the engine mirrors                                                              |
 | `export_florence2.py`  | torch -> ONNX for Florence-2                                                                                                 |
-| `export_dedicated.py`  | torch -> ONNX for SegFormer, fetch for BiRefNet                                                                              |
+| `export_dedicated.py`  | torch -> ONNX for SegFormer, fetch for BiRefNet and Depth Anything                                                           |
 | `common.py`            | store paths, sha256, raw decode, resize convention, timers                                                                   |
 | `testdata.py`          | the three CC0 evaluation photos                                                                                              |
 | `inspect_onnx.py`      | print a graph's inputs and outputs                                                                                           |

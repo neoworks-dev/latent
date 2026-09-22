@@ -83,6 +83,14 @@ struct Viewport {
   double center_x = 0.5;
   double center_y = 0.5;
   bool fit = true;
+  // What the client has floating over the view: its panels, in view pixels. A fitted photo
+  // is fitted into the view minus these and centred in what is left, so nothing covers it;
+  // a zoomed one is still placed over the whole view and runs on behind them. Sticky per
+  // view like the rest of the viewport, and never edit state.
+  double inset_left = 0;
+  double inset_top = 0;
+  double inset_right = 0;
+  double inset_bottom = 0;
 
   bool operator==(const Viewport& other) const = default;
 };

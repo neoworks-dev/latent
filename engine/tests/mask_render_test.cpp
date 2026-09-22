@@ -79,6 +79,17 @@ struct Fixture {
     return renderer->read_mask(1, stack, "exp00001", component_id, raster, 0).coverage;
   }
 
+  // Mean coverage of one column of the combined mask, 0..1: what the blend actually mixed
+  // by, rather than what the component's parameters suggest it should have.
+  double mask_column(const Stack& stack, uint32_t x) {
+    renderer->read_mask(1, stack, "exp00001", {}, raster, 0);
+    double sum = 0;
+    for (uint32_t y = 0; y < kSize; ++y) {
+      sum += raster[(static_cast<size_t>(y) * kSize) + x];
+    }
+    return sum / (kSize * 255.0);
+  }
+
   // Mean red level of one column of the frame, 0-255.
   double column(const Stack& stack, uint32_t x) {
     renderer->render(1, stack, frame, 0);
@@ -189,6 +200,130 @@ TEST_CASE("a masked op changes the frame only inside its mask") {
   CHECK_THAT(fixture->column({plain}, 8), Catch::Matchers::WithinAbs(half_level, 0.5));
 }
 
+namespace {
+
+Op develop_op(const std::string& id, const std::string& name, const nlohmann::json& params) {
+  std::vector<std::string> warnings;
+  Op op;
+  op.id = id;
+  op.name = name;
+  op.params = normalize_params_for(name, params, warnings);
+  return op;
+}
+
+// A layer: one mask, one opacity, and the adjustments that share them (PROMPT.md 3.7).
+Op group_of(const std::vector<nlohmann::json>& components, std::vector<Op> children,
+            double opacity = 100) {
+  Op group;
+  group.id = "exp00001";
+  group.name = std::string(kGroupOpName);
+  if (!components.empty()) {
+    group.mask = normalize_mask(nlohmann::json{{"components", components}});
+  }
+  group.opacity = opacity;
+  group.ops = std::move(children);
+  return group;
+}
+
+}  // namespace
+
+TEST_CASE("a group renders its children under one mask") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  const nlohmann::json right = half_plane("r", "add", 1.0);
+  // One child is the case the old per-op mask covered, and it has to land on the same
+  // pixels: a layer of one is what a masked op used to be.
+  const Stack legacy = {masked_exposure({right}, 1.0, 100)};
+  const Stack layer = {group_of({right}, {develop_op("child001", "exposure", {{"value", 1.0}})})};
+  CHECK_THAT(fixture->column(layer, 56),
+             Catch::Matchers::WithinAbs(fixture->column(legacy, 56), 1));
+  CHECK_THAT(fixture->column(layer, 8), Catch::Matchers::WithinAbs(fixture->column({}, 8), 0.5));
+
+  // Two children stack inside the layer, and still only where the mask is.
+  const Stack two = {group_of({right}, {develop_op("child001", "exposure", {{"value", 1.0}}),
+                                        develop_op("child002", "exposure", {{"value", 1.0}})})};
+  REQUIRE(fixture->column(two, 56) > fixture->column(layer, 56) + 5);
+  CHECK_THAT(fixture->column(two, 8), Catch::Matchers::WithinAbs(fixture->column({}, 8), 0.5));
+
+  // The group's own opacity scales the whole layer, mask included.
+  const Stack faint = {
+      group_of({right}, {develop_op("child001", "exposure", {{"value", 1.0}})}, 50)};
+  CHECK_THAT(fixture->linear_column(faint, 56),
+             Catch::Matchers::WithinRel(
+                 (fixture->linear_column({}, 56) + fixture->linear_column(layer, 56)) / 2, 0.02));
+}
+
+TEST_CASE("a group blends once, above all of its children") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  // A mask with a soft edge across the whole frame: the middle column is half covered,
+  // which is where blending once and blending per child stop agreeing. The pair is
+  // deliberately non-linear — contrast after exposure — because two linear ops commute
+  // with the mix and would agree either way.
+  nlohmann::json ramp = half_plane("r", "add", 1.0);
+  ramp["feather"] = 100;
+  const Op exposure = develop_op("child001", "exposure", {{"value", 1.0}});
+  const Op contrast = develop_op("child002", "contrast", {{"value", 80}});
+
+  Op exposure_masked = exposure;
+  exposure_masked.id = "exp00001";
+  exposure_masked.mask = normalize_mask(nlohmann::json{{"components", {ramp}}});
+  Op contrast_masked = contrast;
+  contrast_masked.id = "exp00002";
+  contrast_masked.mask = normalize_mask(nlohmann::json{{"components", {ramp}}});
+
+  const Stack grouped = {group_of({ramp}, {exposure, contrast})};
+  const Stack per_op = {exposure_masked, contrast_masked};
+  const Stack whole = {exposure, contrast};
+
+  // The contract: at a half-covered pixel the layer sits halfway between the frame under it
+  // and the frame its children made — one crossing of the soft edge, not two.
+  const double coverage = fixture->mask_column(grouped, 32);
+  REQUIRE(coverage > 0.4);
+  REQUIRE(coverage < 0.6);
+  const double under = fixture->linear_column({}, 32);
+  const double above = fixture->linear_column(whole, 32);
+  const double expected = under + (coverage * (above - under));
+  CHECK_THAT(fixture->linear_column(grouped, 32), Catch::Matchers::WithinRel(expected, 0.03));
+  // Blending each child separately is a different number, which is the whole reason the
+  // group exists.
+  REQUIRE(std::abs(fixture->column(per_op, 32) - fixture->column(grouped, 32)) > 1.0);
+
+  // Fully covered and fully uncovered agree either way: only the soft edge moves.
+  CHECK_THAT(fixture->column(grouped, 62),
+             Catch::Matchers::WithinAbs(fixture->column(whole, 62), 1.5));
+  CHECK_THAT(fixture->column(grouped, 1), Catch::Matchers::WithinAbs(fixture->column({}, 1), 1.0));
+}
+
+TEST_CASE("an empty or disabled group renders nothing") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  const nlohmann::json right = half_plane("r", "add", 1.0);
+  const double base = fixture->column({}, 56);
+
+  // A mask with no adjustments under it yet: a layer the user is still building.
+  CHECK_THAT(fixture->column({group_of({right}, {})}, 56), Catch::Matchers::WithinAbs(base, 0.5));
+
+  Op disabled = group_of({right}, {develop_op("child001", "exposure", {{"value", 2.0}})});
+  disabled.enabled = false;
+  CHECK_THAT(fixture->column({disabled}, 56), Catch::Matchers::WithinAbs(base, 0.5));
+
+  // A disabled child sits out; the layer still renders what is left.
+  Op one_off = group_of({right}, {develop_op("child001", "exposure", {{"value", 2.0}}),
+                                  develop_op("child002", "exposure", {{"value", 2.0}})});
+  one_off.ops[1].enabled = false;
+  const Stack single = {group_of({right}, {develop_op("child001", "exposure", {{"value", 2.0}})})};
+  CHECK_THAT(fixture->column({one_off}, 56),
+             Catch::Matchers::WithinAbs(fixture->column(single, 56), 1));
+
+  // A group with no mask is a layer over the whole frame, at its opacity.
+  const Stack unmasked = {group_of({}, {develop_op("child001", "exposure", {{"value", 1.0}})})};
+  REQUIRE(fixture->column(unmasked, 8) > base + 10);
+}
+
 TEST_CASE("a pending component contributes nothing, so the op does nothing") {
   std::unique_ptr<Fixture> fixture = make_fixture();
   if (!fixture) SKIP("no GPU adapter");
@@ -220,6 +355,35 @@ TEST_CASE("a cached mask survives a render and a resize rebuilds it") {
   fixture->frame.resize(static_cast<size_t>(kSize) * kSize * 16);
   fixture->raster.resize(static_cast<size_t>(kSize) * kSize * 4);
   CHECK_THAT(fixture->coverage(first), Catch::Matchers::WithinAbs(0.5, 0.02));
+}
+
+TEST_CASE("a luminance mask samples the photo, not the ops below it") {
+  std::unique_ptr<Fixture> fixture = make_fixture();
+  if (!fixture) SKIP("no GPU adapter");
+
+  // The flat photo is mid-grey, well under the band; +3 EV below the layer would put every
+  // pixel inside it if the mask read the op's input. Lightroom's range masks read the
+  // unadjusted photo (issue #1), so the band selects nothing before and after the edit, and a
+  // view that never saw the stack without the edit agrees with the one that did.
+  const nlohmann::json band = nlohmann::json::parse(
+      R"({"id": "lum", "kind": "luminance", "mode": "add", "feather": 0,
+          "params": {"range": [0.8, 1], "smoothness": 0}})");
+  std::vector<std::string> warnings;
+  Op below;
+  below.id = "below001";
+  below.name = "exposure";
+  below.params = normalize_params_for("exposure", {{"value", 0.0}}, warnings);
+  const Op masked = masked_exposure({band}, 1.0, 100);
+
+  CHECK_THAT(fixture->coverage({below, masked}), Catch::Matchers::WithinAbs(0.0, 0.001));
+  below.params = normalize_params_for("exposure", {{"value", 3.0}}, warnings);
+  const Stack edited = {below, masked};
+  CHECK_THAT(fixture->coverage(edited), Catch::Matchers::WithinAbs(0.0, 0.001));
+
+  fixture->renderer->open_view(2, 1, kSize, kSize);
+  const double fresh =
+      fixture->renderer->read_mask(2, edited, "exp00001", {}, fixture->raster, 0).coverage;
+  CHECK_THAT(fresh, Catch::Matchers::WithinAbs(0.0, 0.001));
 }
 
 namespace {

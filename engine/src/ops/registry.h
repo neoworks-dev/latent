@@ -44,6 +44,14 @@ struct OpParamSpec {
 enum class PipelineStage : int {
   Geometry = 10,
   Optics = 20,
+  // `denoise` and `upscale` (issues #51, #52): model rasters like the generative ops, but
+  // whole-frame and unmasked, and they sit under everything a slider can do — the raster is
+  // the new input to the rest of the stack. Denoise is below upscale because an upscaler
+  // turns leftover noise into detail that was never there, and both are below the
+  // parametric NoiseReduction pass, which is the cheap cleanup on top of whatever the model
+  // left rather than a second opinion about the same pixels.
+  Denoise = 24,
+  Upscale = 26,
   NoiseReduction = 30,
   // Generative results are composited before the tone and colour passes, so the develop
   // settings apply to the generated pixels as well as to everything around them — a patch
@@ -53,6 +61,18 @@ enum class PipelineStage : int {
   Generative = 35,
   Tone = 40,
   Color = 50,
+  // A group (ops/op.h, kGroupOpName) renders here, as a unit, whatever its children are:
+  // the branch runs off the group's input and one blend puts it back through the mask. It
+  // sits after the global tone and colour passes because that is where Lightroom applies a
+  // local adjustment — the mask is drawn on a picture the user has already developed. The
+  // price is that a masked op does not render at its own stage any more: a group holding
+  // noise reduction denoises after the tone curve, not before it.
+  Local = 55,
+  // `relight` (PROMPT.md 3.8) sits between the local adjustments and the effects: it adds
+  // light to a developed picture, so the tone and colour passes are already behind it, and
+  // vignette, grain and sharpening have to see the light it added rather than the other way
+  // round.
+  Relight = 58,
   Effects = 60,
   Sharpening = 70,
   Grain = 80,
@@ -74,12 +94,26 @@ struct OpDefinition {
 
   // ops.describe `maskable`: every develop op takes a mask and an opacity. Geometry ops
   // move pixels rather than changing them, so there is nothing to blend a mask into —
-  // a mask on one is ignored with an engine.log warning.
-  bool maskable() const { return panel != "geometry"; }
+  // a mask on one is ignored with an engine.log warning. `denoise` and `upscale` are the
+  // other exception: they are whole-frame by definition, so there is no region to pick.
+  bool maskable() const {
+    if (panel == "geometry") return false;
+    return stage != PipelineStage::Denoise && stage != PipelineStage::Upscale;
+  }
 };
 
 const std::vector<OpDefinition>& op_definitions();
 const OpDefinition* find_op_definition(std::string_view name);
+
+// Every op whose pixels a model produced rather than a formula: `generative_fill` and
+// `remove` (PROMPT.md 3.5), `denoise` and `upscale` (issues #51, #52). All four are cached
+// rasters with an input hash, none ever re-runs on its own, and none sits under a group
+// (src/generative/generative.h).
+bool is_generative_op(std::string_view name);
+
+// The two of those that cover the whole frame: `denoise` and `upscale` take no mask — there
+// is no region to choose, the raster replaces the picture the ops below it produced.
+bool is_whole_frame_op(std::string_view name);
 
 // ops.describe result payload.
 nlohmann::json describe_ops();
