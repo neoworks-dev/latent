@@ -3,7 +3,7 @@
 // a folder into the catalog, and write the frame it sends back as a PNG. Run with
 // `bun engine/tests/smoke.ts`; ctest runs the same command. Exits 77 (ctest's skip code)
 // when the sample raw is missing.
-import { existsSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import {
   assert,
   channelMean,
@@ -14,6 +14,8 @@ import {
   engineExecutable,
   letterboxShare,
   mean,
+  modelStore,
+  rasterDir,
   samplePath,
   startEngine,
   timed,
@@ -200,9 +202,6 @@ console.log(`  ${builtinPresets.length} shipped presets name only registered par
 
 const sidecarPath = `${samplePath}.latent`;
 if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
-// Its sibling directory holds brush strokes and mask rasters; a stale one would make the
-// mask assertions below pass for the wrong reason.
-rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 
 const photo = await timed("photo.open", () => ui.call("photo.open", { path: samplePath }));
 console.log(
@@ -701,7 +700,7 @@ const strokeState = await ui.call("stack.get", { photoId });
 const brushParams = strokeState.stack[0].mask.components[1].params;
 assert(brushParams.strokeData.length === strokeSegments.length, "every segment must be stored");
 assert(brushParams.strokes === "masks/brush01.strokes.json", "the engine names the stroke file");
-const strokeFile = `${samplePath}.latent.d/masks/brush01.strokes.json`;
+const strokeFile = `${rasterDir(scratch, photo.hash)}/masks/brush01.strokes.json`;
 assert(existsSync(strokeFile), `the engine must mirror the strokes to ${strokeFile}`);
 assert(
   JSON.parse(await Bun.file(strokeFile).text()).length === strokeSegments.length,
@@ -1965,6 +1964,42 @@ assert(restored.canUndo === false, "a freshly loaded stack has nothing to undo")
 assert(restored.histogram === undefined, "no view has rendered this photo yet");
 
 await timed("photo.close", () => ui.call("photo.close", { photoId }));
+
+// Older builds wrote rasters into `<photo>.latent.d/` beside the photo, and the scan imported
+// them as photos (#36). A recursive import must skip that directory, and opening the photo
+// must move it into the raster store.
+const legacyFolder = `${scratch}/legacy`;
+const legacyPhoto = `${legacyFolder}/nested/legacy.ARW`;
+const legacyRasters = `${legacyPhoto}.latent.d`;
+mkdirSync(`${legacyRasters}/masks`, { recursive: true });
+copyFileSync(samplePath, legacyPhoto);
+const legacyPng = encodePng(new Uint8Array(4 * 4 * 4).fill(200), 4, 4);
+await Bun.write(`${legacyRasters}/masks/subject1.0123456789abcdef.png`, legacyPng);
+await Bun.write(`${legacyRasters}/depth.png`, legacyPng);
+const legacyImport = await ui.call("catalog.import", { paths: [legacyFolder], recursive: true });
+await waitFor("the legacy import job to finish", () =>
+  ui.notifications.some(
+    (n) =>
+      n.method === "job.progress" && n.params.jobId === legacyImport.jobId && n.params.finished,
+  ),
+);
+const legacyRows = (await ui.call("catalog.list", { limit: 1000 })).photos.filter((p: any) =>
+  p.path.startsWith(legacyFolder),
+);
+assert(
+  legacyRows.length === 1 && legacyRows[0].path === legacyPhoto,
+  `a scan must import the photo and nothing under *.latent.d/, got ${legacyRows.map((p: any) => p.path)}`,
+);
+const legacyOpen = await ui.call("photo.open", { path: legacyPhoto });
+assert(!existsSync(legacyRasters), "photo.open must move the legacy raster directory");
+assert(
+  existsSync(`${rasterDir(scratch, legacyOpen.hash)}/masks/subject1.0123456789abcdef.png`) &&
+    existsSync(`${rasterDir(scratch, legacyOpen.hash)}/depth.png`),
+  "the legacy rasters must land in the store under the photo's hash",
+);
+await ui.call("photo.close", { photoId: legacyOpen.photoId });
+console.log(`  legacy rasters skipped by the scan and moved on open`);
+
 observer.close();
 ui.close();
 
@@ -2050,8 +2085,8 @@ assert(
   "the raster must be tied to the source image",
 );
 assert(
-  existsSync(`${samplePath}.latent.d/${detected.params.raster}`),
-  "the raster must be cached beside the sidecar",
+  existsSync(`${rasterDir(stubScratch, stubPhoto.hash)}/${detected.params.raster}`),
+  "the raster must be cached in the raster store",
 );
 
 const stubPreview = await stub.call("mask.preview", {
@@ -2210,14 +2245,10 @@ rmSync(stubScratch, { recursive: true, force: true });
 // that `scripts/models/fetch.py` installs; without them this section does not run, so a
 // fresh clone still gets a green ctest. Coverage is the share of the image rect above 0.5,
 // and every bound below was measured on this raw — a studio portrait, hence no sky.
-const modelStore =
-  process.env.LATENT_MODEL_STORE ??
-  `${process.env.XDG_DATA_HOME ?? `${process.env.HOME}/.local/share`}/latent/models`;
 if (!existsSync(`${modelStore}/birefnet-lite`)) {
   console.log(`smoke: no model store at ${modelStore}; skipping the AI mask section`);
 } else {
   if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
-  rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 
   const aiScratch = `${scratch}-ai`;
   const aiEngine = startEngine(aiScratch, ["--no-mcp"]);
@@ -2278,8 +2309,8 @@ if (!existsSync(`${modelStore}/birefnet-lite`)) {
       "the raster must be tied to the source image",
     );
     assert(
-      existsSync(`${samplePath}.latent.d/${component.params.raster}`),
-      "the raster is cached beside the sidecar",
+      existsSync(`${rasterDir(aiScratch, aiPhoto.hash)}/${component.params.raster}`),
+      "the raster is cached in the raster store",
     );
     return { coverage: preview.coverage, model: component.params.model as string };
   }
@@ -2342,6 +2373,5 @@ if (!existsSync(`${modelStore}/birefnet-lite`)) {
 }
 
 if (existsSync(sidecarPath)) await Bun.file(sidecarPath).delete();
-rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 rmSync(scratch, { recursive: true, force: true });
 console.log(`smoke: ok in ${(performance.now() - started).toFixed(0)} ms`);

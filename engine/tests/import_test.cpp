@@ -284,6 +284,14 @@ TEST_CASE("the importer claims png and jpeg and leaves everything else alone", "
   CHECK(is_photo_extension("/photos/a.png"));
   CHECK(is_photo_extension("/photos/a.ARW"));
   CHECK_FALSE(is_photo_extension("/photos/a.txt"));
+
+  // Older builds wrote mask rasters and depth maps into `<photo>.latent.d/`; a scan that
+  // walks into one must not import them as photos (#36).
+  CHECK(is_importable_photo("/photos/a.png"));
+  CHECK(is_importable_photo("/photos/a.latent.png"));
+  CHECK_FALSE(is_importable_photo("/photos/a.ARW.latent.d/depth.png"));
+  CHECK_FALSE(is_importable_photo("/photos/a.ARW.latent.d/masks/m.0123456789abcdef.png"));
+  CHECK_FALSE(is_importable_photo("/photos/a.txt"));
 }
 
 TEST_CASE("a jpeg and a png of one colour land on the same linear value", "[import]") {

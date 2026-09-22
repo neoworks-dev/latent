@@ -4,9 +4,11 @@
 #include "ops/sha256.h"
 
 #include <cmath>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <numbers>
 #include <span>
 #include <string>
@@ -623,12 +625,48 @@ void migrate_mask_groups(Stack& stack) {
   }
 }
 
-std::string sidecar_dir_for(std::string_view photo_path) {
-  return std::string(photo_path) + ".latent.d";
+std::string raster_dir_for(std::string_view photo_hash) {
+  const char* data_home = std::getenv("XDG_DATA_HOME");
+  const char* home = std::getenv("HOME");
+  std::filesystem::path root;
+  if (data_home != nullptr && data_home[0] != '\0') {
+    root = data_home;
+  } else {
+    root = std::filesystem::path(home == nullptr ? "" : home) / ".local" / "share";
+  }
+  return (root / "latent" / "rasters" / std::string(photo_hash)).string();
 }
 
-std::string mask_dir_for(std::string_view photo_path) {
-  return sidecar_dir_for(photo_path) + "/masks";
+bool is_legacy_raster_dir(std::string_view directory) {
+  return std::filesystem::path(directory).filename().string().ends_with(".latent.d");
+}
+
+bool is_inside_legacy_raster_dir(std::string_view path) {
+  const std::filesystem::path full(path);
+  return std::any_of(full.begin(), full.end(), [](const std::filesystem::path& part) {
+    return part.string().ends_with(".latent.d");
+  });
+}
+
+void migrate_legacy_raster_dir(std::string_view photo_path, std::string_view photo_hash) {
+  const std::filesystem::path legacy = std::string(photo_path) + ".latent.d";
+  const std::filesystem::path store = raster_dir_for(photo_hash);
+  std::error_code error;
+  if (photo_hash.empty() || !std::filesystem::is_directory(legacy, error)) return;
+  std::filesystem::create_directories(store.parent_path(), error);
+  // One rename when the store has nothing for this photo and both sit on one filesystem;
+  // otherwise a copy that keeps what the store already holds, then the source goes.
+  if (!std::filesystem::exists(store, error)) {
+    std::filesystem::rename(legacy, store, error);
+    if (!error) return;
+  }
+  error.clear();
+  std::filesystem::copy(
+      legacy, store,
+      std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing,
+      error);
+  if (error) return;
+  std::filesystem::remove_all(legacy, error);
 }
 
 std::string mask_raster_relative_path(std::string_view component_id, std::string_view hash) {

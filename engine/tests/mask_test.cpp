@@ -6,7 +6,11 @@
 #include "ops/mask_raster.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <unistd.h>
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -169,8 +173,66 @@ TEST_CASE("brush strokes live in the params and append one at a time") {
 
   REQUIRE(brush_stroke_relative_path("b") == "masks/b.strokes.json");
   REQUIRE(mask_raster_relative_path("b", "0123456789abcdef0011") == "masks/b.0123456789abcdef.png");
-  REQUIRE(sidecar_dir_for("/photos/a.ARW") == "/photos/a.ARW.latent.d");
-  REQUIRE(mask_dir_for("/photos/a.ARW") == "/photos/a.ARW.latent.d/masks");
+}
+
+TEST_CASE("rasters live in the data dir, keyed by the source's hash") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / ("latent-rasters-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const std::filesystem::path photos = root / "photos";
+  std::filesystem::create_directories(photos);
+  const char* previous = std::getenv("XDG_DATA_HOME");
+  const std::string restore = previous == nullptr ? "" : previous;
+  ::setenv("XDG_DATA_HOME", (root / "data").c_str(), 1);
+
+  const std::string hash = "ab12";
+  const std::string store = (root / "data" / "latent" / "rasters" / hash).string();
+  REQUIRE(raster_dir_for(hash) == store);
+  REQUIRE(is_legacy_raster_dir("/photos/a.ARW.latent.d"));
+  REQUIRE(!is_legacy_raster_dir("/photos/a.ARW.latent"));
+  REQUIRE(is_inside_legacy_raster_dir("/photos/a.ARW.latent.d/masks/m.png"));
+  REQUIRE(!is_inside_legacy_raster_dir("/photos/a.ARW"));
+
+  const auto write = [](const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path) << text;
+  };
+  const auto read = [](const std::filesystem::path& path) {
+    std::string text;
+    std::ifstream(path) >> text;
+    return text;
+  };
+
+  // A photo nobody opened since the store: its directory moves over whole.
+  const std::string photo = (photos / "a.ARW").string();
+  write(photo + ".latent.d/masks/m.png", "mask");
+  write(photo + ".latent.d/depth.png", "depth");
+  migrate_legacy_raster_dir(photo, hash);
+  REQUIRE(!std::filesystem::exists(photo + ".latent.d"));
+  REQUIRE(read(store + "/masks/m.png") == "mask");
+  REQUIRE(read(store + "/depth.png") == "depth");
+
+  // A copy of the same file with its own legacy directory: merged, the store's copy wins.
+  const std::string copy = (photos / "copy-of-a.ARW").string();
+  write(copy + ".latent.d/depth.png", "other");
+  write(copy + ".latent.d/generative/g1.png", "fill");
+  migrate_legacy_raster_dir(copy, hash);
+  REQUIRE(!std::filesystem::exists(copy + ".latent.d"));
+  REQUIRE(read(store + "/depth.png") == "depth");
+  REQUIRE(read(store + "/generative/g1.png") == "fill");
+
+  // Nothing to move, or no hash to move it under: a no-op.
+  migrate_legacy_raster_dir(photo, hash);
+  write(photo + ".latent.d/x.png", "x");
+  migrate_legacy_raster_dir(photo, "");
+  REQUIRE(std::filesystem::exists(photo + ".latent.d/x.png"));
+
+  if (previous == nullptr) {
+    ::unsetenv("XDG_DATA_HOME");
+  } else {
+    ::setenv("XDG_DATA_HOME", restore.c_str(), 1);
+  }
+  std::filesystem::remove_all(root);
 }
 
 TEST_CASE("the brush rasteriser stamps, joins and erases") {

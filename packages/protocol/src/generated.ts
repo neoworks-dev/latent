@@ -318,7 +318,7 @@ export interface Op {
   opacity?: number;
   enabled: boolean;
   /**
-   * Generative ops only (PROMPT.md 3.5): the cached raster this op produced, as a PNG path relative to `<photo>.latent.d/` — `generative/<opId>.png`. Absent until a generative.run has landed; the op renders as if it were not there until then. A client round-trips it untouched.
+   * Generative ops only (PROMPT.md 3.5): the cached raster this op produced, as a PNG path relative to the photo's raster dir ($XDG_DATA_HOME/latent/rasters/<sha256>/, keyed by the file's hash) — `generative/<opId>.png`. Absent until a generative.run has landed; the op renders as if it were not there until then. A client round-trips it untouched.
    */
   result?: string;
   /**
@@ -367,7 +367,7 @@ export interface MaskComponent {
    */
   opacity?: number;
   /**
-   * Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. trails: {seed:[[x,y]] — the stroke drawn along one aircraft trail, which is what the detector measures every other streak against; a path and not a box, because a trail is a line and a box around a diagonal one is mostly sky. At most 256 points, thinned by the client — plus sensitivity 0–100 (how much dimmer than the seed a streak may be), minLength 1–100 (shortest streak kept, as a percentage of the long edge) and grow 0–100 (margin drawn around each streak, as a percentage of a two-hundredth of the long edge — a trail is two or three pixels wide and the mask is meant to hug it). AI kinds carry {model, sourceHash, raster: <cached PNG path relative to <photo>.latent.d/>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched.
+   * Kind-specific, all coordinates normalised 0..1 over the image (Mask.space), never over the cropped view: use ViewRenderResult.imageTransform to put one on a canvas. A brush's `size` is a diameter as a fraction of the image's long edge, in the same space. linear: {start:[x,y], end:[x,y]}. radial: {center:[x,y], radius:[rx,ry], angle}. luminance: {range:[lo,hi], smoothness}. color: {samples:[[r,g,b]], range, smoothness}. brush: {size, flow} plus engine-owned `strokeData` (the stroke list — it lives in the op so one undo drops one stroke) and `strokes` (the path it is mirrored to); strokes are appended with mask.stroke, never sent whole. objects: {box:[x0,y0,x1,y1]} or {points:[[x,y]]}. people: {person, parts?}. text: {prompt}. trails: {seed:[[x,y]] — the stroke drawn along one aircraft trail, which is what the detector measures every other streak against; a path and not a box, because a trail is a line and a box around a diagonal one is mostly sky. At most 256 points, thinned by the client — plus sensitivity 0–100 (how much dimmer than the seed a streak may be), minLength 1–100 (shortest streak kept, as a percentage of the long edge) and grow 0–100 (margin drawn around each streak, as a percentage of a two-hundredth of the long edge — a trail is two or three pixels wide and the mask is meant to hug it). AI kinds carry {model, sourceHash, raster: <cached PNG path relative to the photo's raster dir>} once rasterised and `error` after a failed detect. A client round-trips strokeData, strokes, raster and error untouched.
    */
   params?: {
     [k: string]: unknown | undefined;
@@ -433,7 +433,7 @@ export interface MaskDetectResult {
   jobId: JobId;
 }
 /**
- * Runs monocular depth estimation over the photo (PROMPT.md 3.8) and caches the map as `<photo>.latent.d/depth.png`. Ticks job.progress with kind "depth" and publishes depth.changed when it lands. The map belongs to the photo rather than to the stack — it is not edit state, it costs no undo step, and no slider can make it stale — so re-running it is always an explicit ask. A `relight` op renders nothing until one exists, and a `depth` mask component contributes nothing.
+ * Runs monocular depth estimation over the photo (PROMPT.md 3.8) and caches the map as `depth.png` in the photo's raster dir ($XDG_DATA_HOME/latent/rasters/<sha256>/, keyed by the file's hash). Ticks job.progress with kind "depth" and publishes depth.changed when it lands. The map belongs to the photo rather than to the stack — it is not edit state, it costs no undo step, and no slider can make it stale — so re-running it is always an explicit ask. A `relight` op renders nothing until one exists, and a `depth` mask component contributes nothing.
  */
 export interface DepthEstimateParams {
   photoId: PhotoId;
@@ -745,7 +745,7 @@ export interface PhotoOpenResult {
    */
   sidecarLoaded: boolean;
   /**
-   * True when `<photo>.latent.d/depth.png` was there and is loaded. False means a relight op would render nothing until depth.estimate is called.
+   * True when `depth.png` in the photo's raster dir ($XDG_DATA_HOME/latent/rasters/<sha256>/, keyed by the file's hash) was there and is loaded. False means a relight op would render nothing until depth.estimate is called.
    */
   depthReady?: boolean;
   catalog?: CatalogPhoto;
