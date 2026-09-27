@@ -42,7 +42,7 @@ bool generative_is_stale(const Stack& stack, const Op& op);
 // field is derived, so it never reaches the sidecar: the server adds it on the way out.
 void annotate_generative_stale(nlohmann::json& stack_json, const Stack& stack);
 
-// `generative/<opId>.png`, relative to `<photo>.latent.d/` (ops/mask.h, sidecar_dir_for).
+// `generative/<opId>.png`, relative to the photo's raster dir (ops/mask.h, raster_dir_for).
 std::string generative_result_relative_path(std::string_view op_id);
 
 // Which graph an op asks for: "fill", "remove", "denoise" or "upscale". An op that is not

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 using namespace latent;
 
@@ -277,4 +278,25 @@ TEST_CASE("a non-recursive root covers only itself") {
   REQUIRE(folders.at(0).watched);
   REQUIRE(folders.at(1).path == "/photos/trip/raw");
   REQUIRE(!folders.at(1).watched);
+}
+
+TEST_CASE("opening an old catalog drops rasters the scan once imported as photos") {
+  TemporaryCatalog catalog;
+  catalog->register_photo("/photos/a.arw", sample("Sony A6400", 100), true);
+  catalog->register_photo("/photos/a.arw.latent.d/masks/m1.0123456789abcdef.png", sample("", 0),
+                          false);
+  catalog->register_photo("/photos/a.arw.latent.d/depth.png", sample("", 0), false);
+  catalog->register_photo("/photos/b.latent.png", sample("", 0), false);
+
+  // Back to the schema version before the scan knew about `*.latent.d/`.
+  sqlite3* db = nullptr;
+  REQUIRE(sqlite3_open(catalog.path().c_str(), &db) == SQLITE_OK);
+  REQUIRE(sqlite3_exec(db, "PRAGMA user_version=2", nullptr, nullptr, nullptr) == SQLITE_OK);
+  sqlite3_close(db);
+
+  Catalog reopened(catalog.path());
+  REQUIRE(reopened.find_by_path("/photos/a.arw").has_value());
+  REQUIRE(reopened.find_by_path("/photos/b.latent.png").has_value());
+  REQUIRE(!reopened.find_by_path("/photos/a.arw.latent.d/depth.png").has_value());
+  REQUIRE(reopened.list({}).total == 2);
 }

@@ -1,5 +1,7 @@
 #include "image/import_image.h"
 
+#include "ops/mask.h"
+
 #include <cmath>
 #include <csetjmp>
 #include <cstdint>
@@ -553,6 +555,10 @@ bool is_rendered_extension(const std::string& path) {
 
 bool is_photo_extension(const std::string& path) {
   return is_raw_extension(path) || is_rendered_extension(path);
+}
+
+bool is_importable_photo(const std::string& path) {
+  return is_photo_extension(path) && !is_inside_legacy_raster_dir(path);
 }
 
 DecodedRaw decode_rendered_image(const std::string& path, uint32_t min_long_edge) {

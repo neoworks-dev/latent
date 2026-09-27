@@ -1,5 +1,5 @@
 // Greyscale PNG in and out, 8-bit and 16-bit. The one place the engine needs it is the mask raster
-// cache under `<photo>.latent.d/masks/` (PROMPT.md 3.7): an AI component's raster is
+// cache under `<raster dir>/masks/` (ops/mask.h): an AI component's raster is
 // expensive to produce and has to survive a restart, so it lands on disk as a PNG rather
 // than as base64 inside the sidecar.
 #pragma once
@@ -25,7 +25,7 @@ std::vector<uint8_t> encode_gray_png(const GrayImage& image);
 // engine can read.
 std::optional<GrayImage> read_gray_png(const std::string& path);
 
-// The same pair for a 16-bit map: the depth cache (`<photo>.latent.d/depth.png`). Written
+// The same pair for a 16-bit map: the depth cache (`<raster dir>/depth.png`). Written
 // and read through libpng's linear-Y format, so the file is a true 16-bit grey PNG and the
 // round trip is exact.
 void write_gray16_png(const std::string& path, const Gray16Image& image);

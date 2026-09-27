@@ -7,6 +7,15 @@ import { fileURLToPath } from "node:url";
 
 export const engineExecutable =
   process.env.LATENTD ?? fileURLToPath(new URL("../build/dev/latentd", import.meta.url));
+export const modelStore =
+  process.env.LATENT_MODEL_STORE ??
+  `${process.env.XDG_DATA_HOME ?? `${process.env.HOME}/.local/share`}/latent/models`;
+
+/** A photo's raster dir under an engine started with `startEngine(scratch)`. */
+export function rasterDir(scratch: string, photoHash: string): string {
+  return `${scratch}/data/latent/rasters/${photoHash}`;
+}
+
 export const samplePath = process.env.LATENT_SAMPLE_RAW ?? "/home/moritz/Downloads/DSC00120.ARW";
 
 export function assert(condition: unknown, message: string): asserts condition {
@@ -87,6 +96,9 @@ export function startEngine(
         ...process.env,
         XDG_CONFIG_HOME: `${scratch}/config`,
         XDG_CACHE_HOME: `${scratch}/cache`,
+        // The raster store (ops/mask.h) resolves from here; models stay on the real store.
+        XDG_DATA_HOME: `${scratch}/data`,
+        LATENT_MODEL_STORE: modelStore,
         ...extraEnv,
       },
       stdout: "pipe",

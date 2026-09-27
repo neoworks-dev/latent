@@ -14,7 +14,7 @@ namespace latent {
 
 namespace {
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 
 constexpr const char* kSchema = R"(
 CREATE TABLE IF NOT EXISTS photos (
@@ -258,6 +258,9 @@ void Catalog::migrate() {
                              " is newer than this engine");
   }
   execute(db_, kSchema);
+  // Before version 3 the folder scan walked into `<photo>.latent.d/` and imported the mask
+  // rasters, depth maps and generative patches there as photos (ops/mask.h).
+  if (current < 3) execute(db_, "DELETE FROM photos WHERE path GLOB '*.latent.d/*'");
   execute(db_, ("PRAGMA user_version=" + std::to_string(kSchemaVersion)).c_str());
 }
 

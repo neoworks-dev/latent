@@ -77,8 +77,14 @@ mirror Lightroom 1:1.
   `GenerativeBackend`. ComfyUI only via `comfy` CLI (`~/.local/bin/comfy`, skill at
   `~/.claude/skills/comfy`). Graphs in `engine/workflows/`: fragments + blueprint, `comfy
   workflow compose`; compiled JSON is a template, substitute by node id at runtime.
+- `<photo>.latent` sidecar sits beside the photo; every raster it names (masks, stroke
+  mirrors, depth, generative patches) lives in `$XDG_DATA_HOME/latent/rasters/<sha256>/`
+  (`raster_dir_for(photo.hash)`, `engine/src/ops/mask.h`), keyed by the file's content hash
+  so a move outside the app orphans nothing. Never write beside the photo: older builds did
+  (`<photo>.latent.d/`), the scan imported those PNGs as photos (#36); open/export migrate
+  them. Test harness pins `XDG_DATA_HOME` to its scratch dir.
 - Relight (`PROMPT.md` §3.8) needs the photo's depth map: `depth.estimate` → Depth Anything
-  V2 Small → `<photo>.latent.d/depth.png`, **16-bit** (0 far / 65535 near), image space like
+  V2 Small → `depth.png` in the raster dir, **16-bit** (0 far / 65535 near), image space like
   a mask raster but uploaded at its own size as `r16uint` and filtered in the shader — 8 bits
   terraces a sky and the shadow march draws a contour on every terrace, and a nearest-
   neighbour resample blocks it. An 8-bit map from an older build reads as absent.
@@ -185,9 +191,12 @@ Anything bigger than one simple change runs this loop:
    like, same shape as the existing bodies. Label it: one `type:`, one or more `area:`, one
    `priority:`, `status:` only if it is blocked or unreproduced.
 2. **Branch off `main`**, named `<issue>-<slug>` (`31-job-queue`). Never work on `main`.
-3. **PR to `main`** when the work is verified — every check in _Verification_ green, and a
-   screenshot for visual work. Body ends with `Closes #<issue>`, so the merge closes it.
-4. Merge only after the checks pass. Never merge unverified into `main`.
+3. **Draft PR up front.** First commit, `git push -u`, `gh pr create --draft` against
+   `main` — plan in the body, ending `Closes #<issue>`, so the merge closes it. Commit
+   locally while working; push once at the end.
+4. **Ready when verified** — every check in _Verification_ green, and a screenshot for
+   visual work. Push, update the body with what changed + how verified, `gh pr ready`.
+5. Merge only after the checks pass. Never merge unverified into `main`.
 
 One simple change — typo, one-file fix, a comment — skips the issue and goes on a branch as
 asked. Splitting a large ask into several issues is fine and usually right; say which ones.

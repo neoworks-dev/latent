@@ -197,7 +197,6 @@ console.log(`brush component coverage ${(brush.coverage * 100).toFixed(1)}%`);
 
 const sidecar = `${samplePath}.latent`;
 if (existsSync(sidecar)) await Bun.file(sidecar).delete();
-rmSync(`${samplePath}.latent.d`, { recursive: true, force: true });
 client.close();
 engine.process.kill("SIGTERM");
 await engine.process.exited;
