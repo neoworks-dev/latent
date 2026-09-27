@@ -12,6 +12,7 @@
   import type { Context } from "@neoworks/extension-system";
   import { Button, FloatingScrollbar, Tooltip } from "@neoworks-dev/ui";
   import ArrowsOutIcon from "phosphor-svelte/lib/ArrowsOutIcon";
+  import ChatCircleDotsIcon from "phosphor-svelte/lib/ChatCircleDotsIcon";
   import CropIcon from "phosphor-svelte/lib/CropIcon";
   import DropHalfIcon from "phosphor-svelte/lib/DropHalfIcon";
   import SelectionBackgroundIcon from "phosphor-svelte/lib/SelectionBackgroundIcon";
@@ -78,6 +79,7 @@
     layers: StackSimpleIcon,
     export: UploadSimpleIcon,
     python: TerminalWindowIcon,
+    assistant: ChatCircleDotsIcon,
   };
   const railLabels: Record<string, string> = {
     edit: "Edit",
@@ -90,6 +92,7 @@
     layers: "Layers",
     export: "Export",
     python: "Python — Ctrl+`",
+    assistant: "Assistant",
   };
 
   const showsLeft = $derived(left.length > 0 && showsRegion(chrome, "left"));
