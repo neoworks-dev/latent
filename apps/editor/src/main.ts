@@ -1,4 +1,5 @@
 import "./app.css";
+import { assistantPlugin } from "@latent/plugin-assistant";
 import { catalogPlugin } from "@latent/plugin-catalog";
 import { consolePlugin } from "@latent/plugin-console";
 import { cropPlugin } from "@latent/plugin-crop";
@@ -59,6 +60,8 @@ void root.plugin(planesPlugin);
 // Export last in the rail, after the catalog it reads its selection from.
 void root.plugin(exportPlugin);
 void root.plugin(consolePlugin);
+// Beside the console: the other way of driving the engine by words rather than sliders.
+void root.plugin(assistantPlugin);
 // The left column. After the catalog, whose thumbnails the navigator draws, and after the
 // panels, whose op descriptions the history rows are labelled and formatted with.
 void root.plugin(developPlugin);

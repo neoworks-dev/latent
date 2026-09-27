@@ -1,9 +1,11 @@
-// Electron main. Does two things and nothing else: spawns latentd and opens the one
-// window. State, pixels, scripting, MCP all live in the engine (PROMPT.md §4.1).
+// Electron main. Spawns latentd and the agent harness sidecar, and opens the one window;
+// nothing else. State, pixels, scripting, MCP all live in the engine (PROMPT.md §4.1); the
+// sidecar only runs the Assistant's agents, which act through the engine's MCP server.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { EngineProcess } from "./engine-process";
+import { HarnessProcess, resolveHarnessCli } from "./harness-process";
 
 const developmentUrl = process.env.LATENT_EDITOR_URL;
 const editorBuildDir = join(import.meta.dirname, "../../../editor/dist");
@@ -28,6 +30,11 @@ ipcMain.handle("engine:endpoint", () => {
   if (externalEngineUrl) return externalEngineUrl;
   return engine?.endpoint();
 });
+
+// Optional: without the sidecar the Assistant says so and everything else works.
+const harnessCli = resolveHarnessCli();
+const harness = harnessCli ? new HarnessProcess(harnessCli) : null;
+ipcMain.handle("harness:endpoint", () => harness?.endpoint() ?? null);
 ipcMain.handle("dialog:pickFiles", async (event): Promise<string[]> => {
   const parent = BrowserWindow.fromWebContents(event.sender);
   const options: Electron.OpenDialogOptions = {
@@ -103,9 +110,16 @@ function createWindow(): void {
 }
 
 void app.whenReady().then(async () => {
+  const sidecar = harness?.start().catch((error: unknown) => {
+    process.stderr.write(`[harness] not started: ${String(error)}\n`);
+  });
   await engine?.start();
+  await sidecar;
   createWindow();
 });
 
 app.on("window-all-closed", () => app.quit());
-app.on("will-quit", () => engine?.stop());
+app.on("will-quit", () => {
+  engine?.stop();
+  harness?.stop();
+});
