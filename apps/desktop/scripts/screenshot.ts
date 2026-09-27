@@ -34,6 +34,10 @@
 // the panel column and the History pane checked afterwards — a preset is one whole-stack
 // write, so twelve sliders move in one undo step.
 //
+// `--flow history` branches the History pane: a preset applied and undone, another applied
+// in its place, the graph shot with the first one on a lane of its own (`-branch.png`),
+// then that branch merged back in.
+//
 // `--flow curve` drives the hand-built tone curve: the Point/RGB tab, a click that adds a
 // control point, a drag that moves it, one undo that takes the whole drag, a second point
 // on the Red channel, then the Parametric tab's region slider and split handles. The
@@ -1225,10 +1229,11 @@ if (flow === "catalog") {
   await window.waitForSelector('[data-pane="masks"]', { timeout: 10_000 });
   await window.waitForSelector("[data-create-mask]", { timeout: 10_000 });
 
-  // Create a radial, then drag one on the overlay: press at the centre, release at a
-  // corner of the ellipse. The component exists after the first call; the drag resizes it.
-  await window.locator('[data-create-mask] [aria-haspopup="listbox"]').click();
-  await window.getByRole("option", { name: "Radial gradient" }).click();
+  // A new mask, then a radial in it, then a drag on the overlay: press at the centre,
+  // release at a corner of the ellipse. The component exists after the click; the drag
+  // resizes it.
+  await window.locator("[data-create-mask] button").click();
+  await window.locator('[data-add-component] [data-add-kind="radial"]').click();
   await window.waitForSelector('[data-mask-component="radial1"]', { timeout: 10_000 });
   const created = await coverageAbove(0);
   console.log(`[shot] radial created, mask.preview covers ${(created * 100).toFixed(1)}%`);
@@ -1994,6 +1999,56 @@ if (flow === "catalog") {
   await window.keyboard.press("Control+z");
   await window.waitForFunction(readoutIs, { op: "contrast", text: "0" }, { timeout: 10_000 });
   console.log("[shot] undo took the revert, then the whole preset, back off");
+} else if (flow === "history") {
+  await window.waitForSelector('[data-pane="presets"]', { timeout: 30_000 });
+  await window.waitForSelector('[data-pane="history"] [data-history-step]', { timeout: 30_000 });
+  const rowCount = (): Promise<number> => window.locator("[data-history-step]").count();
+  const waitForRows = (count: number): Promise<unknown> =>
+    window.waitForFunction(
+      (want: number) => document.querySelectorAll("[data-history-step]").length === want,
+      count,
+      { timeout: 10_000 },
+    );
+
+  // One preset applied and undone, then a different one: the first is not thrown away but
+  // left as a branch beside the second.
+  const start = await rowCount();
+  await window.locator('[data-preset-group="Cinematic"]').click();
+  await window.locator('[data-preset="builtin:teal-orange"]').click();
+  await waitForRows(start + 1);
+  await window.keyboard.press("Control+z");
+  await window.waitForSelector("[data-history-merge]", { timeout: 10_000 });
+  const firstOpen = window.locator("[data-preset]").first();
+  const secondPreset = await firstOpen.getAttribute("data-preset");
+  await firstOpen.click();
+  await waitForRows(start + 2);
+  const lanes = await window
+    .locator("[data-history-lane]")
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-history-lane")));
+  console.log(`[shot] teal & orange undone, ${secondPreset} applied: lanes ${lanes.join(" ")}`);
+  if (!lanes.includes("1")) throw new Error("the undone preset should sit on a second lane");
+  await window.locator('[data-pane="history"]').scrollIntoViewIfNeeded();
+  await capture(outputPath.replace(/\.png$/, "-branch.png"));
+
+  // Merging the old branch back: one more step, with both presets' ops in the stack.
+  await window.locator("[data-history-merge]").first().click();
+  await waitForRows(start + 3);
+  const newest = window.locator("[data-history-step]").first();
+  console.log(
+    `[shot] merged: newest row reads "${(await newest.innerText()).replace(/\n/g, " ")}"`,
+  );
+  if (!(await newest.innerText()).startsWith("Merged “Teal & orange applied”")) {
+    throw new Error("the newest step should be the merge");
+  }
+  await window.waitForFunction(
+    () => document.querySelectorAll("[data-history-merge]").length === 0,
+    null,
+    {
+      timeout: 10_000,
+    },
+  );
+  await capture(outputPath);
+  console.log(`[shot] wrote ${outputPath}`);
 } else if (flow === "export") {
   // The Export rail mode end to end: pick a format and a colour space, type a folder, run
   // it, and wait for the bar to report `done`. On `--engine real` the file it names is
@@ -2249,8 +2304,8 @@ if (flow === "catalog") {
   }
   await window.waitForSelector('[data-pane="masks"]', { timeout: 10_000 });
   await window.waitForSelector("[data-create-mask]", { timeout: 10_000 });
-  await window.locator('[data-create-mask] [aria-haspopup="listbox"]').click();
-  await window.getByRole("option", { name: "Radial gradient" }).click();
+  await window.locator("[data-create-mask] button").click();
+  await window.locator('[data-add-component] [data-add-kind="radial"]').click();
   await window.waitForSelector('[data-mask-component="radial1"]', { timeout: 10_000 });
   console.log("[shot] a radial mask on the exposure layer");
 

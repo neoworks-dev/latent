@@ -16,6 +16,7 @@ export type MethodName =
   | "history.list"
   | "history.jump"
   | "history.revertOp"
+  | "history.merge"
   | "view.open"
   | "view.close"
   | "view.render"
@@ -217,6 +218,8 @@ export interface LatentProtocol {
   HistoryJumpResult?: StackGetResult;
   HistoryRevertOpParams?: HistoryRevertOpParams;
   HistoryRevertOpResult?: StackGetResult;
+  HistoryMergeParams?: HistoryMergeParams;
+  HistoryMergeResult?: StackGetResult;
   ViewOpenParams?: ViewOpenParams;
   ViewOpenResult?: ViewOpenResult;
   ViewCloseParams?: ViewCloseParams;
@@ -568,11 +571,11 @@ export interface StackGetResult {
   canRedo: boolean;
   histogram?: Histogram;
   /**
-   * Which snapshot of the undo stack this is, counting the photo's opening state as 0. `revision` is a change counter that advances on every write, transient drag ticks included; this counts undo steps, so a slider drag moves it by one however many frames it took.
+   * Which step of the history tree this is (HistoryStep.index); the oldest kept is 0 and every new step takes the next number, whatever branch it is on. `revision` is a change counter that advances on every write, transient drag ticks included; this counts undo steps, so a slider drag moves it by one however many frames it took.
    */
   historyIndex?: number;
   /**
-   * How many snapshots the undo stack holds, the opening state included, so `historyIndex + 1 == historyDepth` means nothing is left to redo.
+   * How many steps the history tree holds, every branch and the opening state included. `canRedo` says whether there is anything to redo; on a tree this count does not.
    */
   historyDepth?: number;
 }
@@ -715,6 +718,13 @@ export interface EngineHelloResult {
    * Streamable-HTTP endpoint of the engine's MCP server, e.g. http://127.0.0.1:7801/mcp. Absent when the daemon was started with --no-mcp or the SDK failed to load.
    */
   mcpUrl?: string;
+  /**
+   * The photo photo.open last opened in this catalog, from any client and across restarts, so a UI can come back on it. Absent on a fresh catalog, or when that row or its file is gone.
+   */
+  lastPhoto?: {
+    photoId: number;
+    path: string;
+  };
   gpu: {
     adapter: string;
     maxTextureDimension2D: number;
@@ -862,7 +872,7 @@ export interface OpRemoveParams {
   opId: OpId;
 }
 /**
- * One parameter this step moved. `from` and `to` are the parameter's own values, so the UI formats them with the spec ops.describe gave the control. A value that is not a scalar - a curve's point list - is reported as a change with neither, since a list of points is nothing a history row can show.
+ * One parameter this step moved. `from` and `to` are the parameter's own values, so the UI formats them with the spec ops.describe gave the control. A value that is not a scalar - a curve's point list - is reported as a change with neither, since a list of points is nothing a history row can show. On a `mask` step `param` names a mask component instead: `radial1` is the component arriving (`to` is its kind) or leaving (`from` is), `radial1.feather` one property of it.
  */
 export interface HistoryChange {
   param: string;
@@ -879,10 +889,18 @@ export interface HistoryEntry {
   changes?: HistoryChange[];
 }
 /**
- * One snapshot of the undo stack, described by what it changed from the snapshot before it. Index 0 is the state the photo opened in, so its kind is `initial` and it has no changes. A drag is one step: the engine replaces the snapshot in place while it runs (StackGetResult.historyIndex).
+ * One step of the history tree, described by what it changed from its `parent`. The step without a parent is the oldest state kept, so its kind is `initial` and it has no changes. A drag is one step: the engine replaces the snapshot in place while it runs (StackGetResult.historyIndex).
  */
 export interface HistoryStep {
   index: number;
+  /**
+   * The step this one was made from. Always a lower index; absent on the initial step. Two steps with one parent are two branches: an edit made after an undo starts one instead of dropping the steps it undid.
+   */
+  parent?: number;
+  /**
+   * A merge only (history.merge): the branch step joined into `parent`. The step is still described against `parent`, so its changes are what the merge brought in.
+   */
+  mergedFrom?: number;
   kind: "initial" | "add" | "remove" | "update" | "mask" | "reorder" | "batch";
   /**
    * The op this step is about, by name: `exposure`, `group`. Absent on `initial`, `reorder` and `batch`, which are about the stack rather than one entry.
@@ -900,14 +918,14 @@ export interface HistoryStep {
   changes?: HistoryChange[];
 }
 /**
- * The whole undo stack of one photo, described. One entry per snapshot, oldest first; `index` is where the cursor sits, the same number StackGetResult.historyIndex carries.
+ * The whole history tree of one photo, described. One entry per step, oldest first, each naming its parent; `index` is the step on screen, the same number StackGetResult.historyIndex carries. Undo walks to the parent, redo back down to the child last left.
  */
 export interface HistoryListResult {
   entries: HistoryStep[];
   index: number;
 }
 /**
- * Moves the undo cursor straight to one snapshot - clicking a row of the history list. Out of range is -32602; the step that is already current is accepted and changes nothing.
+ * Moves the undo cursor straight to one step, on any branch - clicking a row of the history list. Out of range is -32602; the step that is already current is accepted and changes nothing.
  */
 export interface HistoryJumpParams {
   photoId: PhotoId;
@@ -920,6 +938,13 @@ export interface HistoryRevertOpParams {
   photoId: PhotoId;
   index: number;
   opId: OpId;
+}
+/**
+ * Joins step `index` - the tip of another branch - into the step on screen, as a new step with both as parents (HistoryStep.mergedFrom). Three-way from the step they parted at: what only one side changed is kept, ops and mask components are matched by id, and where both sides changed the same value the merged-in branch wins. -32602 when the step is out of range or is already part of the current one.
+ */
+export interface HistoryMergeParams {
+  photoId: PhotoId;
+  index: number;
 }
 /**
  * A view is one canvas showing one photo at one proxy size. Frames for it arrive as LFRM binary frames tagged with viewId.

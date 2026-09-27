@@ -28,7 +28,8 @@ async function harnessEndpoint(): Promise<HarnessEndpoint | null> {
 
 export const assistantPlugin: Plugin.Object<void> = {
   name: "assistant",
-  inject: ["engine", "panes", "viewer"],
+  // `panels` for the chat's change rows: their labels, and the flash a click sends there.
+  inject: ["engine", "panes", "viewer", "panels"],
   apply(ctx: Context) {
     const state = new AssistantState(ctx.engine, ctx.viewer, localStorage);
     ctx.provide("assistant", state);

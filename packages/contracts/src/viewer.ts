@@ -518,6 +518,12 @@ export interface ViewerService {
    */
   readonly histogram: Histogram | null;
   /**
+   * True while adjustments are being written — a slider drag, a click, a key nudge — and
+   * briefly after the last one. Mask edits do not count. The Masks panel hides its tint
+   * while this is up, the way Lightroom does, so the adjustment is judged on the pixels.
+   */
+  readonly adjusting: boolean;
+  /**
    * Merge `params` into the op with this name, adding it to the stack when absent.
    * `transient` is true while a slider is dragged: no history snapshot, no sidecar.
    */

@@ -5,6 +5,7 @@
   import {
     controlKind,
     controlValue,
+    isHighlighted,
     pendingNote,
     rowLabel,
     sliderRange,
@@ -31,7 +32,12 @@
      */
     rowName?: string | null;
   } = $props();
-  const viewer = kernelContext().viewer;
+  const ctx = kernelContext();
+  const viewer = ctx.viewer;
+  const panels = ctx.panels;
+
+  let row = $state<HTMLDivElement | null>(null);
+  let flashing = $state(false);
 
   const kind = $derived(controlKind(spec));
   const range = $derived(sliderRange(spec));
@@ -67,11 +73,29 @@
     if (!(target instanceof HTMLInputElement)) return;
     write(target.checked, false);
   }
+
+  $effect(() => {
+    const target = panels.highlighted;
+    const element = row;
+    if (!element) return;
+    if (!isHighlighted(target, { op: op.name, param: spec.name, opId }, Date.now())) return;
+    element.scrollIntoView({ block: "center", behavior: "smooth" });
+    flashing = true;
+    const timer = setTimeout(() => (flashing = false), 1600);
+    return () => clearTimeout(timer);
+  });
 </script>
 
 <!-- More room on the right than the left: the reset dot hangs off the end of the box and
      would otherwise sit under the column's edge. -->
-<div class="py-[3px] pr-3 pl-2" data-op={op.name} data-param={spec.name}>
+<div
+  bind:this={row}
+  class="rounded-md py-[3px] pr-3 pl-2 transition-colors duration-700"
+  class:bg-blue-soft={flashing}
+  data-op={op.name}
+  data-param={spec.name}
+  data-highlighted={flashing}
+>
   {#if kind === "slider"}
     <BoxedSlider
       value={Number(current)}

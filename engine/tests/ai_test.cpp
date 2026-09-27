@@ -456,8 +456,7 @@ TEST_CASE("the local denoise cleans a frame without leaving a tile edge in it", 
           40.0;
       const size_t at = (((static_cast<size_t>(y) * kWidth) + x) * 3);
       for (size_t channel = 0; channel < 3; ++channel) {
-        noisy.pixels[at + channel] =
-            static_cast<uint8_t>(std::clamp(level + grain, 0.0, 255.0));
+        noisy.pixels[at + channel] = static_cast<uint8_t>(std::clamp(level + grain, 0.0, 255.0));
       }
     }
   }

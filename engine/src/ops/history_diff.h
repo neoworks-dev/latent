@@ -3,10 +3,12 @@
 // no label lives here.
 #pragma once
 
+#include "ops/history.h"
 #include "ops/op.h"
 
 #include <cstddef>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,9 @@ struct HistoryStep {
   std::vector<HistoryStep> entries;
   // What the caller called the step (`stack.set`'s `label`), for the steps that carry one.
   std::string label;
+  // Where the step sits in the history tree (HistoryNode), by step id.
+  std::optional<size_t> parent;
+  std::optional<size_t> merged_from;
 };
 
 // The step from `before` to `after`. A commit that touched one op is described in full; one
@@ -43,10 +48,9 @@ struct HistoryStep {
 // one can put one of them back on its own.
 HistoryStep describe_step(const Stack& before, const Stack& after);
 
-// One step per snapshot, oldest first; `steps[0]` is the opening state. `labels` is
-// History::labels(), one per snapshot; a short list simply names fewer steps.
-std::vector<HistoryStep> describe_history(const std::vector<Stack>& snapshots,
-                                          const std::vector<std::string>& labels = {});
+// One step per history node, oldest first, each described against its parent; the root is
+// the opening state. A merge is described against the step it was merged into.
+std::vector<HistoryStep> describe_history(const std::vector<HistoryNode>& nodes);
 
 nlohmann::json history_step_to_json(const HistoryStep& step, size_t index);
 

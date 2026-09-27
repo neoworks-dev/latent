@@ -1202,6 +1202,38 @@ assert(
 );
 await ui.call("history.jump", { photoId, index: afterDragRedo.historyIndex });
 
+// An edit after an undo is a branch, not the end of the steps undone; merging the old branch
+// back brings its op along with the new one.
+await ui.call("history.undo", { photoId });
+const branched = await ui.call("op.add", { photoId, op: "vibrance", params: { value: 30 } });
+const branchRows = await ui.call("history.list", { photoId });
+assert(
+  branchRows.entries.at(-1).parent === beforeDrag.historyIndex &&
+    branchRows.entries.some((entry: any) => entry.index === afterDragRedo.historyIndex),
+  "an edit after an undo must branch off the step undone to and keep the steps undone",
+);
+const merged = await timed("history.merge", () =>
+  ui.call("history.merge", { photoId, index: afterDragRedo.historyIndex }),
+);
+assert(
+  merged.stack.some((op: any) => op.id === dragId) &&
+    merged.stack.some((op: any) => op.id === branched.opId),
+  "a merge must keep the op each branch added",
+);
+const mergeStep = (await ui.call("history.list", { photoId })).entries.at(-1);
+assert(
+  mergeStep.parent === branched.historyIndex &&
+    mergeStep.mergedFrom === afterDragRedo.historyIndex,
+  `a merge step must name both parents: ${JSON.stringify(mergeStep)}`,
+);
+assert(
+  (await ui.fail("history.merge", { photoId, index: afterDragRedo.historyIndex })).startsWith(
+    "-32602",
+  ),
+  "merging a branch already merged must be refused",
+);
+await ui.call("history.jump", { photoId, index: afterDragRedo.historyIndex });
+
 // A preset is one stack.set that moves a dozen ops. It arrives as one step, named by the
 // caller because the diff cannot know a dozen ops were one click, and listing the ops it
 // touched so a row can be unfolded.
@@ -1218,12 +1250,18 @@ const preset = await timed("stack.set (preset)", () =>
     ],
   }),
 );
+// Steps are numbered across every branch, so "one step" is one more of them, hung off the
+// step the preset was applied to.
 assert(
-  preset.historyIndex === beforePreset.historyIndex + 1,
-  `a preset must be one history step, not ${preset.historyIndex - beforePreset.historyIndex}`,
+  preset.historyDepth === beforePreset.historyDepth + 1,
+  `a preset must be one history step, not ${preset.historyDepth - beforePreset.historyDepth}`,
 );
 const presetRows = await ui.call("history.list", { photoId });
 const presetStep = presetRows.entries.at(-1);
+assert(
+  presetStep.parent === beforePreset.historyIndex,
+  `the preset's step must hang off the step it was applied to: ${presetStep.parent}`,
+);
 assert(
   presetStep.kind === "batch" && presetStep.label === "Golden hour applied",
   `the preset's step should be a named batch, not ${presetStep.kind} "${presetStep.label}"`,
@@ -1555,6 +1593,7 @@ assert(
       "generative_fill",
       "generative_remove",
       "generative_status",
+      "get_histogram",
       "get_stack",
       "list_photos",
       "merge_hdr",
@@ -1577,6 +1616,7 @@ const agentRun = await timed("mcp run_python", () =>
       name: "run_python",
       arguments: {
         code: "latent.photo.develop.exposure = 2.5\nlatent.photo.develop.exposure",
+        explanation: "Brighten the photo by two and a half stops",
         photo_id: photoId,
       },
     },
@@ -1627,6 +1667,28 @@ assert(
   "get_stack lost the exposure op",
 );
 
+const agentHistogram = await timed("mcp get_histogram", () =>
+  mcp({
+    jsonrpc: "2.0",
+    id: 40,
+    method: "tools/call",
+    params: { name: "get_histogram", arguments: { photo_id: photoId } },
+  }),
+);
+const tones = agentHistogram.result.structuredContent;
+const zoneTotal = Object.values(tones.channels.g.zonesPct as Record<string, number>).reduce(
+  (sum, share) => sum + share,
+  0,
+);
+console.log(`  histogram g: mean ${tones.channels.g.mean}, zones ${JSON.stringify(tones.channels.g.zonesPct)}`);
+assert(Math.abs(zoneTotal - 100) < 1, `the five zones must cover the photo, got ${zoneTotal}%`);
+assert(tones.channels.r.bucketsPct.length === 32, "get_histogram must bucket each channel 32 ways");
+assert(
+  tones.channels.b.percentiles.p1 <= tones.channels.b.percentiles.p99,
+  "percentiles must rise",
+);
+assert(typeof tones.clipping.highlightsPct === "number", "get_histogram must carry clipping");
+
 const preview = await timed("mcp render_preview", () =>
   mcp({
     jsonrpc: "2.0",
@@ -1646,6 +1708,52 @@ assert(
   "render_preview did not return JPEG bytes",
 );
 console.log(`  preview ${jpeg.length} bytes of JPEG`);
+
+/** Width and height from a baseline or progressive JPEG's SOF marker. */
+function jpegSize(bytes: Uint8Array): { width: number; height: number } {
+  let at = 2;
+  while (at + 9 < bytes.length) {
+    const marker = bytes[at + 1]!;
+    const length = (bytes[at + 2]! << 8) | bytes[at + 3]!;
+    if (marker === 0xc0 || marker === 0xc2) {
+      return {
+        height: (bytes[at + 5]! << 8) | bytes[at + 6]!,
+        width: (bytes[at + 7]! << 8) | bytes[at + 8]!,
+      };
+    }
+    at += 2 + length;
+  }
+  throw new Error("no SOF marker in the JPEG");
+}
+
+// render_preview(region=…) zooms instead of cropping: a tenth of the photo still comes back
+// at the size asked for, in the region's own shape.
+const zoomed = await timed("mcp render_preview (region)", () =>
+  mcp({
+    jsonrpc: "2.0",
+    id: 60,
+    method: "tools/call",
+    params: {
+      name: "render_preview",
+      arguments: { photo_id: photoId, max_size: 512, region: [0.4, 0.4, 0.5, 0.45] },
+    },
+  }),
+);
+const zoomedBlock = zoomed.result.content[0];
+assert(zoomedBlock?.type === "image", `a region preview must be an image: ${JSON.stringify(zoomed.result)}`);
+const zoomedSize = jpegSize(Uint8Array.from(atob(zoomedBlock.data), (c) => c.charCodeAt(0)));
+const regionAspect = (0.1 * photo.width) / (0.05 * photo.height);
+console.log(
+  `  zoomed region ${zoomedSize.width}x${zoomedSize.height}, region aspect ${regionAspect.toFixed(2)}`,
+);
+assert(
+  Math.max(zoomedSize.width, zoomedSize.height) === 512,
+  `a zoomed region comes back max_size long, got ${zoomedSize.width}x${zoomedSize.height}`,
+);
+assert(
+  Math.abs(zoomedSize.width / zoomedSize.height / regionAspect - 1) < 0.05,
+  `a zoomed region keeps its own shape: ${zoomedSize.width}x${zoomedSize.height} for ${regionAspect.toFixed(2)}`,
+);
 
 // render_preview(mask=…) hands back the raster instead of the picture, so an agent can
 // check what it selected rather than describe it (PROMPT.md 3.7).
@@ -1955,12 +2063,26 @@ const reopened = await timed("photo.open (sidecar)", () =>
 );
 assert(reopened.photoId === photoId, "the catalog id must be stable across close and open");
 assert(reopened.sidecarLoaded === true, "reopening must report that the sidecar was restored");
+// The catalog remembers it, so a restarted UI comes back on this photo (engine.hello).
+const helloAfterOpen = await ui.call("engine.hello", {});
+assert(
+  helloAfterOpen.lastPhoto?.photoId === reopened.photoId,
+  "engine.hello does not name the photo opened last",
+);
 photoId = reopened.photoId;
 const restored = await timed("stack.get (sidecar)", () => ui.call("stack.get", { photoId }));
 assert(restored.stack.length === 1, "the sidecar stack did not come back");
 assert(restored.stack[0].id === "cafe0002", "the sidecar lost the op id");
 assert(restored.stack[0].params.value === 30, "the sidecar lost the vibrance value");
-assert(restored.canUndo === false, "a freshly loaded stack has nothing to undo");
+// The undo history comes back with it (history.json in the raster dir): the reopened photo
+// can still undo the op.remove above.
+assert(restored.canUndo === true, "a reopened photo lost its undo history");
+const reopenedHistory = await ui.call("history.list", { photoId });
+assert(
+  reopenedHistory.entries.length > 1 &&
+    reopenedHistory.entries[reopenedHistory.index]?.kind === "remove",
+  "the restored history does not end on the op.remove made before the close",
+);
 assert(restored.histogram === undefined, "no view has rendered this photo yet");
 
 await timed("photo.close", () => ui.call("photo.close", { photoId }));

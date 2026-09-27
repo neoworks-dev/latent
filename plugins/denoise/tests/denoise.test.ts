@@ -131,14 +131,21 @@ describe("the manual filter beside it", () => {
       "color",
       "colorDetail",
     ]);
-    const amounts = manualSpecs.filter((spec) => spec.name === "luminance" || spec.name === "color");
+    const amounts = manualSpecs.filter(
+      (spec) => spec.name === "luminance" || spec.name === "color",
+    );
     expect(amounts.map((spec) => spec.default)).toEqual([0, 0]);
   });
 
   test("a slider shows the op's value, or the spec's default when the op has none", () => {
     const [luminance, detail] = manualSpecs;
     if (!luminance || !detail) throw new Error("the manual specs are the four the column draws");
-    const manual: Op = { id: "op2", op: MANUAL_DENOISE_OP, params: { luminance: 65 }, enabled: true };
+    const manual: Op = {
+      id: "op2",
+      op: MANUAL_DENOISE_OP,
+      params: { luminance: 65 },
+      enabled: true,
+    };
     expect(manualValue(manual, luminance)).toBe(65);
     expect(manualValue(manual, detail)).toBe(50);
     expect(manualValue(undefined, luminance)).toBe(0);

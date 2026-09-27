@@ -14,16 +14,35 @@
   import TrashIcon from "phosphor-svelte/lib/TrashIcon";
   import UniteIcon from "phosphor-svelte/lib/UniteIcon";
   import KindIcon from "./KindIcon.svelte";
-  import { featherSpec, isAiKind, kindSpec, opacitySpec } from "./masks";
+  import {
+    bandHighSpec,
+    bandLowSpec,
+    bandOf,
+    componentDetail,
+    featherSpec,
+    isAiKind,
+    isBandKind,
+    kindSpec,
+    movedBand,
+    opacitySpec,
+    smoothnessSpec,
+  } from "./masks";
 
-  const { component, index }: { component: MaskComponent; index: number } = $props();
+  const { component }: { component: MaskComponent } = $props();
   const masks = kernelContext().masks;
 
   const spec = $derived(kindSpec(component.kind));
+  const detail = $derived(componentDetail(component));
   const selected = $derived(masks.selectedComponentId === component.id);
   const feather = $derived(component.feather ?? 0);
   const opacity = $derived(component.opacity ?? 100);
   const failure = $derived(masks.errorOf(component));
+  // The engine only ever stores a string here (`normalize` rejects anything else).
+  const storedPrompt = $derived(String(component.params?.prompt ?? ""));
+  // The words being edited, seeded from the stored ones until the user types.
+  let draftPrompt = $state<string | null>(null);
+  const band = $derived(bandOf(component));
+  const smoothness = $derived(Number(component.params?.smoothness ?? 0.1));
 
   const modes = [
     { mode: "add" as const, icon: UniteIcon, label: "Add" },
@@ -33,6 +52,23 @@
 
   function write(patch: Partial<MaskComponent>, transient = false): void {
     void masks.patch(component.id, patch, transient);
+  }
+
+  function writeBand(edge: "low" | "high", percent: number, transient = false): void {
+    void masks.patchParams(component.id, { range: movedBand(band, edge, percent) }, transient);
+  }
+
+  function writeSmoothness(percent: number, transient = false): void {
+    void masks.patchParams(component.id, { smoothness: percent / 100 }, transient);
+  }
+
+  /** New words for a text mask: stored first, so the detection and the label both read them. */
+  async function searchAgain(): Promise<void> {
+    const prompt = (draftPrompt ?? storedPrompt).trim();
+    draftPrompt = null;
+    if (prompt === "") return;
+    await masks.patchParams(component.id, { prompt });
+    await masks.detect(component.id, { prompt });
   }
 </script>
 
@@ -53,8 +89,10 @@
       data-select-component={component.id}
     >
       <KindIcon kind={component.kind} size={13} />
-      <span class="truncate">{spec.label}</span>
-      <span class="text-faint">{index + 1}</span>
+      <span class="shrink-0">{spec.noun}</span>
+      {#if detail}
+        <span class="truncate text-faint" data-component-detail>{detail}</span>
+      {/if}
     </button>
 
     {#if component.state === "pending"}
@@ -97,6 +135,59 @@
 
   {#if selected}
     <div class="flex flex-col gap-1 px-3 pb-2">
+      {#if component.kind === "text"}
+        <form
+          class="flex items-center gap-1"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void searchAgain();
+          }}
+        >
+          <input
+            class="min-w-0 flex-1 rounded-sm border border-line-strong bg-input px-1.5 py-1
+                   text-xs text-default"
+            placeholder="the cat"
+            value={draftPrompt ?? storedPrompt}
+            oninput={(event) => (draftPrompt = event.currentTarget.value)}
+            data-component-prompt={component.id}
+          />
+          <Button size="sm" type="submit">Detect</Button>
+        </form>
+      {/if}
+      {#if isBandKind(component.kind)}
+        <!-- The band this component keeps. The raster is the channel itself, so moving an
+             edge is a shader pass, never another model run. -->
+        <p class="text-[10px] text-faint">
+          {component.kind === "depth" ? "0 = farthest · 100 = nearest" : "0 = black · 100 = white"}
+        </p>
+        <BoxedSlider
+          value={band[0] * 100}
+          spec={bandLowSpec}
+          range={{ min: 0, max: 100, step: 1 }}
+          label="From"
+          onInput={(next) => writeBand("low", next, true)}
+          onCommit={(next) => writeBand("low", next)}
+          onReset={() => writeBand("low", 50)}
+        />
+        <BoxedSlider
+          value={band[1] * 100}
+          spec={bandHighSpec}
+          range={{ min: 0, max: 100, step: 1 }}
+          label="To"
+          onInput={(next) => writeBand("high", next, true)}
+          onCommit={(next) => writeBand("high", next)}
+          onReset={() => writeBand("high", 100)}
+        />
+        <BoxedSlider
+          value={smoothness * 100}
+          spec={smoothnessSpec}
+          range={{ min: 0, max: 100, step: 1 }}
+          label="Smoothness"
+          onInput={(next) => writeSmoothness(next, true)}
+          onCommit={(next) => writeSmoothness(next)}
+          onReset={() => writeSmoothness(10)}
+        />
+      {/if}
       <div class="flex items-center gap-1" role="group" aria-label="Combine mode">
         {#each modes as entry (entry.mode)}
           <Tooltip text={entry.label} placement="top">

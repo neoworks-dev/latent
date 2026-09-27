@@ -122,6 +122,10 @@ class Catalog {
   void set_hash(int64_t photo_id, const std::string& hash);
   // Stamps edited_at with now; called on every non-transient stack change.
   void touch_edited(int64_t photo_id, bool has_sidecar);
+  // The photo photo.open last opened, so the UI comes back on it after a restart. Nullopt
+  // when none was, or when that row or its file is gone.
+  void set_last_photo(int64_t photo_id);
+  std::optional<CatalogPhoto> last_photo();
 
   std::vector<CatalogCollection> collections();
   int64_t create_collection(const std::string& name);

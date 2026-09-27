@@ -52,7 +52,14 @@ CREATE TABLE IF NOT EXISTS watched_folders (
   path TEXT PRIMARY KEY,
   recursive INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 )";
+
+// The `state` row holding the photo photo.open last opened.
+constexpr const char* kLastPhotoKey = "lastPhotoId";
 
 std::string now_iso8601() {
   const std::time_t when = std::time(nullptr);
@@ -433,6 +440,29 @@ void Catalog::touch_edited(int64_t photo_id, bool has_sidecar) {
   update.bind(2, static_cast<int64_t>(has_sidecar ? 1 : 0));
   update.bind(3, photo_id);
   update.run();
+}
+
+void Catalog::set_last_photo(int64_t photo_id) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Statement upsert(db_, "INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)");
+  upsert.bind(1, std::string(kLastPhotoKey));
+  upsert.bind(2, std::to_string(photo_id));
+  upsert.run();
+}
+
+std::optional<CatalogPhoto> Catalog::last_photo() {
+  int64_t photo_id = 0;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    Statement select(db_, "SELECT value FROM state WHERE key = ?");
+    select.bind(1, std::string(kLastPhotoKey));
+    if (!select.step()) return std::nullopt;
+    photo_id = std::strtoll(select.text(0).c_str(), nullptr, 10);
+  }
+  // A row removed since — or a file gone from the disk — is no photo to come back to.
+  std::optional<CatalogPhoto> photo = get(photo_id);
+  if (!photo.has_value() || !std::filesystem::exists(photo->path)) return std::nullopt;
+  return photo;
 }
 
 std::vector<CatalogCollection> Catalog::collections() {

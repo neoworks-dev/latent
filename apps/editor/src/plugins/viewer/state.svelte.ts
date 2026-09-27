@@ -52,6 +52,12 @@ interface PendingAdd {
 const VIEWPORT_RENDER_INTERVAL_MS = 60;
 
 /**
+ * How long `adjusting` stays up after the last adjustment write: past the gap between two
+ * ticks of a slow drag, short enough that the mask tint is back before the next slider.
+ */
+const ADJUSTING_HOLD_MS = 700;
+
+/**
  * Field by field, never by identity: `viewport` is a `$state` proxy and the rest are the
  * plain objects it was assigned from, so `===` between the two is the equality mismatch
  * Svelte warns about and is false even when they hold the same numbers.
@@ -124,6 +130,9 @@ export class ViewerState implements ViewerService, GeometryView {
    * rendered at the viewport the gesture has already left (contracts ViewerService).
    */
   frameGeometry = $state(0);
+  /** An adjustment was written in the last `ADJUSTING_HOLD_MS` (contracts ViewerService). */
+  adjusting = $state(false);
+  private adjustingTimer: ReturnType<typeof setTimeout> | null = null;
   readonly overlay = new ViewerOverlayState();
 
   // The last frame the engine answered about. Not what is on screen once a gesture has
@@ -200,6 +209,8 @@ export class ViewerState implements ViewerService, GeometryView {
     this.presentHandle = null;
     if (this.viewportTimer !== null) clearTimeout(this.viewportTimer);
     this.viewportTimer = null;
+    if (this.adjustingTimer !== null) clearTimeout(this.adjustingTimer);
+    this.adjustingTimer = null;
     this.unsubscribeFrame?.();
     this.unsubscribeStack();
     this.unsubscribeResolution();
@@ -527,8 +538,23 @@ export class ViewerState implements ViewerService, GeometryView {
       });
   }
 
+  /**
+   * Every write to what an op does — not to its mask — keeps `adjusting` up until the
+   * writes stop. A drag ticks far inside the hold, and a click or a key nudge gets the same
+   * brief window, so the mask tint is off for exactly as long as the user is judging pixels.
+   */
+  private markAdjusting(): void {
+    this.adjusting = true;
+    if (this.adjustingTimer !== null) clearTimeout(this.adjustingTimer);
+    this.adjustingTimer = setTimeout(() => {
+      this.adjustingTimer = null;
+      this.adjusting = false;
+    }, ADJUSTING_HOLD_MS);
+  }
+
   async setParam(op: string, params: Record<string, unknown>, transient: boolean): Promise<void> {
     if (this.photoId === null) return;
+    this.markAdjusting();
     // A mask is selected: the Edit column's sliders are that mask's, so the write goes into
     // its layer and adds the adjustment there rather than to the photo.
     const target = this.maskTarget;
@@ -545,6 +571,7 @@ export class ViewerState implements ViewerService, GeometryView {
   }
 
   setOpParams(opId: string, params: Record<string, unknown>, transient: boolean): Promise<void> {
+    this.markAdjusting();
     return this.updateOp(opId, params, transient);
   }
 
@@ -576,6 +603,7 @@ export class ViewerState implements ViewerService, GeometryView {
   ): Promise<void> {
     const photoId = this.photoId;
     if (photoId === null) return;
+    this.markAdjusting();
     const pendingAdd = this.addsInFlight.find((entry) => entry.op === `${groupId}:${op}`);
     if (pendingAdd) await pendingAdd.request;
     const group = this.stack.find((entry) => entry.id === groupId);
@@ -622,6 +650,7 @@ export class ViewerState implements ViewerService, GeometryView {
    * the tick is dropped while another write is in flight so a drag cannot queue up.
    */
   setOpacity(opId: string, value: number, transient: boolean): Promise<void> {
+    this.markAdjusting();
     if (transient && this.stackWriteBusy) return Promise.resolve();
     return this.writeOp({ opId, params: {}, opacity: value, transient });
   }

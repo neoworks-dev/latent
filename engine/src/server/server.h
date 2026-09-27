@@ -88,6 +88,8 @@ class Server : public EngineApi {
   bool redo(int64_t photo_id) override;
   std::vector<uint8_t> render_preview_jpeg(int64_t photo_id, uint32_t max_size,
                                            std::optional<PreviewRegion> region) override;
+  std::vector<uint8_t> render_zoomed_jpeg(int64_t photo_id, uint32_t max_size,
+                                          const PreviewRegion& region);
   nlohmann::json catalog_list(int limit) override;
   int64_t detect_mask(int64_t photo_id, const std::string& op_id,
                       const std::string& component_id) override;
@@ -164,6 +166,7 @@ class Server : public EngineApi {
   nlohmann::json handle_history_list(const nlohmann::json& params);
   nlohmann::json handle_history_jump(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_history_revert_op(const nlohmann::json& params, Peer* peer);
+  nlohmann::json handle_history_merge(const nlohmann::json& params, Peer* peer);
   nlohmann::json handle_view_open(const nlohmann::json& params);
   nlohmann::json handle_view_close(const nlohmann::json& params);
   nlohmann::json handle_view_render(const nlohmann::json& params, Peer* peer);
@@ -319,6 +322,14 @@ class Server : public EngineApi {
   void commit(PhotoState& photo, Stack next, bool transient, std::string_view source, Peer* origin,
               std::string_view client = {}, std::string label = {});
   void save_sidecar(PhotoState& photo);
+  // The undo history beside the photo's rasters (kHistoryFileName), written with every
+  // sidecar and read back at photo.open when its current step is the sidecar's stack.
+  void save_history(const PhotoState& photo);
+  void restore_history(PhotoState& photo);
+  // Mask rasters and generative results the current stack names, from the raster dir. After
+  // a history move too: the step undone to can name a raster a later detect replaced, and
+  // the renderer holds one per component.
+  void load_cached_rasters(const PhotoState& photo);
   OffscreenFrame render_offscreen(int64_t photo_id, uint32_t max_size);
   // The same, over a stack the caller chose rather than the photo's current one: what
   // mask.detect hands a model, which is the sub-stack below the masked op with the

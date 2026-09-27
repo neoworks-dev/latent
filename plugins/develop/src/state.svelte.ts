@@ -50,6 +50,15 @@ export class DevelopState {
     await this.engine.call("history.revertOp", { photoId, index, opId });
   }
 
+  /**
+   * Another branch joined into the step on screen. The engine does the three-way merge and
+   * commits it as a step with both parents; where both branches set one value, the branch
+   * merged in wins.
+   */
+  async merge(photoId: number, index: number): Promise<void> {
+    await this.engine.call("history.merge", { photoId, index });
+  }
+
   save(label: string, stack: Op[]): void {
     const name = label.trim();
     if (!name) return;

@@ -969,6 +969,15 @@ void Renderer::load_photo(int64_t photo_id, const DecodedRaw& raw) {
   gpu_.wait_idle();
   gpu_.raise_pending_error();
 
+  // A reload of the same photo keeps what photo.open loaded beside it: mask rasters, the
+  // depth map and generative results are image-space, so the full-resolution decode that
+  // replaces a cached preview leaves them valid. Dropping them here made every AI component
+  // answer "no cached raster" after a restart, once the background upgrade landed.
+  if (const auto previous = photos_.find(photo_id); previous != photos_.end()) {
+    photo->rasters = std::move(previous->second->rasters);
+    photo->depth = std::move(previous->second->depth);
+    photo->results = std::move(previous->second->results);
+  }
   photos_[photo_id] = std::move(photo);
   // A second load of the same photo replaces the texture every open view downscaled its
   // base from, so those bases are stale even though nothing about the view changed.
@@ -1688,8 +1697,8 @@ WGPUTextureView Renderer::run_passes(View& view, const Stack& stack, bool bypass
                          sizeof(OpUniform)),
             texture_entry(3, white_mask_view_.get())};
         bind_groups.push_back(gpu_.create_bind_group(neighborhood_pipeline_.get(), combine));
-        gpu_.encode_fullscreen_pass(encoder, neighborhood_pipeline_.get(),
-                                    bind_groups.back().get(), level_target);
+        gpu_.encode_fullscreen_pass(encoder, neighborhood_pipeline_.get(), bind_groups.back().get(),
+                                    level_target);
         level_source = level_target;
       }
       const std::array<WGPUBindGroupEntry, 4> entries = {texture_entry(0, source), uniform,

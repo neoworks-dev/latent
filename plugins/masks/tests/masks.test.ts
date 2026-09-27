@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { Mask, MaskComponent, Op } from "@latent/protocol";
 import {
   addComponent,
+  componentDetail,
   componentId,
   coverageLabel,
   defaultComponent,
@@ -12,6 +13,7 @@ import {
   layersOf,
   maskShortcut,
   maskSignature,
+  movedBand,
   type MaskAction,
   nextTint,
   patchComponent,
@@ -122,16 +124,38 @@ describe("component list edits", () => {
 
   test("a layer is labelled by its number and the kinds in it", () => {
     expect(layerLabel(layer("g1", [defaultComponent("radial", "radial1")]), 0)).toBe(
-      "Mask 1 · radial",
+      "Mask 1 · Radial",
     );
     expect(
       layerLabel(
         layer("g2", [defaultComponent("sky", "sky1"), defaultComponent("brush", "brush1")]),
         1,
       ),
-    ).toBe("Mask 2 · sky, brush");
+    ).toBe("Mask 2 · Sky, Brush");
+    // A text mask is named by what it searched for, which says more than "Text".
+    const cat = { ...defaultComponent("text", "text1"), params: { prompt: "the cat" } };
+    expect(layerLabel(layer("g4", [cat, defaultComponent("brush", "brush1")]), 3)).toBe(
+      "Mask 4 · “the cat”, Brush",
+    );
     // A layer whose mask is still empty is a mask the user is in the middle of making.
     expect(layerLabel(layer("g3", []), 2)).toBe("Mask 3");
+  });
+
+  test("a band edge dragged past the other pushes it along instead of inverting the band", () => {
+    expect(movedBand([0.5, 1], "low", 20)).toEqual([0.2, 1]);
+    expect(movedBand([0.5, 0.7], "low", 90)).toEqual([0.9, 0.9]);
+    expect(movedBand([0.5, 0.7], "high", 30)).toEqual([0.3, 0.3]);
+    expect(movedBand([0.2, 0.7], "high", 140)).toEqual([0.2, 1]);
+  });
+
+  test("a component says what it was made from when its kind does not", () => {
+    const text = { ...defaultComponent("text", "text1"), params: { prompt: "the cat" } };
+    expect(componentDetail(text)).toBe("“the cat”");
+    expect(componentDetail(defaultComponent("luminance", "luminance1"))).toBe("50–100 %");
+    const depth = { ...defaultComponent("depth", "depth1"), params: { range: [0, 0.4] } };
+    expect(componentDetail(depth)).toBe("0–40 %");
+    expect(componentDetail(defaultComponent("sky", "sky1"))).toBeUndefined();
+    expect(componentDetail(defaultComponent("text", "text2"))).toBeUndefined();
   });
 
   test("the preview signature changes with the mask and with the selection, not with a param", () => {

@@ -184,18 +184,17 @@ export class MasksState {
   }
 
   /**
-   * A new layer with its first component — Lightroom's Create New Mask. The mask comes
-   * first and the adjustments under it come later, which is the order a mask is actually
-   * made in: nothing has to be adjusted before a region can be selected.
+   * A new, empty layer, selected — Lightroom's Create New Mask. Its region is picked next
+   * from the add row, and the adjustments under it come after that, which is the order a
+   * mask is actually made in.
    */
-  async createLayer(kind: MaskComponentKind): Promise<MaskComponent | null> {
+  async createLayer(): Promise<void> {
     const layerId = await this.viewer.addGroup();
     if (!layerId) {
       this.status = "could not create the mask";
-      return null;
+      return;
     }
     this.selectLayer(layerId);
-    return this.createComponent(kind);
   }
 
   async removeLayer(opId: string): Promise<void> {

@@ -112,7 +112,8 @@ GrayImage streak_mask(uint32_t width, uint32_t height) {
   mask.width = width;
   mask.height = height;
   mask.pixels.assign(static_cast<size_t>(width) * height, 0);
-  for (uint32_t y = kMaskTop; y <= kMaskBottom; ++y) {
+  // A mask smaller than the band (the mismatched-size case) is left empty, not overrun.
+  for (uint32_t y = kMaskTop; y <= kMaskBottom && y < height; ++y) {
     for (uint32_t x = 0; x < width; ++x) {
       mask.pixels[(static_cast<size_t>(y) * width) + x] = 255;
     }
