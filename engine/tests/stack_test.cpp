@@ -145,7 +145,7 @@ TEST_CASE("history appends a snapshot per commit") {
   REQUIRE(history.current().size() == 1);
 }
 
-TEST_CASE("undo and redo walk the cursor, redo truncates on the next commit") {
+TEST_CASE("undo and redo walk the cursor, the next commit branches off") {
   History history;
   Stack one;
   one.push_back(make_op("a1", "exposure", 1));
@@ -169,7 +169,7 @@ TEST_CASE("undo and redo walk the cursor, redo truncates on the next commit") {
   other.push_back(make_op("b1", "shadows", -10));
   history.commit(other);
   REQUIRE(!history.can_redo());
-  REQUIRE(history.size() == 3);
+  REQUIRE(history.size() == 4);
   REQUIRE(history.current()[0].id == "b1");
 }
 

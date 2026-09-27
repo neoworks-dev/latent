@@ -22,7 +22,14 @@ export { default as ValueField } from "./ValueField.svelte";
 export { sliderRange, type SliderRange } from "./panels";
 // The History pane prints a step in the units of the control that made it, so the
 // formatting and the labelling are the panel column's, not a second copy of them.
-export { formatValue, paramLabel, rowLabel } from "./panels";
+export {
+  formatSide,
+  formatValue,
+  isHighlighted,
+  paramLabel,
+  rowLabel,
+  type Highlight,
+} from "./panels";
 // A preset can carry a tone curve, so it names the curve's own point type.
 export { type CurvePoint } from "./curve";
 

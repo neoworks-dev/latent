@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -61,6 +62,13 @@ constexpr uint32_t kDepthInputSize = 1024;
 // The depth map's cache file inside the photo's raster dir. One per photo: the map describes
 // the scene, so no edit can make it stale (ai/depth.h).
 constexpr std::string_view kDepthCacheName = "depth.png";
+// The undo history's file inside the photo's raster dir. Not in the sidecar: the sidecar is
+// the edit, portable beside the photo; the history is this machine's record of getting
+// there, like Lightroom's catalog, and every step carries a whole stack with its strokes.
+constexpr std::string_view kHistoryFileName = "history.json";
+// Steps kept on disk. The in-memory history is unbounded for the session; a restart keeps
+// the newest of them around the cursor.
+constexpr size_t kHistoryMaxSteps = 100;
 // LTHM carries the photo id in a u32 (protocol/frames.md); a larger rowid cannot be
 // tagged, so the request is refused instead of answered with a truncated frame.
 constexpr int64_t kMaxThumbnailPhotoId = 0xFFFFFFFF;
@@ -658,6 +666,7 @@ std::optional<nlohmann::json> Server::dispatch(std::string_view method,
   if (method == "history.list") return handle_history_list(params);
   if (method == "history.jump") return handle_history_jump(params, peer);
   if (method == "history.revertOp") return handle_history_revert_op(params, peer);
+  if (method == "history.merge") return handle_history_merge(params, peer);
   if (method == "view.open") return handle_view_open(params);
   if (method == "view.close") return handle_view_close(params);
   if (method == "view.render") return handle_view_render(params, peer);
@@ -706,6 +715,10 @@ nlohmann::json Server::handle_hello(const nlohmann::json& params) {
                              {"shaderF16", gpu.shader_f16}}}};
   // Absent rather than empty when --no-mcp kept the server down: no url is not "".
   if (!mcp_url_.empty()) result["mcpUrl"] = mcp_url_;
+  // What the UI reopens at startup; absent on a fresh catalog or when the file is gone.
+  if (const std::optional<CatalogPhoto> last = catalog_.last_photo(); last.has_value()) {
+    result["lastPhoto"] = {{"photoId", last->id}, {"path", last->path}};
+  }
   return result;
 }
 
@@ -758,6 +771,7 @@ void Server::finish_photo_open(const std::string& path, const std::shared_ptr<De
     const int64_t photo_id = catalog_.register_photo(path, metadata, has_sidecar);
     catalog_.set_hash(photo_id, hash);
     last_opened_photo_ = photo_id;
+    catalog_.set_last_photo(photo_id);
     if (photos_.contains(photo_id)) {
       // A second open of the same file raced us; the first one already owns the texture.
       reply_result(responder, photo_open_result(photos_.at(photo_id)));
@@ -795,6 +809,7 @@ void Server::finish_photo_open(const std::string& path, const std::shared_ptr<De
       migrate_mask_groups(sidecar->stack);
       photo.history = History(sanitize_stack(sidecar->stack, warnings));
       photo.sidecar_loaded = true;
+      restore_history(photo);
     }
     photos_.emplace(photo_id, std::move(photo));
     warn_all(warnings, photo_id);
@@ -1035,6 +1050,7 @@ nlohmann::json Server::handle_history(const nlohmann::json& params, bool redo, P
   const bool moved = redo ? photo.history.redo() : photo.history.undo();
   nlohmann::json state = stack_state(photo);
   if (!moved) return state;
+  load_cached_rasters(photo);
   save_sidecar(photo);
   broadcast_stack_changed(photo, "history", peer);
   return state;
@@ -1042,8 +1058,7 @@ nlohmann::json Server::handle_history(const nlohmann::json& params, bool redo, P
 
 nlohmann::json Server::handle_history_list(const nlohmann::json& params) {
   const PhotoState& photo = photo_for(params);
-  const std::vector<HistoryStep> steps =
-      describe_history(photo.history.snapshots(), photo.history.labels());
+  const std::vector<HistoryStep> steps = describe_history(photo.history.nodes());
   nlohmann::json entries = nlohmann::json::array();
   for (size_t index = 0; index < steps.size(); ++index) {
     entries.push_back(history_step_to_json(steps[index], index));
@@ -1062,6 +1077,7 @@ nlohmann::json Server::handle_history_jump(const nlohmann::json& params, Peer* p
     throw RpcError(kInvalidParams, "'index' is past the end of the history");
   }
   if (!photo.history.jump(step)) return stack_state(photo);
+  load_cached_rasters(photo);
   save_sidecar(photo);
   broadcast_stack_changed(photo, "history", peer);
   return stack_state(photo);
@@ -1074,15 +1090,19 @@ nlohmann::json Server::handle_history_jump(const nlohmann::json& params, Peer* p
 nlohmann::json Server::handle_history_revert_op(const nlohmann::json& params, Peer* peer) {
   PhotoState& photo = photo_for(params);
   const auto index = params.find("index");
-  if (index == params.end() || !index->is_number_unsigned() || index->get<size_t>() == 0) {
-    throw RpcError(kInvalidParams, "'index' must be an integer >= 1");
+  if (index == params.end() || !index->is_number_unsigned()) {
+    throw RpcError(kInvalidParams, "'index' must be a non-negative integer");
   }
   const auto step = index->get<size_t>();
   if (step >= photo.history.size()) {
     throw RpcError(kInvalidParams, "'index' is past the end of the history");
   }
+  const std::optional<size_t> parent = photo.history.nodes()[step].parent;
+  if (!parent.has_value()) {
+    throw RpcError(kInvalidParams, "the opening step has no state before it");
+  }
   const std::string op_id = require_string(params, "opId");
-  const Stack& before = photo.history.snapshots()[step - 1];
+  const Stack& before = photo.history.nodes()[*parent].stack;
   const Op* was = find_op_anywhere(before, op_id);
 
   Stack next = photo.history.current();
@@ -1115,6 +1135,44 @@ nlohmann::json Server::handle_history_revert_op(const nlohmann::json& params, Pe
   Stack sanitized = sanitize_stack(next, warnings);
   warn_all(warnings, photo.id);
   commit(photo, std::move(sanitized), false, "ui", peer);
+  return stack_state(photo);
+}
+
+// Another branch of the history tree joined into the step on screen, as a new step with
+// both as parents. Three-way from where they parted: what only one side changed is kept,
+// and where both changed the same value the merged-in branch wins (#71 is picking per
+// value).
+nlohmann::json Server::handle_history_merge(const nlohmann::json& params, Peer* peer) {
+  PhotoState& photo = photo_for(params);
+  const auto index = params.find("index");
+  if (index == params.end() || !index->is_number_unsigned()) {
+    throw RpcError(kInvalidParams, "'index' must be a non-negative integer");
+  }
+  const auto from = index->get<size_t>();
+  if (from >= photo.history.size()) {
+    throw RpcError(kInvalidParams, "'index' is past the end of the history");
+  }
+  const size_t cursor = photo.history.cursor();
+  if (photo.history.descends_from(cursor, from)) {
+    throw RpcError(kInvalidParams, "step " + std::to_string(from) + " is already in this one");
+  }
+  const std::vector<HistoryNode>& nodes = photo.history.nodes();
+  const size_t base = photo.history.common_ancestor(cursor, from);
+  Stack merged;
+  try {
+    merged = merge_stacks(nodes[base].stack, photo.history.current(), nodes[from].stack);
+  } catch (const std::exception& error) {
+    throw RpcError(kInvalidParams, std::string("the branches do not merge: ") + error.what());
+  }
+  std::vector<std::string> warnings;
+  Stack sanitized = sanitize_stack(merged, warnings);
+  warn_all(warnings, photo.id);
+  photo.history.merge(from, std::move(sanitized));
+  load_cached_rasters(photo);
+  save_sidecar(photo);
+  broadcast_stack_changed(photo, "history", peer);
+  catalog_.touch_edited(photo.id, std::filesystem::exists(photo.sidecar_path));
+  notify_catalog_changed({photo.id}, "edit");
   return stack_state(photo);
 }
 
@@ -1971,6 +2029,57 @@ void Server::load_depth_map(const PhotoState& photo) {
   }
 }
 
+void Server::save_history(const PhotoState& photo) {
+  const std::filesystem::path path =
+      std::filesystem::path(raster_dir_for(photo.hash)) / kHistoryFileName;
+  const std::filesystem::path temporary = path.string() + ".tmp";
+  try {
+    std::filesystem::create_directories(path.parent_path());
+    {
+      std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+      if (!file) throw std::runtime_error("cannot write " + temporary.string());
+      file << history_to_json(photo.history, kHistoryMaxSteps).dump();
+      if (!file) throw std::runtime_error("write failed for " + temporary.string());
+    }
+    std::filesystem::rename(temporary, path);
+  } catch (const std::exception& error) {
+    warn(std::string("history not written: ") + error.what(), photo.id);
+  }
+}
+
+void Server::restore_history(PhotoState& photo) {
+  const std::string path = raster_dir_for(photo.hash) + "/" + std::string(kHistoryFileName);
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return;
+  try {
+    const nlohmann::json value = nlohmann::json::parse(file, nullptr, false);
+    std::optional<History> restored = history_from_json(value);
+    if (!restored.has_value()) return;
+    // Every step goes through what the sidecar's stack went through on the way in, so an
+    // old step undoes to a stack this build can render.
+    std::vector<HistoryNode> nodes = restored->nodes();
+    std::vector<std::string> discarded;
+    for (HistoryNode& node : nodes) {
+      migrate_mask_space(node.stack, photo.width, photo.height);
+      migrate_mask_groups(node.stack);
+      node.stack = sanitize_stack(node.stack, discarded);
+    }
+    // The sidecar is the truth. A history whose current step is not it was left behind by
+    // an edit this engine did not make — another build, a reset, a hand edit — and undoing
+    // from it would jump to states that never led here.
+    const size_t cursor = restored->cursor();
+    if (stack_to_json(nodes[cursor].stack) != stack_to_json(photo.history.current())) return;
+    photo.history = History(std::move(nodes), cursor);
+  } catch (const std::exception& error) {
+    warn(std::string("history not restored: ") + error.what(), photo.id);
+  }
+}
+
+void Server::load_cached_rasters(const PhotoState& photo) {
+  load_mask_rasters(photo);
+  load_generative_results(photo);
+}
+
 void Server::load_mask_rasters(const PhotoState& photo) {
   for_each_op(photo.history.current(), [&](const Op& op) {
     if (!op.mask.has_value()) return;
@@ -1979,6 +2088,8 @@ void Server::load_mask_rasters(const PhotoState& photo) {
       if (!mask_kind_is_ai(component.kind)) continue;
       const std::string relative = component.params.value("raster", std::string());
       if (relative.empty()) continue;
+      // Runs again on every undo, where most rasters are already the ones in memory.
+      if (renderer_.has_mask_raster(photo.id, component.id, relative)) continue;
       try {
         std::optional<GrayImage> raster =
             read_gray_png(raster_dir_for(photo.hash) + "/" + relative);
@@ -2253,6 +2364,7 @@ void Server::save_sidecar(PhotoState& photo) {
   } catch (const std::exception& error) {
     warn(std::string("sidecar not written: ") + error.what(), photo.id);
   }
+  save_history(photo);
 
   // Brush strokes ride the stack so they undo, and are mirrored beside the sidecar under
   // the path the component names (PROMPT.md 3.3): one file per component, rewritten whole.
@@ -2436,6 +2548,7 @@ nlohmann::json Server::agent_stack_state(int64_t photo_id) {
 bool Server::undo(int64_t photo_id) {
   PhotoState& photo = require_photo(photo_id);
   if (!photo.history.undo()) return false;
+  load_cached_rasters(photo);
   save_sidecar(photo);
   broadcast_stack_changed(photo, "history", nullptr);
   return true;
@@ -2444,6 +2557,7 @@ bool Server::undo(int64_t photo_id) {
 bool Server::redo(int64_t photo_id) {
   PhotoState& photo = require_photo(photo_id);
   if (!photo.history.redo()) return false;
+  load_cached_rasters(photo);
   save_sidecar(photo);
   broadcast_stack_changed(photo, "history", nullptr);
   return true;
@@ -2451,24 +2565,88 @@ bool Server::redo(int64_t photo_id) {
 
 std::vector<uint8_t> Server::render_preview_jpeg(int64_t photo_id, uint32_t max_size,
                                                  std::optional<PreviewRegion> region) {
+  if (region.has_value()) return render_zoomed_jpeg(photo_id, max_size, *region);
   const OffscreenFrame frame = render_offscreen(photo_id, max_size);
   const ViewGeometry& geometry = frame.geometry;
-  uint32_t x = geometry.content_x;
-  uint32_t y = geometry.content_y;
-  uint32_t width = geometry.content_width;
-  uint32_t height = geometry.content_height;
-  if (region.has_value()) {
-    const double x0 = std::clamp(region->x0, 0.0, 1.0);
-    const double y0 = std::clamp(region->y0, 0.0, 1.0);
-    const double x1 = std::clamp(region->x1, x0, 1.0);
-    const double y1 = std::clamp(region->y1, y0, 1.0);
-    x = geometry.content_x + static_cast<uint32_t>(x0 * width);
-    y = geometry.content_y + static_cast<uint32_t>(y0 * height);
-    width = std::max(1U, static_cast<uint32_t>((x1 - x0) * geometry.content_width));
-    height = std::max(1U, static_cast<uint32_t>((y1 - y0) * geometry.content_height));
-  }
-  const Rgb8Image image = rgba_to_rgb(frame.rgba, geometry.width, x, y, width, height);
+  const Rgb8Image image =
+      rgba_to_rgb(frame.rgba, geometry.width, geometry.content_x, geometry.content_y,
+                  geometry.content_width, geometry.content_height);
   return encode_jpeg(image, kPreviewQuality);
+}
+
+namespace {
+
+struct ViewBounds {
+  double width = 0;
+  double height = 0;
+};
+
+// How big an image-space region is on screen in a fitted view. Its corners, not its size
+// in photo pixels: a quarter turn or a straighten changes the shape it is drawn with.
+ViewBounds region_on_screen(const GeometryMap& map, double x0, double y0, double x1, double y1) {
+  double left = std::numeric_limits<double>::max();
+  double top = left;
+  double right = std::numeric_limits<double>::lowest();
+  double bottom = right;
+  for (const auto& [x, y] : {std::array{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}}) {
+    const auto [view_x, view_y] = mat3_apply(map.image_to_view, x, y);
+    left = std::min(left, view_x);
+    top = std::min(top, view_y);
+    right = std::max(right, view_x);
+    bottom = std::max(bottom, view_y);
+  }
+  return {std::max(1.0, right - left), std::max(1.0, bottom - top)};
+}
+
+}  // namespace
+
+// The region is image space, like a mask's coordinates, so an agent can pass the user's
+// selection straight through. The view is zoomed onto it rather than cropped out of a
+// fitted frame: the render rebuilds the proxy from the full-res texture at that scale, so
+// a small region comes back with its own detail instead of a hundred upscaled pixels.
+std::vector<uint8_t> Server::render_zoomed_jpeg(int64_t photo_id, uint32_t max_size,
+                                                const PreviewRegion& region) {
+  const PhotoState& photo = require_photo(photo_id);
+  const double x0 = std::clamp(region.x0, 0.0, 1.0);
+  const double y0 = std::clamp(region.y0, 0.0, 1.0);
+  const double x1 = std::clamp(region.x1, x0, 1.0);
+  const double y1 = std::clamp(region.y1, y0, 1.0);
+  const Stack& stack = photo.history.current();
+  const GeometryParams params = geometry_from_stack(stack);
+
+  // The view takes the region's shape on screen, long edge at `max_size`.
+  const uint32_t side = std::clamp(max_size, 32U, 4096U);
+  const ViewBounds shape =
+      region_on_screen(geometry_map(params, photo.width, photo.height, side, side), x0, y0, x1, y1);
+  uint32_t width = side;
+  auto height = std::max(1U, static_cast<uint32_t>(std::lround(side * shape.height / shape.width)));
+  if (height > side) {
+    height = side;
+    width = std::max(1U, static_cast<uint32_t>(std::lround(side * shape.width / shape.height)));
+  }
+
+  // The zoom that makes the region fill that view, from its size with the photo fitted.
+  const ViewBounds fitted = region_on_screen(
+      geometry_map(params, photo.width, photo.height, width, height), x0, y0, x1, y1);
+  Viewport viewport;
+  viewport.fit = false;
+  viewport.scale = std::clamp(std::min(width / fitted.width, height / fitted.height),
+                              kMinViewportScale, kMaxViewportScale);
+  viewport.center_x = (x0 + x1) / 2;
+  viewport.center_y = (y0 + y1) / 2;
+
+  const uint32_t view_id = next_view_id_++;
+  renderer_.open_view(view_id, photo_id, width, height);
+  std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
+  try {
+    renderer_.set_viewport(view_id, viewport);
+    renderer_.render(view_id, stack, rgba, 0);
+  } catch (...) {
+    renderer_.close_view(view_id);
+    throw;
+  }
+  renderer_.close_view(view_id);
+  return encode_jpeg(rgba_to_rgb(rgba, width, 0, 0, width, height), kPreviewQuality);
 }
 
 int64_t Server::detect_mask(int64_t photo_id, const std::string& op_id,
@@ -3027,6 +3205,7 @@ void Server::finish_generative(int64_t photo_id, const std::string& op_id, int64
 void Server::load_generative_results(const PhotoState& photo) {
   for (const Op& op : photo.history.current()) {
     if (!is_generative_op(op.name) || op.result.empty()) continue;
+    if (renderer_.has_generative_result(photo.id, op.id, op.result)) continue;
     try {
       const std::optional<Rgb8Image> image =
           read_rgb_png(raster_dir_for(photo.hash) + "/" + op.result);

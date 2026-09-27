@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { HistoryStep, Op, OpDefinition } from "@latent/protocol";
-import { historyRow, historyRows } from "../src/history";
+import { ancestorsOf, graphWidth, historyGraph, historyRow, historyRows } from "../src/history";
 import { panForPoint, visibleRect } from "../src/navigator";
 import {
   applyPreset,
@@ -21,7 +21,16 @@ const ops: OpDefinition[] = [
     order: 1,
     stage: "tone",
     params: [
-      { name: "value", label: "Exposure", type: "number", min: -5, max: 5, step: 0.01, unit: "EV" },
+      {
+        name: "value",
+        label: "Exposure",
+        type: "number",
+        min: -5,
+        max: 5,
+        step: 0.01,
+        unit: "EV",
+        default: 0,
+      },
     ],
   },
   {
@@ -32,8 +41,16 @@ const ops: OpDefinition[] = [
     order: 1,
     stage: "tone",
     params: [
-      { name: "temperature", label: "Temperature", type: "number", min: -100, max: 100, step: 1 },
-      { name: "tint", label: "Tint", type: "number", min: -150, max: 150, step: 1 },
+      {
+        name: "temperature",
+        label: "Temperature",
+        type: "number",
+        min: -100,
+        max: 100,
+        step: 1,
+        default: 0,
+      },
+      { name: "tint", label: "Tint", type: "number", min: -150, max: 150, step: 1, default: 0 },
     ],
   },
 ];
@@ -147,6 +164,47 @@ describe("history rows", () => {
     expect(historyRow(step({ index: 4, kind: "reorder" }), ops).title).toBe("Reordered");
   });
 
+  test("an op arriving or leaving says where its slider went, from or to the default", () => {
+    const added = historyRow(
+      step({ index: 1, kind: "add", op: "exposure", changes: [{ param: "value", to: 1 }] }),
+      ops,
+    );
+    expect(added.detail).toBe("0.00 EV → +1.00 EV");
+    const removed = historyRow(
+      step({ index: 2, kind: "remove", op: "exposure", changes: [{ param: "value", from: 1 }] }),
+      ops,
+    );
+    expect(removed.detail).toBe("+1.00 EV → 0.00 EV");
+    // Added at its default: nothing moved, so there is no pair of values to show.
+    const idle = historyRow(
+      step({ index: 3, kind: "add", op: "exposure", changes: [{ param: "value", to: 0 }] }),
+      ops,
+    );
+    expect(idle.detail).toBe("added");
+  });
+
+  test("a mask step names the component and the property that moved", () => {
+    const row = historyRow(
+      step({
+        index: 5,
+        kind: "mask",
+        op: "group",
+        changes: [
+          { param: "radial1.feather", from: 0, to: 40 },
+          { param: "brush1", to: "brush" },
+        ],
+      }),
+      ops,
+    );
+    expect(row.title).toBe("Mask");
+    expect(row.detail).toBe("Radial 1 feather 0 → 40 · +1 more");
+    const added = historyRow(
+      step({ index: 6, kind: "mask", op: "group", changes: [{ param: "sky1", to: "sky" }] }),
+      ops,
+    );
+    expect(added.detail).toBe("Sky 1 added");
+  });
+
   test("a curve, whose values no row can print, still reports that it moved", () => {
     const row = historyRow(
       step({ index: 5, kind: "update", op: "tone_curve", changes: [{ param: "rgb" }] }),
@@ -163,6 +221,89 @@ describe("history rows", () => {
       ops,
     );
     expect(rows.map((row) => row.index)).toEqual([1, 0]);
+  });
+
+  test("a merge step is named after the branch it brought in", () => {
+    const row = historyRow(
+      step({
+        index: 4,
+        kind: "update",
+        op: "exposure",
+        parent: 3,
+        mergedFrom: 2,
+        changes: [{ param: "value", from: 0, to: 1.5 }],
+      }),
+      ops,
+    );
+    expect(row.title).toBe("Merged step 2");
+    expect(row.detail).toBe("0.00 EV → +1.50 EV");
+
+    // With the whole list at hand, it is called after the step it brought in.
+    const rows = historyRows(
+      [
+        step({ index: 0, kind: "initial" }),
+        step({ index: 1, kind: "batch", parent: 0, label: "Punch applied" }),
+        step({ index: 2, kind: "update", op: "exposure", parent: 0 }),
+        step({ index: 3, kind: "batch", parent: 2, mergedFrom: 1 }),
+      ],
+      ops,
+    );
+    expect(rows[0]?.title).toBe("Merged “Punch applied”");
+  });
+});
+
+describe("the history graph", () => {
+  // 0 ─ 1 ─ 2          a step undone and edited past: 3 branches off 1,
+  //      └─ 3 ─ 4      and 4 merges 2 back in.
+  const tree: HistoryStep[] = [
+    step({ index: 0, kind: "initial" }),
+    step({ index: 1, kind: "add", parent: 0 }),
+    step({ index: 2, kind: "update", parent: 1 }),
+    step({ index: 3, kind: "update", parent: 1 }),
+    step({ index: 4, kind: "update", parent: 3, mergedFrom: 2 }),
+  ];
+
+  test("a line is one lane, straight down", () => {
+    const rows = historyGraph(tree.slice(0, 3));
+    expect(rows.map((row) => row.lane)).toEqual([0, 0, 0]);
+    expect(rows[0]?.top).toEqual([]);
+    expect(rows[0]?.bottom).toEqual([{ from: 0, to: 0 }]);
+    expect(rows[2]?.bottom).toEqual([]);
+    expect(graphWidth(rows)).toBe(1);
+  });
+
+  test("a branch takes a lane of its own and joins where it left", () => {
+    const rows = historyGraph(tree.slice(0, 4));
+    expect(rows.map((row) => [row.index, row.lane])).toEqual([
+      [3, 0],
+      [2, 1],
+      [1, 0],
+      [0, 0],
+    ]);
+    // Step 1 is where both lanes were waiting: the second one bends into it.
+    expect(rows[2]?.top).toEqual([
+      { from: 0, to: 0 },
+      { from: 1, to: 0 },
+    ]);
+    expect(graphWidth(rows)).toBe(2);
+  });
+
+  test("a merge opens a lane down to the branch it brought in", () => {
+    const rows = historyGraph(tree);
+    const merge = rows[0];
+    expect(merge?.index).toBe(4);
+    expect(merge?.bottom).toEqual([
+      { from: 0, to: 0 },
+      { from: 0, to: 1 },
+    ]);
+    // The branch tip takes the lane the merge opened for it, not a new one.
+    expect(rows.find((row) => row.index === 2)?.lane).toBe(1);
+  });
+
+  test("what a step is made of follows both parents of a merge", () => {
+    const byIndex = (left: number, right: number): number => left - right;
+    expect([...ancestorsOf(tree, 4)].sort(byIndex)).toEqual([0, 1, 2, 3, 4]);
+    expect([...ancestorsOf(tree, 3)].sort(byIndex)).toEqual([0, 1, 3]);
   });
 });
 

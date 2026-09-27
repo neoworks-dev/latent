@@ -275,11 +275,10 @@ std::vector<OpDefinition> build_definitions() {
   // The two Detail-panel noise sliders stay what they were: one small-radius bilateral pass,
   // the cheap trim. This op is the one that reaches far enough to kill the multi-pixel blobs
   // high-ISO chroma noise arrives as.
-  definitions.push_back(define("manual_denoise", "enhance", "Enhance", 3,
-                               PipelineStage::NoiseReduction, "Manual Denoise",
-                               {unipolar("luminance", "Luminance", 0),
-                                unipolar("detail", "Detail", 50), unipolar("color", "Color", 0),
-                                unipolar("colorDetail", "Color Detail", 50)}));
+  definitions.push_back(define(
+      "manual_denoise", "enhance", "Enhance", 3, PipelineStage::NoiseReduction, "Manual Denoise",
+      {unipolar("luminance", "Luminance", 0), unipolar("detail", "Detail", 50),
+       unipolar("color", "Color", 0), unipolar("colorDetail", "Color Detail", 50)}));
 
   // Relight (PROMPT.md 3.8): a virtual light placed in the scene the depth map describes.
   // Lightroom has no such tool, so the vocabulary is Luminar's rather than Adobe's, and the

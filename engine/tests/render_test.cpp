@@ -17,7 +17,6 @@
 #include <cstdint>
 
 #include <algorithm>
-
 #include <map>
 #include <memory>
 #include <string>
@@ -296,8 +295,7 @@ DecodedRaw noisy_raw() {
       const double blue = (hash(x / 3, y / 3, 3) - 0.5) * 0.16;
       const size_t index = ((static_cast<size_t>(y) * kWidth) + x) * 4;
       const auto store = [&](size_t channel, double value) {
-        raw.rgba[index + channel] =
-            static_cast<uint16_t>(std::clamp(value, 0.0, 1.0) * 65535);
+        raw.rgba[index + channel] = static_cast<uint16_t>(std::clamp(value, 0.0, 1.0) * 65535);
       };
       store(0, level + grain + red);
       store(1, level + grain + green);
@@ -329,8 +327,8 @@ FrameStats measure(const std::vector<uint8_t>& frame) {
       const double luma = (0.2126 * at(x, y, 0)) + (0.7152 * at(x, y, 1)) + (0.0722 * at(x, y, 2));
       stats.chroma += std::abs(at(x, y, 0) - luma) + std::abs(at(x, y, 2) - luma);
       // Pixel-to-pixel difference: what is left of the grain after the filter ran.
-      const double right = (0.2126 * at(x + 1, y, 0)) + (0.7152 * at(x + 1, y, 1)) +
-                           (0.0722 * at(x + 1, y, 2));
+      const double right =
+          (0.2126 * at(x + 1, y, 0)) + (0.7152 * at(x + 1, y, 1)) + (0.0722 * at(x + 1, y, 2));
       stats.grain += std::abs(right - luma);
       count += 1;
       neighbours += 1;

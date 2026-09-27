@@ -5,6 +5,7 @@
   const { paneId: _paneId }: { paneId: string } = $props();
   const ctx = kernelContext();
   const viewer = ctx.viewer;
+  const engine = ctx.engine;
   const overlay = viewer.overlay;
 
   let canvas = $state<HTMLCanvasElement | null>(null);
@@ -210,16 +211,28 @@
     };
   });
 
-  // Dev hook: `?photo=<path>` opens that file once the canvas has a size, so the app can
-  // be driven against the mock engine without the native dialog.
+  // At startup, once the canvas has a size: the dev hook `?photo=<path>` if given (the app
+  // driven against the mock engine without the native dialog), else the photo that was open
+  // when the app last closed, which the engine keeps in the catalog (`engine.hello`).
   let autoOpened = false;
   $effect(() => {
     if (autoOpened || !canvas) return;
-    const path = new URLSearchParams(location.search).get("photo");
-    if (!path) return;
     autoOpened = true;
-    void openPath(path);
+    const path = new URLSearchParams(location.search).get("photo");
+    if (path) {
+      void openPath(path);
+      return;
+    }
+    void reopenLastPhoto();
   });
+
+  async function reopenLastPhoto(): Promise<void> {
+    await engine.whenOpen();
+    const hello = await engine.call("engine.hello", { client: "viewer" });
+    // Something else opened a photo while the hello was out; that one wins.
+    if (!hello.lastPhoto || viewer.photoId !== null) return;
+    await openPath(hello.lastPhoto.path);
+  }
 </script>
 
 <div class="relative h-full">

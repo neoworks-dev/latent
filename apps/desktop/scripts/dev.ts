@@ -6,11 +6,24 @@ import { fileURLToPath } from "node:url";
 const desktopDir = join(dirname(fileURLToPath(import.meta.url)), "..");
 const editorDir = join(desktopDir, "..", "editor");
 
-function pickFreePort(): number {
-  const probe = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
-  const { port } = probe;
-  probe.stop(true);
-  return port;
+// The renderer's origin is `http://localhost:<port>`, and localStorage is per origin: a new
+// port every run meant every launch started with nothing remembered — panel layout,
+// presets, the Assistant's harness, model and conversations. So one fixed port, and a
+// random one only when something else already holds it.
+const PREFERRED_PORT = 5199;
+
+function pickPort(): number {
+  for (const wanted of [PREFERRED_PORT, 0]) {
+    try {
+      const probe = Bun.listen({ hostname: "127.0.0.1", port: wanted, socket: { data() {} } });
+      const { port } = probe;
+      probe.stop(true);
+      return port;
+    } catch {
+      // Taken: fall through to any free port.
+    }
+  }
+  throw new Error("no free port for the editor");
 }
 
 let editor: Bun.Subprocess | null = null;
@@ -38,9 +51,12 @@ async function waitForServer(url: string, timeoutMs: number): Promise<void> {
   throw new Error(`Vite did not answer on ${url} within ${timeoutMs}ms`);
 }
 
-const port = process.env.LATENT_DEV_PORT ? Number(process.env.LATENT_DEV_PORT) : pickFreePort();
+const port = process.env.LATENT_DEV_PORT ? Number(process.env.LATENT_DEV_PORT) : pickPort();
 const editorUrl = `http://localhost:${port}`;
 console.log(`[dev] editor on ${editorUrl}`);
+if (port !== PREFERRED_PORT) {
+  console.log(`[dev] ${PREFERRED_PORT} is taken: this run starts with an empty localStorage`);
+}
 editor = Bun.spawn(["bun", "--bun", "vite", "dev", "--port", String(port), "--strictPort"], {
   cwd: editorDir,
   stdio: ["ignore", "inherit", "inherit"],

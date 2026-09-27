@@ -57,11 +57,10 @@ class OnnxDenoiseBackend : public GenerativeBackend {
 
     try {
       ScuNet model(model_dir(kDenoiseModel));
-      const std::optional<Rgb8Image> cleaned =
-          model.denoise(*image, [&](double fraction) {
-            if (!progress) return true;
-            return progress(fraction, "denoising");
-          });
+      const std::optional<Rgb8Image> cleaned = model.denoise(*image, [&](double fraction) {
+        if (!progress) return true;
+        return progress(fraction, "denoising");
+      });
       if (!cleaned.has_value()) {
         result.code = "cancelled";
         result.message = "cancelled";

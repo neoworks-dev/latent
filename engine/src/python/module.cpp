@@ -993,11 +993,11 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
       py::arg("limit") = 200);
   module.def(
       "_preview_jpeg",
-      [](const py::object& photo_id, uint32_t max_size) {
+      [](const py::object& photo_id, uint32_t max_size, const py::object& region) {
         return preview_jpeg(resolve_photo(photo_id.is_none() ? 0 : photo_id.cast<int64_t>()),
-                            max_size, py::none());
+                            max_size, region);
       },
-      py::arg("photo_id") = py::none(), py::arg("max_size") = 1024);
+      py::arg("photo_id") = py::none(), py::arg("max_size") = 1024, py::arg("region") = py::none());
   // MCP's render_preview(mask=(op_id, component_id?)): the raster as PNG bytes, so an
   // agent can look at what it selected instead of guessing (PROMPT.md 3.7).
   module.def(

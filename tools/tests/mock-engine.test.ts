@@ -90,6 +90,26 @@ describe("history semantics", () => {
     expect(() => photo.jump(9)).toThrow();
   });
 
+  test("an edit after an undo branches, and a merge brings the branch back", () => {
+    const photo = new PhotoState();
+    const op = photo.addOp("exposure", { value: 0 });
+    photo.updateOp(op.id, { value: 1.5 }, undefined, false);
+    photo.undo();
+    photo.addOp("contrast", { value: 20 });
+
+    const listed = photo.historyList();
+    expect(listed.entries.map((entry) => entry.parent)).toEqual([undefined, 0, 1, 1]);
+    expect(photo.canRedo).toBe(false);
+
+    photo.merge(2);
+    const merged = photo.historyList().entries.at(-1);
+    expect(merged).toMatchObject({ index: 4, parent: 3, mergedFrom: 2 });
+    expect(exposureOf(photo)).toBe(1.5);
+    expect(photo.stack.map((entry) => entry.op)).toEqual(["exposure", "contrast"]);
+    // Merged once, it is part of this step.
+    expect(() => photo.merge(2)).toThrow();
+  });
+
   test("the eye and the layer opacity are steps of their own", () => {
     const photo = new PhotoState();
     const op = photo.addOp("exposure", { value: 1 });

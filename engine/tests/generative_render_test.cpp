@@ -5,6 +5,7 @@
 //   1. a pixel the mask does not cover comes back bit for bit, and
 //   2. the result lands inside `resultRect` and nowhere else.
 #include "generative/generative.h"
+#include "image/gray.h"
 #include "image/jpeg.h"
 #include "ops/op.h"
 #include "ops/registry.h"
@@ -249,4 +250,29 @@ TEST_CASE(
   const std::vector<uint8_t> enlarged = fixture.render(Stack{upscale});
   CHECK(enlarged.size() == empty.size());
   CHECK(enlarged != empty);
+}
+
+// photo.open after a restart shows the cached preview first and swaps in the full decode
+// behind it (Server::upgrade_to_full_resolution). The rasters photo.open loaded beside the
+// first texture are image-space and must survive the second: without them every AI mask
+// component answered "no cached raster" and every fill vanished once the upgrade landed.
+TEST_CASE("reloading a photo keeps its mask rasters, depth map and generative results") {
+  Fixture fixture;
+  try {
+    fixture.renderer = std::make_unique<Renderer>(16384);
+  } catch (const std::exception& error) {
+    SKIP(std::string("no GPU adapter: ") + error.what());
+  }
+  fixture.renderer->load_photo(1, flat_raw());
+  GrayImage raster{.width = 8, .height = 8, .pixels = std::vector<uint8_t>(64, 255)};
+  fixture.renderer->put_mask_raster(1, "subject1", "masks/subject1.png", raster);
+  Gray16Image depth{.width = 8, .height = 8, .pixels = std::vector<uint16_t>(64, 1000)};
+  fixture.renderer->put_depth_map(1, "depth.png", depth);
+  fixture.renderer->put_generative_result(1, "gen1", "generative/gen1.png", magenta(8, 8));
+
+  fixture.renderer->load_photo(1, flat_raw());
+
+  CHECK(fixture.renderer->has_mask_raster(1, "subject1", "masks/subject1.png"));
+  CHECK(fixture.renderer->has_depth_map(1));
+  CHECK(fixture.renderer->has_generative_result(1, "gen1", "generative/gen1.png"));
 }

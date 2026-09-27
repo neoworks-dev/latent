@@ -360,24 +360,33 @@ function describeStep(before: Op[], after: Op[]): Omit<HistoryStep, "index"> {
   return { kind: "reorder" };
 }
 
+/** One step of the history tree, as the engine's HistoryNode. */
+interface HistoryNode {
+  stack: Op[];
+  parent?: number;
+  mergedFrom?: number;
+  redoChild?: number;
+}
+
 /**
- * The op-stack with the engine's history semantics: snapshots plus a cursor, never a
- * pop. A transient mutation (slider being dragged) changes the live stack without
- * snapshotting; the next committed mutation appends one, so undo lands before the drag.
+ * The op-stack with the engine's history semantics: a tree of snapshots plus a cursor,
+ * never a pop. A transient mutation (slider being dragged) changes the live stack without
+ * snapshotting; the next committed mutation adds a child of the cursor, so undo lands
+ * before the drag and an edit after an undo starts a branch.
  */
 export class PhotoState {
   stack: Op[] = [];
   revision = 0;
-  private history: Op[][] = [[]];
+  private history: HistoryNode[] = [{ stack: [] }];
   private cursor = 0;
   private nextOpId = 1;
 
   get canUndo(): boolean {
-    return this.cursor > 0;
+    return this.history[this.cursor]?.parent !== undefined;
   }
 
   get canRedo(): boolean {
-    return this.cursor < this.history.length - 1;
+    return this.history[this.cursor]?.redoChild !== undefined;
   }
 
   snapshot(): StackGetResult {
@@ -525,18 +534,67 @@ export class PhotoState {
   }
 
   undo(): void {
-    if (!this.canUndo) return;
-    this.moveCursor(this.cursor - 1);
+    const node = this.history[this.cursor];
+    if (node?.parent === undefined) return;
+    const parent = this.history[node.parent];
+    if (parent) parent.redoChild = this.cursor;
+    this.moveCursor(node.parent);
   }
 
-  /** The undo stack described: one row per snapshot, oldest first, plus where the cursor is. */
+  /** The tree described: one row per step, oldest first, each against its parent. */
   historyList(): HistoryListResult {
-    const entries = this.history.map((stack, index) => {
-      const previous = this.history[index - 1];
-      if (index === 0 || !previous) return { index, kind: "initial" as const };
-      return { ...describeStep(previous, stack), index };
+    const entries = this.history.map((node, index) => {
+      const previous = node.parent === undefined ? undefined : this.history[node.parent];
+      const links = { parent: node.parent, mergedFrom: node.mergedFrom };
+      if (!previous) return { index, kind: "initial" as const };
+      return { ...describeStep(previous.stack, node.stack), ...links, index };
     });
     return { entries, index: this.cursor };
+  }
+
+  /**
+   * Joins step `index` into the current one. The engine merges value by value; this mock
+   * merges op by op — whatever the other branch added, changed or removed since the two
+   * parted replaces ours, which is the engine's "merged-in wins" at a coarser grain.
+   */
+  merge(index: number): void {
+    const theirs = this.history[index];
+    if (!theirs || this.lineOf(this.cursor).has(index)) {
+      throw new Error(`step ${index} is already in this one`);
+    }
+    const shared = this.lineOf(index);
+    const baseIndex = Math.max(...[...this.lineOf(this.cursor)].filter((step) => shared.has(step)));
+    const base = this.history[baseIndex];
+    if (!base) throw new Error(`no common step for ${index}`);
+    const same = (left: Op | undefined, right: Op | undefined): boolean =>
+      JSON.stringify(left) === JSON.stringify(right);
+    const find = (stack: Op[], id: string): Op | undefined =>
+      stack.find((entry) => entry.id === id);
+    const merged: Op[] = [];
+    for (const ours of this.stack) {
+      const theirOp = find(theirs.stack, ours.id);
+      if (same(theirOp, find(base.stack, ours.id))) merged.push(ours);
+      else if (theirOp) merged.push(theirOp);
+    }
+    const added = theirs.stack.filter(
+      (entry) => !find(this.stack, entry.id) && !same(entry, find(base.stack, entry.id)),
+    );
+    this.revision += 1;
+    this.append({ stack: [...merged, ...added], parent: this.cursor, mergedFrom: index });
+  }
+
+  /** A step and everything it is made of: parents and merged branches. */
+  private lineOf(index: number): Set<number> {
+    const found = new Set<number>();
+    const pending = [index];
+    for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+      const node = this.history[next];
+      if (!node || found.has(next)) continue;
+      found.add(next);
+      if (node.parent !== undefined) pending.push(node.parent);
+      if (node.mergedFrom !== undefined) pending.push(node.mergedFrom);
+    }
+    return found;
   }
 
   /** Straight to one snapshot: clicking a row of the history list. */
@@ -548,24 +606,33 @@ export class PhotoState {
   }
 
   redo(): void {
-    if (!this.canRedo) return;
-    this.moveCursor(this.cursor + 1);
+    const child = this.history[this.cursor]?.redoChild;
+    if (child === undefined) return;
+    this.moveCursor(child);
   }
 
   private moveCursor(cursor: number): void {
-    const snapshot = this.history[cursor];
-    if (!snapshot) return;
+    const node = this.history[cursor];
+    if (!node) return;
     this.cursor = cursor;
-    this.stack = snapshot;
+    this.stack = node.stack;
     this.revision += 1;
+  }
+
+  /** A new step under the cursor; the caller has already counted the revision. */
+  private append(node: HistoryNode): void {
+    const parent = node.parent === undefined ? undefined : this.history[node.parent];
+    if (parent) parent.redoChild = this.history.length;
+    this.history = [...this.history, node];
+    this.cursor = this.history.length - 1;
+    this.stack = node.stack;
   }
 
   private commit(stack: Op[], transient: boolean): void {
     this.stack = stack;
     this.revision += 1;
     if (transient) return;
-    this.history = [...this.history.slice(0, this.cursor + 1), stack];
-    this.cursor = this.history.length - 1;
+    this.append({ stack, parent: this.cursor });
   }
 }
 
@@ -1648,6 +1715,10 @@ export class MockEngine {
     }
     if (method === "history.jump") {
       photo.jump(Number(params.index));
+      return photo.snapshot();
+    }
+    if (method === "history.merge") {
+      photo.merge(Number(params.index));
       return photo.snapshot();
     }
     throw new Error(`unknown method ${method}`);

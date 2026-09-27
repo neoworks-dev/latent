@@ -185,6 +185,11 @@ Preview beats description.
 Backlog lives in GitHub (`neoworks-dev/latent`), not in a file. `gh issue list`,
 `gh issue view <n>`.
 
+Every GitHub write — issues, comments, PRs, edits, labels — goes through **`gh bot <args>`**
+(gh extension, posts as `neoworks-bot`), never plain `gh`: nothing lands under the owner's
+name. Reads may use either. `gh bot api user` answers 403 (app token); that is not an auth
+failure.
+
 Anything bigger than one simple change runs this loop:
 
 1. **Issue first.** `gh issue create` before writing code — symptom, files, what done looks
@@ -208,8 +213,8 @@ python-mcp, viewer. `priority:` p0 (blocking real use) → p3. `status:` needs-r
 ## Git
 
 `git status --short` before edits. Dirty files = user-owned; don't stash/reset/commit them.
-Commit only when asked. Imperative subject, body only if diff doesn't explain. Identity: global
-config (`moritz.utcke@gmx.de`). Never force-push.
+Commit only when asked. Imperative subject, body only if diff doesn't explain. No
+`Co-Authored-By` line. Identity: global config (`moritz.utcke@gmx.de`). Never force-push.
 
 ## Gotchas
 

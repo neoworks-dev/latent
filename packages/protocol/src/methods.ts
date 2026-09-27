@@ -19,6 +19,7 @@ export interface MethodMap {
   "history.list": { params: G.StackGetParams; result: G.HistoryListResult };
   "history.jump": { params: G.HistoryJumpParams; result: G.StackGetResult };
   "history.revertOp": { params: G.HistoryRevertOpParams; result: G.StackGetResult };
+  "history.merge": { params: G.HistoryMergeParams; result: G.StackGetResult };
   "view.open": { params: G.ViewOpenParams; result: G.ViewOpenResult };
   "view.close": { params: G.ViewCloseParams; result: G.ViewCloseResult };
   "view.render": { params: G.ViewRenderParams; result: G.ViewRenderResult };
@@ -92,6 +93,7 @@ export const methods: readonly MethodName[] = [
   "history.list",
   "history.jump",
   "history.revertOp",
+  "history.merge",
   "view.open",
   "view.close",
   "view.render",

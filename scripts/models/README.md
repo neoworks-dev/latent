@@ -35,7 +35,7 @@ at the top carries sha256 + size of every file.
 | `birefnet-lite/`           | 114.5 MB      | salient-object alpha matte    | `subject`, `background`                           |
 | `segformer-b2-ade20k/`     | 110.4 MB      | 150-class ADE20K semantic map | `sky`, `people`                                   |
 | `depth-anything-v2-small/` | 49.6 MB       | relative depth of the scene   | `depth`, and the `relight` op (PROMPT.md 3.8)     |
-| `scunet-color-real/`       | 161.9 MB      | noisy frame -> clean frame    | none; the `denoise` op (issue #51)             |
+| `scunet-color-real/`       | 161.9 MB      | noisy frame -> clean frame    | none; the `denoise` op (issue #51)                |
 |                            | **2045.1 MB** |                               |                                                   |
 
 ```

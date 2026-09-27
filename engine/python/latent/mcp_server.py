@@ -34,13 +34,19 @@ server = MCPServer(
 
 
 @server.tool()
-def run_python(code: str, photo_id: int | None = None) -> dict[str, Any]:
+def run_python(code: str, explanation: str, photo_id: int | None = None) -> dict[str, Any]:
     """Run Python against the live engine. The `latent` module is already imported.
+
+    `explanation` is shown to the user in place of the code: one short sentence, in plain
+    words, saying what the script does and why — "Pull the highlights down to recover the
+    clouds", not "Set highlights.value". Required.
 
     The last expression's repr comes back as `value`; stdout and stderr are captured.
     Examples: `latent.photo.develop.exposure = 0.7`, `latent.photo.stack.add("vibrance",
     value=20)`, `latent.undo()`, `latent.photo.stack_json()`.
     """
+    # Only the user reads it; the engine has no use for it.
+    del explanation
     # The tool name rides along so stack.changed reaches the UI as client "mcp:run_python".
     return latent._run_code(code, photo_id, tool="run_python")
 
@@ -51,13 +57,76 @@ def get_stack(photo_id: int | None = None) -> dict[str, Any]:
     return latent._stack_state(photo_id)
 
 
+# Lightroom splits its histogram into five regions, each moved by the slider of that name,
+# so an agent reading these knows which op to reach for. Bounds are 8-bit levels.
+_ZONES = (
+    ("blacks", 0, 26),
+    ("shadows", 26, 77),
+    ("exposure", 77, 179),
+    ("highlights", 179, 230),
+    ("whites", 230, 256),
+)
+_COARSE_BUCKETS = 32
+
+
+def _channel_summary(bins: list[int]) -> dict[str, Any]:
+    total = sum(bins)
+    if total == 0:
+        return {}
+    percentiles: dict[str, float] = {}
+    targets = [("p1", 0.01), ("p5", 0.05), ("p50", 0.5), ("p95", 0.95), ("p99", 0.99)]
+    running = 0
+    for level, count in enumerate(bins):
+        running += count
+        while targets and running >= targets[0][1] * total:
+            percentiles[targets.pop(0)[0]] = round(level / 255, 3)
+    width = len(bins) // _COARSE_BUCKETS
+    return {
+        "mean": round(sum(level * count for level, count in enumerate(bins)) / total / 255, 3),
+        "percentiles": percentiles,
+        "zonesPct": {
+            name: round(100 * sum(bins[low:high]) / total, 1) for name, low, high in _ZONES
+        },
+        "bucketsPct": [
+            round(100 * sum(bins[start : start + width]) / total, 1)
+            for start in range(0, len(bins), width)
+        ],
+    }
+
+
+@server.tool()
+def get_histogram(photo_id: int | None = None) -> dict[str, Any]:
+    """The histogram of the photo as the viewer last drew it, display-referred (0 black, 1 white).
+
+    Per channel r, g, b: `mean`, `percentiles` (p1…p99 as 0..1 levels), `zonesPct` — the
+    share of pixels in Lightroom's five regions, blacks/shadows/exposure/highlights/whites,
+    each moved by the op of that name — and `bucketsPct`, 32 equal-width buckets from black
+    to white. `clipping` is the share of pixels crushed to black or blown to white. Read it
+    after an edit to check tone, instead of guessing from a preview.
+    """
+    state = latent._stack_state(photo_id)
+    histogram = state.get("histogram") or {}
+    return {
+        "channels": {
+            channel: _channel_summary(histogram.get(channel) or []) for channel in ("r", "g", "b")
+        },
+        "clipping": state.get("clipping", {}),
+    }
+
+
 @server.tool()
 def render_preview(
     photo_id: int | None = None,
     max_size: int = 1024,
     mask: list[str] | None = None,
+    region: list[float] | None = None,
 ) -> Image:
     """A JPEG of the photo's current state, long edge at most `max_size`.
+
+    Pass `region=[x0, y0, x1, y1]` to zoom in: image space, 0..1 over the uncropped photo —
+    the same box a <selection> gives you. It is rendered from the full-resolution photo, so
+    a small region shows real detail; use it to judge texture, noise, an edge or a colour
+    up close, or to compare a part of the photo against a reference image.
 
     Pass `mask=["<op_id>"]` to get that op's combined mask instead, as a greyscale PNG
     (white = the op applies, black = it does not), or `mask=["<op_id>", "<component_id>"]`
@@ -67,7 +136,7 @@ def render_preview(
         component_id = mask[1] if len(mask) > 1 else None
         raster = latent._preview_mask_png(photo_id, mask[0], component_id, max_size)
         return Image(data=raster, format="png")
-    return Image(data=latent._preview_jpeg(photo_id, max_size), format="jpeg")
+    return Image(data=latent._preview_jpeg(photo_id, max_size, region), format="jpeg")
 
 
 @server.tool()

@@ -321,6 +321,21 @@ export function formatValue(value: number, spec: OpParamSpec): string {
   return text;
 }
 
+/**
+ * One side of a recorded change as its control would print it — a history row, the
+ * Assistant's change list. A value the engine left off is an em dash.
+ */
+export function formatSide(
+  value: number | string | boolean | undefined,
+  spec: OpParamSpec | undefined,
+): string {
+  if (value === undefined) return "—";
+  if (typeof value === "boolean") return value ? "on" : "off";
+  if (typeof value === "string") return value;
+  if (!spec) return String(value);
+  return formatValue(value, spec);
+}
+
 function signPrefix(rounded: number, range: SliderRange, spec: OpParamSpec): string {
   if (rounded < 0) return MINUS;
   if (spec.display?.kind === "kelvin") return "";
@@ -496,6 +511,33 @@ function isDefaultValue(value: unknown, spec: OpParamSpec): boolean {
     return value === spec.default;
   }
   return Math.abs(value - spec.default) < sliderRange(spec).step / 2;
+}
+
+/** A control someone pointed at, for its row to scroll into view and flash (`PanelsState`). */
+export interface Highlight {
+  /** The stack entry, which is what a Masks-pane row is keyed by. */
+  opId: string;
+  /** The op's name, which is what an Edit-column row is keyed by. */
+  op: string;
+  /** Null names every row of the op. */
+  param: string | null;
+  /** `Date.now()` when it was asked for. */
+  at: number;
+}
+
+/** How long a highlight still flashes a row that mounts after it: a mode switch, a flyout. */
+const HIGHLIGHT_FRESH_MS = 1000;
+
+/** Whether this row flashes: the named entry where the row has one, else the op by name. */
+export function isHighlighted(
+  target: Highlight | null,
+  row: { op: string; param: string; opId: string | null },
+  now: number,
+): boolean {
+  if (!target || now - target.at > HIGHLIGHT_FRESH_MS) return false;
+  if (target.param !== null && target.param !== row.param) return false;
+  if (row.opId) return target.opId === row.opId;
+  return target.op === row.op;
 }
 
 /**

@@ -30,7 +30,8 @@ struct PhotoSummary {
   uint32_t height = 0;
 };
 
-// Normalised crop of a preview, 0..1 of the image rect.
+// The part of the photo a preview zooms onto: image space, 0..1 over the uncropped photo,
+// the space masks and the Assistant's selection use.
 struct PreviewRegion {
   double x0 = 0;
   double y0 = 0;

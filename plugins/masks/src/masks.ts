@@ -35,6 +35,8 @@ export type KindGroup = "ai" | "manual" | "range";
 export interface KindSpec {
   kind: MaskComponentKind;
   label: string;
+  /** What a mask made of it is called in the lists: "Subject", not "Select subject". */
+  noun: string;
   group: KindGroup;
   /** The tool the overlay arms once the component exists, if any. */
   tool: MaskTool;
@@ -42,18 +44,24 @@ export interface KindSpec {
 
 /** Lightroom's Create New Mask menu, in its order and its three groups. */
 export const kindSpecs: readonly KindSpec[] = [
-  { kind: "subject", label: "Select subject", group: "ai", tool: "none" },
-  { kind: "sky", label: "Select sky", group: "ai", tool: "none" },
-  { kind: "background", label: "Select background", group: "ai", tool: "none" },
-  { kind: "objects", label: "Select objects", group: "ai", tool: "box" },
-  { kind: "people", label: "Select people", group: "ai", tool: "none" },
-  { kind: "text", label: "Select by text", group: "ai", tool: "none" },
-  { kind: "brush", label: "Brush", group: "manual", tool: "brush" },
-  { kind: "linear", label: "Linear gradient", group: "manual", tool: "linear" },
-  { kind: "radial", label: "Radial gradient", group: "manual", tool: "radial" },
-  { kind: "luminance", label: "Luminance range", group: "range", tool: "none" },
-  { kind: "color", label: "Color range", group: "range", tool: "none" },
-  { kind: "depth", label: "Depth range", group: "range", tool: "none" },
+  { kind: "subject", label: "Select subject", noun: "Subject", group: "ai", tool: "none" },
+  { kind: "sky", label: "Select sky", noun: "Sky", group: "ai", tool: "none" },
+  {
+    kind: "background",
+    label: "Select background",
+    noun: "Background",
+    group: "ai",
+    tool: "none",
+  },
+  { kind: "objects", label: "Select objects", noun: "Object", group: "ai", tool: "box" },
+  { kind: "people", label: "Select people", noun: "People", group: "ai", tool: "none" },
+  { kind: "text", label: "Select by text", noun: "Text", group: "ai", tool: "none" },
+  { kind: "brush", label: "Brush", noun: "Brush", group: "manual", tool: "brush" },
+  { kind: "linear", label: "Linear gradient", noun: "Linear", group: "manual", tool: "linear" },
+  { kind: "radial", label: "Radial gradient", noun: "Radial", group: "manual", tool: "radial" },
+  { kind: "luminance", label: "Luminance range", noun: "Luminance", group: "range", tool: "none" },
+  { kind: "color", label: "Color range", noun: "Color", group: "range", tool: "none" },
+  { kind: "depth", label: "Depth range", noun: "Depth", group: "range", tool: "none" },
 ];
 
 export const groupLabels: Record<KindGroup, string> = {
@@ -68,7 +76,56 @@ export type MaskTool = "none" | "brush" | "linear" | "radial" | "box";
 export function kindSpec(kind: MaskComponentKind): KindSpec {
   const found = kindSpecs.find((spec) => spec.kind === kind);
   // A kind the engine invented is still drawable: label it and give it no tool.
-  return found ?? { kind, label: kind, group: "range", tool: "none" };
+  return found ?? { kind, label: kind, noun: kind, group: "range", tool: "none" };
+}
+
+/**
+ * What the component was made from, beyond its kind: the words a text mask searched for,
+ * the band a range mask keeps. Undefined when the kind says it all.
+ */
+export function componentDetail(component: MaskComponent): string | undefined {
+  const params = component.params ?? {};
+  if (component.kind === "text" && typeof params.prompt === "string" && params.prompt !== "") {
+    return `“${params.prompt}”`;
+  }
+  if (component.kind === "people" && typeof params.person === "number") {
+    return `person ${params.person}`;
+  }
+  if (!isBandKind(component.kind)) return undefined;
+  const [low, high] = bandOf(component).map((value) => Math.round(value * 100));
+  return `${low}–${high} %`;
+}
+
+/** Kinds that keep a band of one channel: luminance of the photo, or distance off the depth map. */
+export function isBandKind(kind: MaskComponentKind): boolean {
+  return kind === "luminance" || kind === "depth";
+}
+
+/** `params.range` as 0..1 numbers, at the engine's default when the component has none yet. */
+export function bandOf(component: MaskComponent): [number, number] {
+  const range = component.params?.range;
+  if (!Array.isArray(range) || range.length !== 2) return [0.5, 1];
+  return [Number(range[0]), Number(range[1])];
+}
+
+/**
+ * The band with one edge moved, 0..100 in. The engine rejects a descending pair, so an edge
+ * dragged past the other one pushes it along instead of the write failing mid-drag.
+ */
+export function movedBand(
+  band: [number, number],
+  edge: "low" | "high",
+  percent: number,
+): [number, number] {
+  const value = Math.min(1, Math.max(0, percent / 100));
+  if (edge === "low") return [value, Math.max(value, band[1])];
+  return [Math.min(value, band[0]), value];
+}
+
+/** "Sky", or "“the cat”" for a text mask — the words say more than the kind does. */
+function componentName(component: MaskComponent): string {
+  if (component.kind === "text") return componentDetail(component) ?? kindSpec("text").noun;
+  return kindSpec(component.kind).noun;
 }
 
 /** Ids are the UI's only invention here; the engine takes the mask as it is written. */
@@ -182,11 +239,11 @@ export function layerOf(stack: Op[], selectedOpId: string | null): Op | undefine
   return layers.find((layer) => (layer.ops ?? []).some((op) => op.id === selectedOpId));
 }
 
-/** "Mask 2 · Subject, Brush" — the number the list shows, then what is in it. */
+/** "Mask 2 · Subject, “the cat”" — the number the list shows, then what is in it. */
 export function layerLabel(layer: Op, index: number): string {
-  const kinds = [...new Set((layer.mask?.components ?? []).map((component) => component.kind))];
-  if (kinds.length === 0) return `Mask ${index + 1}`;
-  return `Mask ${index + 1} · ${kinds.join(", ")}`;
+  const names = [...new Set((layer.mask?.components ?? []).map(componentName))];
+  if (names.length === 0) return `Mask ${index + 1}`;
+  return `Mask ${index + 1} · ${names.join(", ")}`;
 }
 
 /**
@@ -281,6 +338,9 @@ function spec(name: string, label: string, max: number, step: number, unit?: str
 export const featherSpec = spec("feather", "Feather", 100, 1);
 export const opacitySpec = spec("opacity", "Opacity", 100, 1, "%");
 export const flowSpec = spec("flow", "Flow", 100, 1, "%");
+export const bandLowSpec = spec("low", "From", 100, 1, "%");
+export const bandHighSpec = spec("high", "To", 100, 1, "%");
+export const smoothnessSpec = spec("smoothness", "Smoothness", 100, 1, "%");
 /** Brush diameter as a percentage of the long edge: `params.size` × 100. */
 export const brushSizeSpec = spec("size", "Size", 80, 0.5, "%");
 

@@ -45,6 +45,7 @@ import { Button } from "@neoworks-dev/ui";
 | `type` | `'button' \| 'submit' \| 'reset'` | `'button'` | no |  |
 | `disabled` | `boolean` | `false` | no |  |
 | `full` | `boolean` | `false` | no |  |
+| `round` | `boolean` | `false` | no | A circle sized to the height, for an icon-only button. |
 | `onclick` | `(event: MouseEvent) => void` | — | no |  |
 | `children` | `Snippet` | — | no |  |
 
@@ -322,6 +323,8 @@ import { Select } from "@neoworks-dev/ui";
 | `multiple` | `boolean` | `false` | no | Allow selecting several options; keeps the popover open on each pick. |
 | `filter` | `(option: Option, query: string) => boolean` | — | no | Enables a search box in the popover; decides whether an option matches the |
 | `searchPlaceholder` | `string` | `'Search'` | no |  |
+| `size` | `Size` | `'md'` | no |  |
+| `variant` | `Variant` | `'surface'` | no | `ghost` drops the border and fill, for a picker set inside another field. |
 
 Live examples: `packages/ui/src/stories/Select.stories.svelte`
 

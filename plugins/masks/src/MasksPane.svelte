@@ -14,7 +14,7 @@
   } from "@latent/contracts";
   import { ValueField } from "@latent/plugin-panels";
   import type { MaskComponentKind } from "@latent/protocol";
-  import { Button, Select, Tooltip } from "@neoworks-dev/ui";
+  import { Button, Tooltip } from "@neoworks-dev/ui";
   import EyeIcon from "phosphor-svelte/lib/EyeIcon";
   import EyeSlashIcon from "phosphor-svelte/lib/EyeSlashIcon";
   import ImageIcon from "phosphor-svelte/lib/ImageIcon";
@@ -23,7 +23,6 @@
   import KindIcon from "./KindIcon.svelte";
   import {
     coverageLabel,
-    groupLabels,
     kindSpec,
     kindSpecs,
     layerLabel,
@@ -31,7 +30,7 @@
     opacitySpec,
     tintStyle,
   } from "./masks";
-  import Toolbar from "./Toolbar.svelte";
+  import BrushOptions from "./BrushOptions.svelte";
   import {
     boxFromDrag,
     boxPoints,
@@ -55,45 +54,30 @@
   const components = $derived(masks.components);
   const adjustments = $derived(masks.adjustments);
   const opacity = $derived(layer?.opacity ?? 100);
-  const createOptions = $derived(
-    kindSpecs.map((spec) => ({
-      value: spec.kind as string,
-      label: `${groupLabels[spec.group]} · ${spec.label}`,
-    })),
-  );
-  // The kinds a mask is actually built out of, one click each: select the subject, then
-  // brush the rest in. The full list stays a step away in the menu beside them.
-  const quickKinds: MaskComponentKind[] = [
-    "subject",
-    "sky",
-    "brush",
-    "linear",
-    "radial",
-    "objects",
-  ];
-
-  let textKind = $state<"layer" | "component" | null>(null);
+  let askingText = $state(false);
   // Drag and hover live outside reactive state: they change per pointer event and only the
   // overlay canvas cares, so they repaint it instead of re-rendering the column.
   let drag: { start: Point; current: Point } | null = null;
   let hover: Point | null = null;
 
-  // `newLayer` is Lightroom's Create New Mask — a mask of its own, with its own
-  // adjustments. Without it the component would join whichever mask is selected.
-  function createMask(kind: string, newLayer: boolean): void {
-    if (kind === "text") {
-      textKind = newLayer ? "layer" : "component";
-      return;
-    }
-    textKind = null;
-    if (newLayer) void masks.createLayer(kind as MaskComponentKind);
-    else void masks.createComponent(kind as MaskComponentKind);
+  /** Adds a component of this kind to the selected mask; `text` asks for its words first. */
+  function addKind(kind: MaskComponentKind): void {
+    askingText = kind === "text";
+    if (askingText) return;
+    void masks.createComponent(kind);
+  }
+
+  /** The icon whose gesture the overlay is waiting for: a drag there lands in that kind. */
+  function armed(kind: MaskComponentKind): boolean {
+    const tool = kindSpec(kind).tool;
+    return tool !== "none" && masks.tool === tool;
   }
 
   async function createText(): Promise<void> {
-    const component =
-      textKind === "layer" ? await masks.createLayer("text") : await masks.createComponent("text");
-    textKind = null;
+    masks.textPrompt = masks.textPrompt.trim();
+    if (masks.textPrompt === "") return;
+    const component = await masks.createComponent("text");
+    askingText = false;
     if (component) await masks.detect(component.id, { prompt: masks.textPrompt });
   }
 
@@ -105,7 +89,7 @@
     map: OverlayMap,
   ): void {
     if (rect.width <= 0 || rect.height <= 0) return;
-    if (masks.overlayVisible) {
+    if (masks.overlayVisible && !viewer.adjusting) {
       drawTint(context, rect);
       drawLiveStroke(context, map);
     }
@@ -398,6 +382,12 @@
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  // The painter is a plain function, so the tint's hide and return is repainted from here.
+  $effect(() => {
+    void viewer.adjusting;
+    viewer.overlay.redraw();
+  });
+
   // The preview follows the stack: it re-asks when this op's mask changed and not otherwise.
   $effect(() => {
     masks.syncPreview();
@@ -456,9 +446,11 @@
         >
           {layerLabel(entry, index)}
         </button>
-        <span class="text-[10px] text-faint tabular-nums">
-          {(entry.ops ?? []).length}
-        </span>
+        <Tooltip text="Adjustments in this mask" placement="left">
+          <span class="text-[10px] text-faint tabular-nums">
+            {(entry.ops ?? []).length}
+          </span>
+        </Tooltip>
         <Tooltip text="Delete mask" placement="left">
           <Button
             size="sm"
@@ -471,19 +463,10 @@
     {/each}
   </ul>
 
-  <div class="px-2 py-1.5" data-create-mask>
-    <Select
-      value=""
-      options={createOptions}
-      placeholder="Create new mask"
-      onChange={(value) => createMask(String(value), true)}
-    />
-  </div>
-
   {#if !layer}
     <p class="px-3 pb-2 text-faint">
-      A mask is a region and the adjustments inside it. Create one and select it, and the Edit
-      panel's sliders apply to it instead of to the photo.
+      A mask is a region and the adjustments inside it. Add one with + above, and while it is
+      selected the Edit panel's sliders apply to it instead of to the photo.
     </p>
   {:else}
     <div class="flex items-center justify-between gap-2 px-3 py-1">
@@ -499,52 +482,52 @@
     </div>
 
     <!-- Add to this mask, one click per kind: select the subject, then brush the rest of it
-         in. The menu beside them is the same list in full, for the kinds with no icon here. -->
+         in. Every kind is here in the menu's order — AI on the first row, tools and ranges on
+         the second — on a fixed grid so the two rows line up column for column. -->
     <div class="flex flex-col gap-1 border-t border-line-faint px-2 py-1.5" data-add-component>
-      <div class="flex items-center gap-2">
-        <span class="min-w-0 flex-1 truncate text-[10px] text-faint">Add to this mask</span>
-        <div class="w-28">
-          <Select
-            value=""
-            options={createOptions}
-            placeholder="More…"
-            onChange={(value) => createMask(String(value), false)}
-          />
-        </div>
-      </div>
-      <div class="flex items-center gap-1" role="group" aria-label="Add to this mask">
-        {#each quickKinds as kind (kind)}
-          <Tooltip text={kindSpec(kind).label} placement="top">
+      <span class="px-1 text-[10px] text-faint">Add to this mask</span>
+      <div class="grid w-fit grid-cols-6 gap-1" role="group" aria-label="Add to this mask">
+        {#each kindSpecs as spec (spec.kind)}
+          <Tooltip text={spec.label} placement="top">
             <button
               type="button"
               class="rounded-sm p-1.5 text-muted transition-colors hover:bg-hover
                      hover:text-default"
-              aria-label={kindSpec(kind).label}
-              data-add-kind={kind}
-              onclick={() => createMask(kind, false)}
+              class:bg-raised={armed(spec.kind)}
+              class:text-default={armed(spec.kind)}
+              aria-label={spec.label}
+              data-add-kind={spec.kind}
+              data-active={armed(spec.kind)}
+              onclick={() => addKind(spec.kind)}
             >
-              <KindIcon {kind} size={14} />
+              <KindIcon kind={spec.kind} size={14} />
             </button>
           </Tooltip>
         {/each}
       </div>
     </div>
 
-    {#if textKind}
+    {#if askingText}
       <!-- `text` is the one kind that needs a word from the user before it can run. -->
-      <div class="flex items-center gap-1 px-2 pb-1.5">
+      <form
+        class="flex items-center gap-1 px-2 pb-1.5"
+        onsubmit={(event) => {
+          event.preventDefault();
+          void createText();
+        }}
+      >
         <input
           class="min-w-0 flex-1 rounded-sm border border-line-strong bg-input px-1.5 py-1
                  text-xs text-default"
-          placeholder="the cat"
+          placeholder="What to select, e.g. the cat"
           bind:value={masks.textPrompt}
           data-text-prompt
         />
-        <Button size="sm" onclick={() => void createText()}>Detect</Button>
-      </div>
+        <Button size="sm" type="submit">Detect</Button>
+      </form>
     {/if}
 
-    <Toolbar />
+    <BrushOptions />
 
     {#if components.length === 0}
       <p class="px-3 py-2 text-faint">No region yet — pick one above.</p>
@@ -554,8 +537,8 @@
            mask, which is the only thing the render ever sees. -->
       <p class="px-3 pt-2 pb-1 text-[10px] text-faint">Layers of this mask</p>
       <ul class="flex flex-col border-b border-line" data-mask-components>
-        {#each components as component, index (component.id)}
-          <ComponentRow {component} {index} />
+        {#each components as component (component.id)}
+          <ComponentRow {component} />
         {/each}
       </ul>
       <p class="flex items-center gap-1.5 px-3 py-1 text-[10px] text-faint" data-mask-merged>
