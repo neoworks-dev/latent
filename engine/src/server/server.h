@@ -253,7 +253,7 @@ class Server : public EngineApi {
   // edit state and never touches history; re-running it is always the user's ask.
   int64_t start_depth_estimate(PhotoState& photo);
   void finish_depth_estimate(int64_t photo_id, int64_t job_id, const DepthResult& result);
-  // Reloads `<photo>.latent.d/depth.png` when a photo is opened.
+  // Reloads `<raster dir>/depth.png` when a photo is opened.
   void load_depth_map(const PhotoState& photo);
 
   // The body behind catalog.import, and behind a folder watch that has just seen files

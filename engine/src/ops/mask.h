@@ -161,11 +161,22 @@ nlohmann::json brush_strokes_to_json(const std::vector<BrushStroke>& strokes);
 void append_brush_stroke(nlohmann::json& params, const BrushStroke& stroke);
 
 // ---- where rasters and strokes live -------------------------------------------------
-// `<photo>.latent` is the sidecar; `<photo>.latent.d/` is its sibling directory
-// (PROMPT.md 3.3), with `masks/` inside it.
-std::string sidecar_dir_for(std::string_view photo_path);
-std::string mask_dir_for(std::string_view photo_path);
-// Relative to the sidecar directory, so the sidecar stays portable.
+// `<photo>.latent` is the sidecar and stays beside the photo. The rasters it points at —
+// mask rasters, brush-stroke mirrors, the depth map, generative patches — live in the
+// engine's data dir, keyed by the source file's sha-256 (`photo.hash`, the sidecar's
+// `source_hash`): Latent never writes the source, so the key survives a move or rename
+// outside the app, works on read-only folders, and keeps the catalog scan out of them.
+// `$XDG_DATA_HOME/latent/rasters/<sha256>/`, else `~/.local/share/latent/rasters/<sha256>/`.
+std::string raster_dir_for(std::string_view photo_hash);
+// Before the store, rasters sat beside the photo in `<photo>.latent.d/`. The scan must skip
+// such a directory wherever it still is, and opening the photo moves it into the store.
+bool is_legacy_raster_dir(std::string_view directory);
+// True for any path with a `*.latent.d` directory among its components.
+bool is_inside_legacy_raster_dir(std::string_view path);
+// Moves `<photo>.latent.d/` into raster_dir_for(hash), keeping files already in the store.
+// Idempotent; a source it cannot delete (read-only folder) stays, copied. Throws nothing.
+void migrate_legacy_raster_dir(std::string_view photo_path, std::string_view photo_hash);
+// Relative to the raster directory, so the sidecar never names an absolute path.
 std::string mask_raster_relative_path(std::string_view component_id, std::string_view hash);
 std::string brush_stroke_relative_path(std::string_view component_id);
 
