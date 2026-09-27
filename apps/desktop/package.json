@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p scripts/tsconfig.json"
   },
   "dependencies": {
-    "@latent/protocol": "workspace:*"
+    "@latent/protocol": "workspace:*",
+    "@neoworks/harness": "link:@neoworks/harness"
   },
   "devDependencies": {
     "electron": "^43.4.1",
