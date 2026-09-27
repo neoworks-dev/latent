@@ -24,6 +24,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@latent/protocol": "workspace:*",
+        "@neoworks/harness": "link:@neoworks/harness",
       },
       "devDependencies": {
         "electron": "^43.4.1",
@@ -37,6 +38,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@latent/contracts": "workspace:*",
+        "@latent/plugin-assistant": "workspace:*",
         "@latent/plugin-catalog": "workspace:*",
         "@latent/plugin-console": "workspace:*",
         "@latent/plugin-crop": "workspace:*",
@@ -89,6 +91,26 @@
       "devDependencies": {
         "json-schema-to-typescript": "^15.0.4",
         "typescript": "^5.9.3",
+      },
+    },
+    "plugins/assistant": {
+      "name": "@latent/plugin-assistant",
+      "version": "0.0.0",
+      "dependencies": {
+        "@latent/contracts": "workspace:*",
+        "@latent/protocol": "workspace:*",
+        "@neoworks-dev/ui": "link:@neoworks-dev/ui",
+        "@neoworks/extension-system": "link:@neoworks/extension-system",
+        "@neoworks/harness": "link:@neoworks/harness",
+        "phosphor-svelte": "^3.1.0",
+      },
+      "devDependencies": {
+        "svelte": "^5.56.4",
+        "svelte-check": "^4.4.1",
+        "typescript": "^5.9.3",
+      },
+      "peerDependencies": {
+        "svelte": "^5.56.4",
       },
     },
     "plugins/catalog": {
@@ -552,6 +574,8 @@
 
     "@latent/editor": ["@latent/editor@workspace:apps/editor"],
 
+    "@latent/plugin-assistant": ["@latent/plugin-assistant@workspace:plugins/assistant"],
+
     "@latent/plugin-catalog": ["@latent/plugin-catalog@workspace:plugins/catalog"],
 
     "@latent/plugin-console": ["@latent/plugin-console@workspace:plugins/console"],
@@ -591,6 +615,8 @@
     "@neoworks-dev/ui": ["@neoworks-dev/ui@link:@neoworks-dev/ui", {}],
 
     "@neoworks/extension-system": ["@neoworks/extension-system@link:@neoworks/extension-system", {}],
+
+    "@neoworks/harness": ["@neoworks/harness@link:@neoworks/harness", { "bin": { "neoworks-harness": "./dist/cli/index.js" } }],
 
     "@oxlint-tsgolint/darwin-arm64": ["@oxlint-tsgolint/darwin-arm64@7.0.2001", "", { "os": "darwin", "cpu": "arm64" }, "sha512-CUJEdbSZ54+Xy9OXqOhWLTKZKV0BBiV7C2i/ygyVmXtkUNXx5YCzN8DpSSshTAKktoL7S+tnQ/ftFG/i7X896w=="],
 
