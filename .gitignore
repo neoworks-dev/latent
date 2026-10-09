@@ -14,3 +14,4 @@ engine/vcpkg_installed/
 .venv/
 __pycache__/
 .task/
+.worktrees/
