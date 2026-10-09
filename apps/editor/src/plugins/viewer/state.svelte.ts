@@ -1,9 +1,11 @@
 import {
+  baseLayerMap,
   clampViewportScale,
   contentRectFor,
   type EngineClient,
   type EngineFrame,
   FIT_VIEWPORT,
+  type FrameLayer,
   type FrameSink,
   frameTransform,
   type GeometryMode,
@@ -50,6 +52,13 @@ interface PendingAdd {
  * the engine's and not the painter's.
  */
 const VIEWPORT_RENDER_INTERVAL_MS = 60;
+
+/**
+ * How long a zoomed view waits after its last frame before it renders the base layer again
+ * (painter.ts). The base layer is only what a pan or a zoom out uncovers, so it can lag an
+ * edit; rendering it during a drag would put a second frame on the wire behind every tick.
+ */
+const BASE_RENDER_DELAY_MS = 300;
 
 /**
  * How long `adjusting` stays up after the last adjustment write: past the gap between two
@@ -162,6 +171,20 @@ export class ViewerState implements ViewerService, GeometryView {
   private viewportRenderAt = 0;
   private viewportTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * The second view on the photo, always fitted, whose frames are the painter's base layer
+   * while the main view is zoomed. While the main view is fitted its own frames are the
+   * base layer and this one renders nothing.
+   */
+  private baseViewId: number | null = null;
+  /** image-normalised → pixel of the frame in the base layer, or no base layer yet. */
+  private baseTransform: ImageTransform | null = null;
+  /** The stack revision the base layer shows; -1 when it has to be rendered again. */
+  private baseRevision = -1;
+  private baseRenderInFlight = false;
+  private baseTimer: ReturnType<typeof setTimeout> | null = null;
+  private unsubscribeBaseFrame: (() => void) | null = null;
+
   private renderWidth = 1;
   private renderHeight = 1;
   private renderInFlight = false;
@@ -200,6 +223,7 @@ export class ViewerState implements ViewerService, GeometryView {
     // landed behind it. Nothing about the stack changed, so only the pixels are stale.
     this.unsubscribeResolution = engine.on("photo.resolution", (params) => {
       if (params.photoId !== this.photoId) return;
+      this.baseRevision = -1;
       this.requestRender();
     });
   }
@@ -211,7 +235,10 @@ export class ViewerState implements ViewerService, GeometryView {
     this.viewportTimer = null;
     if (this.adjustingTimer !== null) clearTimeout(this.adjustingTimer);
     this.adjustingTimer = null;
+    if (this.baseTimer !== null) clearTimeout(this.baseTimer);
+    this.baseTimer = null;
     this.unsubscribeFrame?.();
+    this.unsubscribeBaseFrame?.();
     this.unsubscribeStack();
     this.unsubscribeResolution();
   }
@@ -235,13 +262,31 @@ export class ViewerState implements ViewerService, GeometryView {
   }
 
   /**
+   * Where the painter's base layer lands on the canvas right now, as the map it samples by:
+   * canvas pixel → base frame pixel. Without matrices from the engine there is nothing to
+   * map through, and the base layer stays out.
+   */
+  private baseMap(): ImageTransform | null {
+    if (!this.frameMapped || this.baseTransform === null) return null;
+    return baseLayerMap(this.baseTransform, this.shownFrame.transform);
+  }
+
+  /** Both layers moved to the viewport the user is at, in one draw. */
+  private placeLayers(): void {
+    this.frameSink?.setTransform(
+      frameTransform(this.frame, this.textureViewport, this.viewport),
+      this.baseMap(),
+    );
+  }
+
+  /**
    * Moves the frame already on the GPU to where the viewport now says it is, and moves the
    * overlay with it. This is the whole point of the client-side transform: a wheel notch or
    * a pan step is on screen in the event that caused it, and the engine's next frame only
    * replaces a blur with the real pixels.
    */
   private showViewport(): void {
-    this.frameSink?.setTransform(frameTransform(this.frame, this.textureViewport, this.viewport));
+    this.placeLayers();
     // Nothing has moved past the frame the engine answered about, so its own rect and matrix
     // are on the overlay already and they are exact where a prediction is only close.
     if (!this.frameMapped || sameViewport(this.viewport, this.frameViewport)) return;
@@ -272,8 +317,21 @@ export class ViewerState implements ViewerService, GeometryView {
       frame.header.width === this.frame.frameWidth &&
       frame.header.height === this.frame.frameHeight;
     this.textureViewport = sized ? this.sentViewport : this.viewport;
-    this.frameSink?.setTransform(frameTransform(this.frame, this.textureViewport, this.viewport));
-    const marks = this.frameSink?.draw(frame);
+    // A fitted frame is the whole photo, which is exactly what the base layer is for, and a
+    // zoomed one is the detail over it. The base layer needs the engine's matrices to be
+    // mapped, so until the first reply has brought them every frame is detail.
+    const layer: FrameLayer = this.sentViewport.fit && this.frameMapped ? "base" : "detail";
+    if (layer === "base") {
+      this.frameSink?.dropDetail();
+      // The reply corrects this; until it lands, the frame it describes is predicted from
+      // the one before, which is exact unless the view was resized in between.
+      this.baseTransform = transformImageMatrix(
+        frameTransform(this.frame, this.frameViewport, this.sentViewport),
+        this.frame.transform,
+      );
+    }
+    this.placeLayers();
+    const marks = this.frameSink?.draw(frame, layer);
     // The overlay letterboxes to the frame's aspect, so it follows the frame, not the box.
     this.overlay.setImageSize(frame.header.width, frame.header.height);
     const sent = this.renderSentAt;
@@ -322,9 +380,14 @@ export class ViewerState implements ViewerService, GeometryView {
     this.textureViewport = FIT_VIEWPORT;
     this.zoom = "Fit";
     this.histogram = null;
-    // Switching photos: the previous view is the engine's to free, not ours to leak.
+    // Switching photos: the previous views are the engine's to free, not ours to leak.
     const previousView = this.viewId;
     if (previousView !== null) await this.engine.call("view.close", { viewId: previousView });
+    const previousBase = this.baseViewId;
+    if (previousBase !== null) await this.engine.call("view.close", { viewId: previousBase });
+    this.baseViewId = null;
+    this.baseTransform = null;
+    this.baseRevision = -1;
     const view = await this.engine.call("view.open", {
       photoId: photo.photoId,
       width: this.renderWidth,
@@ -333,6 +396,17 @@ export class ViewerState implements ViewerService, GeometryView {
     this.viewId = view.viewId;
     this.unsubscribeFrame?.();
     this.unsubscribeFrame = this.engine.onFrame(view.viewId, (frame) => this.paint(frame));
+    const baseView = await this.engine.call("view.open", {
+      photoId: photo.photoId,
+      width: this.renderWidth,
+      height: this.renderHeight,
+    });
+    this.baseViewId = baseView.viewId;
+    this.unsubscribeBaseFrame?.();
+    this.unsubscribeBaseFrame = this.engine.onFrame(baseView.viewId, (frame) => {
+      this.placeLayers();
+      this.frameSink?.draw(frame, "base");
+    });
     this.applyStack(await this.engine.call("stack.get", { photoId: photo.photoId }));
     this.status = `${photo.camera} ${photo.width}×${photo.height}`;
     this.requestRender();
@@ -518,6 +592,12 @@ export class ViewerState implements ViewerService, GeometryView {
         };
         this.frameViewport = rendered;
         this.textureViewport = rendered;
+        if (rendered.fit) {
+          this.baseTransform = matrix;
+          this.baseRevision = result.revision;
+        } else if (this.baseRevision !== result.revision) {
+          this.scheduleBaseRender();
+        }
         // Taking the echo while a newer viewport is pending would drag the picture back to
         // where the gesture was a frame ago; the difference between the two is exactly what
         // the painter is showing, so leaving it alone is what keeps the drag smooth.
@@ -535,6 +615,59 @@ export class ViewerState implements ViewerService, GeometryView {
           this.renderQueued = false;
           this.requestRender();
         }
+      });
+  }
+
+  /**
+   * The base layer again, once the main view has been quiet for `BASE_RENDER_DELAY_MS`. Each
+   * zoomed frame rearms the timer, so a drag renders it once at the end and not per tick.
+   */
+  private scheduleBaseRender(): void {
+    if (this.baseTimer !== null) clearTimeout(this.baseTimer);
+    this.baseTimer = setTimeout(() => {
+      this.baseTimer = null;
+      this.renderBase();
+    }, BASE_RENDER_DELAY_MS);
+  }
+
+  /**
+   * A fitted frame of the base view, for the painter's base layer. It waits for the main
+   * view's render rather than queueing behind it in the engine, which would put a whole
+   * extra frame in front of the next slider tick.
+   */
+  private renderBase(): void {
+    const viewId = this.baseViewId;
+    if (viewId === null || this.baseRenderInFlight) return;
+    if (this.viewport.fit) return;
+    if (this.renderInFlight || this.renderQueued) {
+      this.scheduleBaseRender();
+      return;
+    }
+    this.baseRenderInFlight = true;
+    const params: ViewRenderParams = {
+      viewId,
+      width: this.renderWidth,
+      height: this.renderHeight,
+      viewport: { scale: 1 },
+    };
+    if (this.geometry !== "stack") params.geometry = this.geometry;
+    void this.engine
+      .call("view.render", params)
+      .then((result) => {
+        // A photo switch while this was in flight closed the view it came from.
+        if (viewId !== this.baseViewId) return;
+        const transform = (result.imageTransform ?? null) as ImageTransform | null;
+        if (transform === null) return;
+        this.baseTransform = transform;
+        this.baseRevision = result.revision;
+        this.placeLayers();
+        if (result.revision !== this.revision) this.scheduleBaseRender();
+      })
+      .catch((error: Error) => {
+        this.status = error.message;
+      })
+      .finally(() => {
+        this.baseRenderInFlight = false;
       });
   }
 
