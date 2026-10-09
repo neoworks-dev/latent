@@ -12,9 +12,16 @@ struct VSOut {
   return out;
 }
 
+// `step` is 1 for a full frame and 2 for a draft (view.render `draft`): each destination pixel
+// then averages the 2×2 block of view pixels it stands for, so a frame of half the bytes
+// still shows every pixel's worth of the picture rather than every other one.
 struct Frame {
   content_min: vec2f,
   content_max: vec2f,
+  step: vec2f,
+  // The view's own size: a draft of an odd-sized view has a last column or row whose 2×2
+  // block runs one pixel off the source, and that tap reads the edge pixel again.
+  size: vec2f,
 };
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -25,11 +32,24 @@ fn oetf(c: f32) -> f32 {
   return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
-@fragment fn fs(in: VSOut) -> @location(0) vec4f {
-  let p = in.pos.xy;
+// One view pixel, display-encoded: the photo through the OETF, or the letterbox bar.
+fn shade(tap: vec2f) -> vec3f {
+  let p = min(tap, frame.size - vec2f(0.5));
   if (any(p < frame.content_min) || any(p >= frame.content_max)) {
-    return vec4f(0.08, 0.08, 0.09, 1.0);
+    return vec3f(0.08, 0.08, 0.09);
   }
   let c = clamp(textureLoad(src, vec2i(p), 0).rgb, vec3f(0.0), vec3f(1.0));
-  return vec4f(oetf(c.r), oetf(c.g), oetf(c.b), 1.0);
+  return vec3f(oetf(c.r), oetf(c.g), oetf(c.b));
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  let taps = vec2i(frame.step);
+  let origin = floor(in.pos.xy) * frame.step;
+  var sum = vec3f(0.0);
+  for (var y = 0; y < taps.y; y = y + 1) {
+    for (var x = 0; x < taps.x; x = x + 1) {
+      sum = sum + shade(origin + vec2f(f32(x), f32(y)) + vec2f(0.5));
+    }
+  }
+  return vec4f(sum / f32(taps.x * taps.y), 1.0);
 }

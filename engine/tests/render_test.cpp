@@ -15,6 +15,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 #include <algorithm>
 #include <map>
@@ -384,4 +385,56 @@ TEST_CASE("manual denoise takes the noise out and leaves the edge in") {
   const FrameStats chroma_only = measure(fixture.frame);
   REQUIRE(chroma_only.chroma < before.chroma * 0.35);
   REQUIRE(chroma_only.grain > before.grain * 0.8);
+}
+
+TEST_CASE("a draft frame is half the view each way and every pixel averages its 2x2 block") {
+  Fixture fixture;
+  try {
+    fixture.renderer = std::make_unique<Renderer>(16384);
+  } catch (const std::exception& error) {
+    SKIP(std::string("no GPU adapter: ") + error.what());
+  }
+  // Odd on both axes, so the last column and row of the draft cover a block that runs one
+  // pixel off the view.
+  constexpr uint32_t width = kWidth + 1;
+  constexpr uint32_t height = kHeight + 1;
+  fixture.renderer->load_photo(1, synthetic_raw());
+  fixture.renderer->open_view(1, 1, width, height);
+  const Stack stack = {make_op("exposure", {{"value", 0.5}})};
+
+  std::vector<uint8_t> full(static_cast<size_t>(width) * height * 4);
+  fixture.renderer->render(1, stack, full, 0);
+  constexpr uint32_t draft_width = draft_extent(width);
+  constexpr uint32_t draft_height = draft_extent(height);
+  REQUIRE(draft_width == 161);
+  REQUIRE(draft_height == 101);
+  std::vector<uint8_t> draft(static_cast<size_t>(draft_width) * draft_height * 4);
+  fixture.renderer->render(1, stack, draft, 0, false, true);
+
+  // The view's geometry is the full view's whatever was drawn last.
+  REQUIRE(fixture.renderer->view_geometry(1).width == width);
+
+  const auto full_at = [&](uint32_t x, uint32_t y, int channel) {
+    const uint32_t clamped_x = std::min(x, width - 1);
+    const uint32_t clamped_y = std::min(y, height - 1);
+    return static_cast<int>(full[((static_cast<size_t>(clamped_y) * width) + clamped_x) * 4 +
+                                 static_cast<size_t>(channel)]);
+  };
+  int worst = 0;
+  for (uint32_t y = 0; y < draft_height; ++y) {
+    for (uint32_t x = 0; x < draft_width; ++x) {
+      for (int channel = 0; channel < 3; ++channel) {
+        const int expected =
+            (full_at(2 * x, 2 * y, channel) + full_at(2 * x + 1, 2 * y, channel) +
+             full_at(2 * x, 2 * y + 1, channel) + full_at(2 * x + 1, 2 * y + 1, channel) + 2) /
+            4;
+        const int actual = static_cast<int>(
+            draft[((static_cast<size_t>(y) * draft_width) + x) * 4 + static_cast<size_t>(channel)]);
+        worst = std::max(worst, std::abs(actual - expected));
+      }
+    }
+  }
+  // The shader averages before it rounds to 8 bits and the full frame rounds each pixel
+  // first, so the two can differ by the rounding of four values.
+  REQUIRE(worst <= 2);
 }

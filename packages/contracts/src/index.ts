@@ -19,6 +19,7 @@ export type {
   FrameDrawMarks,
   FrameLayer,
   FrameSink,
+  FrameSize,
   FrameTransform,
   ImageTransform,
   OverlayDraw,

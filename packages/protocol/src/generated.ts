@@ -987,6 +987,10 @@ export interface ViewRenderParams {
     centerY?: number;
   };
   /**
+   * Half the pixels each way while the client is dragging a slider or the view: the binary frame is ceil(width/2)×ceil(height/2), each pixel the average of the 2×2 block of view pixels it covers. Everything in the result stays in the view's own pixels — width, height, contentRect, imageTransform — so a client stretches the frame over the view and nothing else changes. Not sticky: a render without it is a full frame.
+   */
+  draft?: boolean;
+  /**
    * What the client floats over the frame — its panels — in frame pixels. A fitted photo is fitted into the view minus these and centred in what is left, so no panel covers it; a zoomed one still fills the whole frame and runs on behind them. Sticky per view like `viewport`, and not edit state. Absent or all-zero is the old behaviour: fit the whole view.
    */
   insets?: {
@@ -1003,7 +1007,7 @@ export interface ViewRenderResult {
    */
   revision: number;
   /**
-   * Size of the frame that was sent, so a client that dropped it still knows the view size.
+   * Size of the view the frame was rendered for, so a client that dropped it still knows it. A draft frame's own pixels are half of it each way; its header says so.
    */
   width: number;
   height: number;
