@@ -1,7 +1,7 @@
 # Latent — agent rules
 
 Read `PROMPT.md` first. It holds why + architecture. The backlog is the GitHub tracker on
-`neoworks-dev/latent` — `gh issue list`, ordered by the `priority:` labels. This file: how to
+`neoworks-dev/latent` — `gh issue list`, ordered by the Priority issue field (see _Issues_). This file: how to
 work here.
 
 ## Voice
@@ -176,45 +176,135 @@ Lint split fixed: oxlint owns TS, ESLint owns svelte markup, never give ESLint
 Config files user-owned — don't edit to pass. No `eslint-disable`/`oxlint-disable`/`NOLINT`
 without stating why. Never weaken/skip tests for green. No tests → one-sentence rationale.
 
-Visual work: launch app (`bun run dev` spawns `latentd` + Electron), drive via
-Playwright-electron or CDP, capture PNG, show it. Engine-only: dump frame to PNG, show it.
-Preview beats description.
-
-## Issues, branches, PRs
-
-Backlog lives in GitHub (`neoworks-dev/latent`), not in a file. `gh issue list`,
-`gh issue view <n>`.
-
-Every GitHub write — issues, comments, PRs, edits, labels — goes through **`gh bot <args>`**
-(gh extension, posts as `neoworks-bot`), never plain `gh`: nothing lands under the owner's
-name. Reads may use either. `gh bot api user` answers 403 (app token); that is not an auth
-failure.
-
-Anything bigger than one simple change runs this loop:
-
-1. **Issue first.** `gh issue create` before writing code — symptom, files, what done looks
-   like, same shape as the existing bodies. Label it: one `type:`, one or more `area:`, one
-   `priority:`, `status:` only if it is blocked or unreproduced.
-2. **Branch off `main`**, named `<issue>-<slug>` (`31-job-queue`). Never work on `main`.
-3. **Draft PR up front.** First commit, `git push -u`, `gh pr create --draft` against
-   `main` — plan in the body, ending `Closes #<issue>`, so the merge closes it. Commit
-   locally while working; push once at the end.
-4. **Ready when verified** — every check in _Verification_ green, and a screenshot for
-   visual work. Push, update the body with what changed + how verified, `gh pr ready`.
-5. Merge only after the checks pass. Never merge unverified into `main`.
-
-One simple change — typo, one-file fix, a comment — skips the issue and goes on a branch as
-asked. Splitting a large ask into several issues is fine and usually right; say which ones.
-
-Labels: `type:` bug / feature / polish / perf / decision / infra / docs. `area:` engine, ui,
-protocol, pipeline, masks, generative, merge, catalog, export, ai-models, color, geometry,
-python-mcp, viewer. `priority:` p0 (blocking real use) → p3. `status:` needs-repro, blocked.
+Visual work: drive your own instance with `node apps/desktop/scripts/screenshot.ts` (it
+spawns `latentd` + Electron over CDP), capture PNG, show it. Engine-only: dump frame to PNG,
+show it. Preview beats description. Never launch or restart my instance of the app; tell me
+to restart it when a merge touches the engine or Electron main.
 
 ## Git
 
-`git status --short` before edits. Dirty files = user-owned; don't stash/reset/commit them.
-Commit only when asked. Imperative subject, body only if diff doesn't explain. No
-`Co-Authored-By` line. Identity: global config (`moritz.utcke@gmx.de`). Never force-push.
+Commit the worktree first if it's dirty, then write your changes. Short, to-the-point commit
+title; a body explaining the change when the title doesn't carry it; ask if you're unsure
+what to write. On a feature branch, only commit what that branch is for. Identity: global
+config (`moritz.utcke@gmx.de`). Never force-push.
+
+No trailers, ever: no `Co-Authored-By` on a commit, no "Generated with Claude Code" on a PR.
+
+## Writing
+
+Commits and issues carry only what matters. Say the thing, explain what a reader won't see for
+themselves, stop. No restating the diff, no summarising what you just said, no section that
+exists because the format seemed to want one.
+
+Write issues and their comments the way you'd explain it to a colleague, in complete
+sentences.
+
+- Start with a 2–3 sentence summary: what happened, why, and the fix.
+- Use short headings, with short paragraphs of normal prose under them.
+- Never join ideas with arrows, slashes, colons or dashes. Write "first X, then Y" instead of
+  "X → Y", and "A and B" instead of "A / B".
+- Use at most two code identifiers per sentence. Say what each one does the first time it
+  appears.
+- Use bullets only for genuinely separate items, and make each bullet a full sentence.
+- Use tables only for numbers or timelines.
+- Use one date format everywhere: 2026-10-07 18:28.
+- Put error messages, paths and commands in code formatting, and long logs in a collapsed
+  `<details>` block.
+- Put side findings in a short "Out of scope" section at the end.
+
+Titles say the thing in plain words, no number prefix (`Embedded preview while the raw
+decodes`, not `57. Previews`).
+
+## How we work
+
+One agent at a time, with me giving feedback as it goes. Keep each step small enough for me
+to read in one sitting, and stop to show me rather than piling up work I then have to catch
+up on.
+
+`main` is what I've reviewed and what I run Latent from. It stays checked out in the repo
+root: never switch branches there.
+
+Straight to `main` in the root, no branch: typos, one-liners, and anything that only touches
+how we work rather than the app — this file, `.claude/skills/`, `scripts/issue-meta.sh`,
+editor config.
+
+Everything else happens on a branch off `main`, in a worktree under `.worktrees/<branch>`
+(`git worktree add .worktrees/<branch> -b <branch> main`). Name it `<issue-number>-<slug>`
+when there is an issue (`31-job-queue`), `<slug>` when there isn't. One branch is one thing;
+anything found along the way gets written down as an issue and stays off the branch, unless
+the branch can't finish without it. A worktree has its own `engine/build/dev`, so its first
+engine build configures from scratch; the `flock` rule under Gotchas still holds, because the
+GPU, the VRAM and the sample raw are shared.
+
+Before starting on anything, check whether it is already half-built: `git branch` and
+`git worktree list` for the feature, and read what is on the branch. Sessions end
+mid-feature, and a branch is where that work is — starting again writes it a second time and
+loses whatever the first attempt learned. If a branch for it exists, continue on it.
+
+No pull requests unless I ask for one. Review happens here, on the diff, before the merge.
+
+## Issues
+
+Issues on `neoworks-dev/latent` carry goals across sessions. A session ends and its context
+goes with it; an issue is the only thing that carries a goal to the next one. So:
+
+- Work that finishes in this session, with me here, needs no issue.
+- Work that won't finish in one session gets one, however loosely defined it still is.
+- Something concrete found along the way, that isn't what we're doing now, gets one instead
+  of being done.
+
+Write them as soon as the list exists, not once the work starts. Splitting a large ask into
+several issues is usually right; say which ones.
+
+Write to GitHub as the bot: issues, comments and labels go through `gh bot`
+(`gh bot issue comment 12 --body …`), so they show as `neoworks-bot[bot]`, not as me. Plain
+`gh` is for reading only. The bot as author already says a model wrote it, so no "written by
+Claude" line in the text. If `gh bot` fails, say so rather than falling back to plain `gh`.
+`gh bot api user` answers 403 (app token); that is not an auth failure.
+
+Every issue carries four things. Type, Priority and Effort are GitHub's own issue type and
+the org's issue fields, not labels; set them right after `gh bot issue create` with
+`scripts/issue-meta.sh <n> --type Feature --priority High --effort Medium`.
+
+- **Type** is `Feature`, `Bug` or `Task` (infra, docs, perf work and decisions).
+- **Priority** is `Urgent` (blocks real use), `High` (a Lightroom switcher hits it in the
+  first day), `Medium` (regular workflow) or `Low` (niche).
+- **Effort** is `Low` (under a day), `Medium` (a few days) or `High` (a week or more, or a
+  new subsystem).
+- **Area** is a label, one or two of `area:engine`, `area:ui`, `area:protocol`,
+  `area:pipeline`, `area:masks`, `area:generative`, `area:merge`, `area:catalog`,
+  `area:export`, `area:ai-models`, `area:color`, `area:geometry`, `area:python-mcp` and
+  `area:viewer`. Three means split it.
+
+`status:blocked` and `status:needs-repro` stay labels, added only when they apply. The old
+`type:` and `priority:` labels are on issues filed before 2026-10-09; don't add them to new
+ones. The backlog is ordered by the Priority field.
+
+## Done means verified
+
+Work is done when it has been shown to work, not when the code is written. Shown means one
+of:
+
+- shown fixed in a driven run of `screenshot.ts`, with a screenshot (and one from before, if
+  you reproduced it), or an engine frame dumped to PNG;
+- a test that fails without the fix and passes with it.
+
+Every check in _Verification_ passes on the branch either way.
+
+Then hand it over and stop: what changed in a sentence or two, the evidence, and the branch.
+When it has an issue, the evidence also goes on the issue as a `gh bot issue comment` — that
+comment is what I read, so it's written for someone who wasn't in the session.
+
+When I tell you what's happening, that's the reproduction: take it as given and go find the
+cause, don't re-check what I already saw. Reach for a driven run when the code doesn't make
+the cause clear, or a fix based on reading it didn't work.
+
+## Merging
+
+I review the branch's diff, and it merges into `main` when I say so — never before, and never
+without evidence. Merge in the root with `git merge --no-ff <branch>`, so the branch stays one
+unit in the history; if it conflicts, resolve it in the merge commit. Push `main`. Then remove
+the worktree and delete the branch, and close its issue with `gh bot issue close <n>`.
 
 ## Gotchas
 
@@ -244,9 +334,10 @@ Commit only when asked. Imperative subject, body only if diff doesn't explain. N
   store resolves from — so `LATENT_MODEL_STORE` is pinned to the real one. Without that pin
   every AI feature answers "model … not installed (run scripts/models/fetch.py)" in a flow
   while the same build finds the models the moment the app is launched by hand.
-- Parallel agents share `engine/build/dev`: every engine build, ctest and real-engine run
-  goes through `flock /tmp/latent-engine.lock`, and each agent works on its own copy of the
-  sample raw (the sidecar next to it is clobbered otherwise).
+- Agents running at once share the GPU, VRAM and the sample raw even from separate
+  worktrees: every engine build, ctest and real-engine run goes through
+  `flock /tmp/latent-engine.lock`, and each agent works on its own copy of the sample raw
+  (the sidecar next to it is clobbered otherwise).
 
 ## Packaging
 
