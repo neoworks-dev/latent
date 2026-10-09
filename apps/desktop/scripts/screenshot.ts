@@ -4,7 +4,7 @@
 //
 //   node apps/desktop/scripts/screenshot.ts [--out /tmp/latent-ui.png] [--engine mock|real]
 //                                           [--photo /path/to/raw]
-//   [--flow slider|panels|curve|mixer|masks|generative|enhance|relight|planes|crop|zoom|merge|catalog|library]
+//   [--flow slider|panels|curve|mixer|masks|generative|enhance|relight|planes|crop|zoom|pan|merge|catalog|library]
 //                                           [--dir <import directory>]
 //                                           [--display vnc|native] [--hold]
 //
@@ -1649,6 +1649,71 @@ if (flow === "catalog") {
   await window.keyboard.press("Control+0");
   await zoomIs("Fit");
   console.log("[shot] Ctrl+0 went back to Fit");
+  await capture(outputPath);
+  console.log(`[shot] wrote ${outputPath}`);
+} else if (flow === "pan") {
+  // What a pan and a zoom out uncover before the engine's next frame lands (#74). A frame
+  // normally lands within a screenshot's own latency, so the flow holds the engine instead:
+  // a sleeping `python.run` on a socket of its own blocks the engine's one thread, and every
+  // capture taken meanwhile shows only what the viewer already had.
+  const stallEngine = async (seconds: number): Promise<void> => {
+    const socket = new WebSocket(engineUrl);
+    await new Promise((resolve) => socket.addEventListener("open", resolve, { once: true }));
+    const code = `import time\ntime.sleep(${seconds})`;
+    socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "python.run", params: { code } }));
+    socket.addEventListener("message", () => socket.close(), { once: true });
+  };
+
+  await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
+  await window.waitForFunction(
+    () => {
+      const canvas = document.querySelector("canvas");
+      return canvas instanceof HTMLCanvasElement && canvas.width > 300;
+    },
+    null,
+    { timeout: 30_000, polling: 200 },
+  );
+  const viewer = window.locator("[data-overlay-canvas]").first();
+  const box =
+    (await viewer.boundingBox()) ?? (await window.locator("canvas").first().boundingBox());
+  if (!box) throw new Error("the viewer has no box");
+  const centre = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  await window.mouse.move(centre.x, centre.y);
+  await window.keyboard.press("z");
+  await window.waitForFunction(
+    () => document.querySelector("[data-zoom-level]")?.textContent?.trim() === "100%",
+    null,
+    { timeout: 15_000, polling: 200 },
+  );
+  await window.waitForTimeout(1500);
+
+  // A middle-button drag a third of the view across while the engine is held.
+  await stallEngine(3);
+  await window.waitForTimeout(200);
+  await window.mouse.down({ button: "middle" });
+  for (let step = 1; step <= 20; step++) {
+    await window.mouse.move(centre.x + step * 20, centre.y + step * 12);
+    await window.waitForTimeout(16);
+  }
+  const panPath = outputPath.replace(/\.png$/, "-mid-pan.png");
+  await capture(panPath);
+  await window.mouse.up({ button: "middle" });
+  console.log(`[shot] wrote ${panPath}`);
+  await window.waitForTimeout(4000);
+
+  // Four wheel notches out while the engine is held.
+  await stallEngine(3);
+  await window.waitForTimeout(200);
+  for (let notch = 0; notch < 4; notch++) {
+    await window.mouse.wheel(0, 120);
+    await window.waitForTimeout(30);
+  }
+  const zoomOutPath = outputPath.replace(/\.png$/, "-mid-zoom-out.png");
+  await capture(zoomOutPath);
+  console.log(
+    `[shot] wrote ${zoomOutPath} at ${await window.locator("[data-zoom-level]").textContent()}`,
+  );
+  await window.waitForTimeout(4000);
   await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
 } else if (flow === "crop") {
