@@ -25,6 +25,7 @@
 #include "pipeline/renderer.h"
 #include "python/engine_api.h"
 #include "python/interpreter.h"
+#include "server/shared_frame.h"
 
 #include <cstdint>
 
@@ -135,6 +136,9 @@ class Server : public EngineApi {
     uint32_t seq = 0;
     bool has_frame = false;
     std::vector<uint8_t> frame;
+    // Where the pixels go instead of the socket, when view.open asked and the platform has
+    // shared memory (protocol view.open `sharedMemory`).
+    std::optional<SharedFrames> shared;
   };
 
   struct OffscreenFrame {

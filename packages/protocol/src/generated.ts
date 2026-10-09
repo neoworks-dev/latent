@@ -953,9 +953,20 @@ export interface ViewOpenParams {
   photoId: PhotoId;
   width: number;
   height: number;
+  /**
+   * Ask for this view's pixels through shared memory instead of the socket. Only for a client on the engine's own machine that can read files: the desktop app's preload. When granted, every LFRM for the view carries `format` 3 and no body, and the pixels are in the file named by `sharedMemory[seq % 2]` in the result (protocol/frames.md).
+   */
+  sharedMemory?: boolean;
 }
 export interface ViewOpenResult {
   viewId: ViewId;
+  /**
+   * The view's two frame slots, absolute paths under /dev/shm, when `sharedMemory` was asked for and the engine could make them. Absent otherwise: the frames come on the socket as usual. The files go away with the view.
+   *
+   * @minItems 2
+   * @maxItems 2
+   */
+  sharedMemory?: [string, string];
 }
 export interface ViewCloseParams {
   viewId: ViewId;

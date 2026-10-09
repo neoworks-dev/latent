@@ -114,7 +114,8 @@ add_library(latent_core STATIC
   python/json_convert.cpp
   python/module.cpp
   raw/raw_decode.cpp
-  server/server.cpp)
+  server/server.cpp
+  server/shared_frame.cpp)
 target_link_libraries(latent_core PUBLIC latent_ops latent_catalog latent_export latent_merge
   latent_generative wgpu_native PkgConfig::LIBRAW unofficial::uwebsockets::uwebsockets
   pybind11::embed)
