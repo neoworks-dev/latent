@@ -97,7 +97,10 @@ function createWindow(): void {
       preload: join(import.meta.dirname, "../preload/index.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true,
+      // The preload reads the engine's frame slots from /dev/shm, which a sandboxed preload
+      // has no `fs` for. The page itself still has no Node: contextIsolation holds, and the
+      // preload opens nothing but the slot paths.
+      sandbox: false,
     },
   });
   window.once("ready-to-show", () => window.show());
