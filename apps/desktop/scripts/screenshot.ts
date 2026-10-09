@@ -828,11 +828,18 @@ if (flow === "catalog") {
   if (!box) throw new Error("exposure slider has no box");
   await window.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await window.mouse.down();
+  // A capture fired half way through the drag and left running while the drag carries on,
+  // so it shows a frame from the middle of it: a draft (view.render `draft`).
+  let midDrag: Promise<void> | null = null;
+  const midDragPath = outputPath.replace(/\.png$/, "-mid-drag.png");
   for (let step = 0; step < 200; step++) {
     const sweep = 0.5 + 0.06 * Math.sin(step / 7);
     await window.mouse.move(box.x + box.width * sweep, box.y + box.height / 2);
     await window.waitForTimeout(10);
+    if (step === 100) midDrag = capture(midDragPath);
   }
+  await midDrag;
+  console.log(`[shot] wrote ${midDragPath}`);
   await window.mouse.up();
   await window.waitForTimeout(500);
   await capture(outputPath);

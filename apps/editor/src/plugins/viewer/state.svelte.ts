@@ -54,6 +54,14 @@ interface PendingAdd {
 const VIEWPORT_RENDER_INTERVAL_MS = 60;
 
 /**
+ * How long after a draft frame (view.render `draft`) the full frame follows, unless another
+ * draft has been asked for since. Drafts go out while a slider or the view is being dragged;
+ * this is what notices the drag has stopped, whatever the control did or did not send at
+ * the end of it.
+ */
+const DRAFT_SETTLE_MS = 120;
+
+/**
  * How long a zoomed view waits after its last frame before it renders the base layer again
  * (painter.ts). The base layer is only what a pan or a zoom out uncovers, so it can lag an
  * edit; rendering it during a drag would put a second frame on the wire behind every tick.
@@ -187,8 +195,14 @@ export class ViewerState implements ViewerService, GeometryView {
 
   private renderWidth = 1;
   private renderHeight = 1;
+  /** The view size the render in flight asked for: what its frame is drawn over. */
+  private sentWidth = 1;
+  private sentHeight = 1;
   private renderInFlight = false;
   private renderQueued = false;
+  /** Whether anything behind the render in flight asked for a full frame, not a draft. */
+  private queuedFull = false;
+  private settleTimer: ReturnType<typeof setTimeout> | null = null;
   private renderSentAt = 0;
   private presentHandle: number | null = null;
   private tracedFrames = 0;
@@ -237,6 +251,8 @@ export class ViewerState implements ViewerService, GeometryView {
     this.adjustingTimer = null;
     if (this.baseTimer !== null) clearTimeout(this.baseTimer);
     this.baseTimer = null;
+    if (this.settleTimer !== null) clearTimeout(this.settleTimer);
+    this.settleTimer = null;
     this.unsubscribeFrame?.();
     this.unsubscribeBaseFrame?.();
     this.unsubscribeStack();
@@ -314,8 +330,7 @@ export class ViewerState implements ViewerService, GeometryView {
     // were on the wire is still the painter's to show. A frame of a different size is a
     // resize rather than a gesture, and `frame` is no longer a reference for either rect.
     const sized =
-      frame.header.width === this.frame.frameWidth &&
-      frame.header.height === this.frame.frameHeight;
+      this.sentWidth === this.frame.frameWidth && this.sentHeight === this.frame.frameHeight;
     this.textureViewport = sized ? this.sentViewport : this.viewport;
     // A fitted frame is the whole photo, which is exactly what the base layer is for, and a
     // zoomed one is the detail over it. The base layer needs the engine's matrices to be
@@ -331,9 +346,11 @@ export class ViewerState implements ViewerService, GeometryView {
       );
     }
     this.placeLayers();
-    const marks = this.frameSink?.draw(frame, layer);
-    // The overlay letterboxes to the frame's aspect, so it follows the frame, not the box.
-    this.overlay.setImageSize(frame.header.width, frame.header.height);
+    const view = { width: this.sentWidth, height: this.sentHeight };
+    const marks = this.frameSink?.draw(frame, layer, view);
+    // The overlay letterboxes to the frame's aspect, so it follows the view the frame was
+    // rendered for — a draft's own pixels are half of it.
+    this.overlay.setImageSize(view.width, view.height);
     const sent = this.renderSentAt;
     if (!marks || sent === 0) return;
     if (this.presentHandle !== null) cancelAnimationFrame(this.presentHandle);
@@ -405,7 +422,10 @@ export class ViewerState implements ViewerService, GeometryView {
     this.unsubscribeBaseFrame?.();
     this.unsubscribeBaseFrame = this.engine.onFrame(baseView.viewId, (frame) => {
       this.placeLayers();
-      this.frameSink?.draw(frame, "base");
+      this.frameSink?.draw(frame, "base", {
+        width: frame.header.width,
+        height: frame.header.height,
+      });
     });
     this.applyStack(await this.engine.call("stack.get", { photoId: photo.photoId }));
     this.status = `${photo.camera} ${photo.width}×${photo.height}`;
@@ -481,7 +501,7 @@ export class ViewerState implements ViewerService, GeometryView {
     this.viewportTimer = setTimeout(
       () => {
         this.viewportTimer = null;
-        this.requestRender();
+        this.requestRender(true);
       },
       Math.max(0, due),
     );
@@ -508,23 +528,36 @@ export class ViewerState implements ViewerService, GeometryView {
     this.requestRender();
   }
 
-  requestRender(): void {
+  /**
+   * `draft` is for a frame in the middle of a drag: half the pixels each way, so a quarter of
+   * the bytes on the wire (view.render `draft`), with the full frame following
+   * `DRAFT_SETTLE_MS` after the last one. Anything asking for a full frame wins over a draft
+   * queued with it.
+   */
+  requestRender(draft = false): void {
     if (this.viewId === null) return;
     // Whatever the gesture had scheduled, this render carries the current viewport anyway.
     if (this.viewportTimer !== null) clearTimeout(this.viewportTimer);
     this.viewportTimer = null;
+    if (this.settleTimer !== null) clearTimeout(this.settleTimer);
+    this.settleTimer = null;
     this.viewportRenderAt = performance.now();
     if (this.renderInFlight) {
       this.renderQueued = true;
+      if (!draft) this.queuedFull = true;
       return;
     }
     this.renderInFlight = true;
     this.renderSentAt = performance.now();
+    this.sentWidth = this.renderWidth;
+    this.sentHeight = this.renderHeight;
     const params: ViewRenderParams = {
       viewId: this.viewId,
       width: this.renderWidth,
       height: this.renderHeight,
     };
+    // Left out of a full frame, so an engine older than the field still answers.
+    if (draft) params.draft = true;
     // Left out unless a tool asked for it, so an engine older than the field still answers.
     if (this.geometry !== "stack") params.geometry = this.geometry;
     // The panels are in CSS pixels and the frame is in device pixels, so the insets are
@@ -612,9 +645,17 @@ export class ViewerState implements ViewerService, GeometryView {
       .finally(() => {
         this.renderInFlight = false;
         if (this.renderQueued) {
+          const full = this.queuedFull;
           this.renderQueued = false;
-          this.requestRender();
+          this.queuedFull = false;
+          this.requestRender(!full);
+          return;
         }
+        if (!draft) return;
+        this.settleTimer = setTimeout(() => {
+          this.settleTimer = null;
+          this.requestRender();
+        }, DRAFT_SETTLE_MS);
       });
   }
 
@@ -746,7 +787,7 @@ export class ViewerState implements ViewerService, GeometryView {
       .call("op.add", { photoId, op, params, parentId: groupId, transient })
       .then((state) => {
         this.applyStack(state);
-        this.requestRender();
+        this.requestRender(transient);
       })
       .catch((error: Error) => {
         this.status = error.message;
@@ -830,7 +871,7 @@ export class ViewerState implements ViewerService, GeometryView {
       .call("op.add", { photoId, op, params, transient })
       .then((state) => {
         this.applyStack(state);
-        this.requestRender();
+        this.requestRender(transient);
       })
       .catch((error: Error) => {
         this.status = error.message;
@@ -869,7 +910,7 @@ export class ViewerState implements ViewerService, GeometryView {
         if (!update || photoId === null) break;
         const { opId, params, transient } = update;
         this.applyStack(await this.engine.call("op.update", { photoId, opId, params, transient }));
-        this.requestRender();
+        this.requestRender(transient);
       }
     } catch (error) {
       this.status = error instanceof Error ? error.message : String(error);
@@ -889,7 +930,7 @@ export class ViewerState implements ViewerService, GeometryView {
         const photoId = this.photoId;
         if (photoId === null) return;
         this.applyStack(await this.engine.call("op.update", { ...update, photoId }));
-        this.requestRender();
+        this.requestRender(update.transient === true);
       })
       .catch((error: Error) => {
         this.status = error.message;
