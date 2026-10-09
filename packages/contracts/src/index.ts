@@ -17,6 +17,7 @@ export { paneModes, panesForMode } from "./panes";
 export type {
   ContentRect,
   FrameDrawMarks,
+  FrameLayer,
   FrameSink,
   FrameTransform,
   ImageTransform,
@@ -31,6 +32,7 @@ export type {
 } from "./viewer";
 export {
   applyImageTransform,
+  baseLayerMap,
   clampViewportScale,
   containRect,
   contentRectFor,
@@ -42,6 +44,7 @@ export {
   invertImageTransform,
   MAX_VIEWPORT_SCALE,
   MIN_VIEWPORT_SCALE,
+  multiplyImageTransforms,
   oneToOneScale,
   panViewport,
   transformImageMatrix,

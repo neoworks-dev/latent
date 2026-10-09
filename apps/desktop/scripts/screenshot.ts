@@ -1716,6 +1716,41 @@ if (flow === "catalog") {
   await window.waitForTimeout(4000);
   await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
+
+  // An edit while zoomed: the base layer renders again once the edit settles, so a pan
+  // after it uncovers the edited picture and not the one from before.
+  await window.mouse.move(centre.x, centre.y);
+  await window.keyboard.press("z");
+  await window.waitForFunction(
+    () => document.querySelector("[data-zoom-level]")?.textContent?.trim() === "100%",
+    null,
+    { timeout: 15_000, polling: 200 },
+  );
+  const slider = window.locator('[data-op="exposure"] [role="slider"]');
+  const sliderBox = await slider.boundingBox();
+  if (!sliderBox) throw new Error("exposure slider has no box");
+  // A drag, not a click: a click on the value opens it for typing.
+  const sliderY = sliderBox.y + sliderBox.height / 2;
+  await window.mouse.move(sliderBox.x + sliderBox.width / 2, sliderY);
+  await window.mouse.down();
+  for (let step = 1; step <= 10; step++) {
+    await window.mouse.move(sliderBox.x + sliderBox.width * (0.5 + step * 0.03), sliderY);
+    await window.waitForTimeout(16);
+  }
+  await window.mouse.up();
+  await window.waitForTimeout(2000);
+  await stallEngine(3);
+  await window.waitForTimeout(200);
+  await window.mouse.move(centre.x, centre.y);
+  await window.mouse.down({ button: "middle" });
+  for (let step = 1; step <= 20; step++) {
+    await window.mouse.move(centre.x + step * 20, centre.y + step * 12);
+    await window.waitForTimeout(16);
+  }
+  const editedPath = outputPath.replace(/\.png$/, "-edited-pan.png");
+  await capture(editedPath);
+  await window.mouse.up({ button: "middle" });
+  console.log(`[shot] wrote ${editedPath}`);
 } else if (flow === "crop") {
   const poll = { timeout: 15_000, polling: 200 };
   await window.waitForSelector('[data-op="exposure"]', { timeout: 30_000 });
