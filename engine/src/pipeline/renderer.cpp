@@ -191,8 +191,10 @@ static_assert(sizeof(FitUniform) == 112, "must match Fit in downscale.wgsl");
 struct FrameUniform {
   float content_min[2] = {0, 0};
   float content_max[2] = {0, 0};
+  float step[2] = {1, 1};
+  float size[2] = {1, 1};
 };
-static_assert(sizeof(FrameUniform) == 16, "must match Frame in display.wgsl");
+static_assert(sizeof(FrameUniform) == 32, "must match Frame in display.wgsl");
 
 struct ExportUniform {
   float m0[4] = {1, 0, 0, 0};
@@ -862,8 +864,14 @@ struct Renderer::View {
   uint32_t depth_height = 0;
   TextureHandle output;
   TextureViewHandle output_view;
+  // A draft frame's target, half the view each way (draft_extent): made the first time a
+  // draft is asked for and dropped with the rest on a resize.
+  TextureHandle draft_output;
+  TextureViewHandle draft_output_view;
   BufferHandle fit_uniform;
   BufferHandle frame_uniform;
+  // The same rect as `frame_uniform` with a 2×2 step, for the draft display pass.
+  BufferHandle draft_frame_uniform;
   BufferHandle op_uniforms;
   BufferHandle curve_uniforms;
   // Two slots per relight op — the shafts march and the shading — at the same 256-byte
@@ -1002,6 +1010,7 @@ void Renderer::open_view(uint32_t view_id, int64_t photo_id, uint32_t width, uin
   view->photo_id = photo_id;
   view->fit_uniform = gpu_.create_uniform_buffer(sizeof(FitUniform), "fit");
   view->frame_uniform = gpu_.create_uniform_buffer(sizeof(FrameUniform), "frame");
+  view->draft_frame_uniform = gpu_.create_uniform_buffer(sizeof(FrameUniform), "draft-frame");
   // The curve binding is part of every op pass's layout, so there is always one slot to
   // point it at, whether or not the stack holds a tone curve.
   view->curve_uniforms = gpu_.create_uniform_buffer(kCurveSlotStride, "curves");
@@ -1069,6 +1078,8 @@ void Renderer::resize_view(uint32_t view_id, uint32_t width, uint32_t height) {
       static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc),
       "view-output");
   view.output_view.reset(wgpuTextureCreateView(view.output.get(), nullptr));
+  view.draft_output = TextureHandle();
+  view.draft_output_view.reset();
   view.base_valid = false;
   build_base(view);
 }
@@ -1131,7 +1142,14 @@ void Renderer::build_base(View& view) {
   frame.content_min[1] = static_cast<float>(geometry.content_y);
   frame.content_max[0] = static_cast<float>(geometry.content_x + geometry.content_width);
   frame.content_max[1] = static_cast<float>(geometry.content_y + geometry.content_height);
+  frame.size[0] = static_cast<float>(geometry.width);
+  frame.size[1] = static_cast<float>(geometry.height);
   gpu_.write_buffer(view.frame_uniform.get(), 0, &frame, sizeof(frame));
+  if (view.draft_frame_uniform) {
+    frame.step[0] = 2;
+    frame.step[1] = 2;
+    gpu_.write_buffer(view.draft_frame_uniform.get(), 0, &frame, sizeof(frame));
+  }
 
   const std::array<WGPUBindGroupEntry, 2> entries = {
       texture_entry(0, photo.linear_view.get()),
@@ -1902,27 +1920,41 @@ MaskReadout Renderer::read_mask(uint32_t view_id, const Stack& stack, std::strin
 }
 
 RenderTiming Renderer::render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
-                              size_t offset, bool bypass_crop) {
+                              size_t offset, bool bypass_crop, bool draft) {
   using clock = std::chrono::steady_clock;
   View& view = view_for(view_id);
   const auto started = clock::now();
 
   WGPUTextureView source = run_passes(view, stack, bypass_crop);
+  // A draft runs every op at the view's size, exactly like a full frame, and only the
+  // display pass writes half as many pixels: the bytes on the wire are the cost, not the
+  // passes (PROMPT.md 8.1).
+  const uint32_t width = draft ? draft_extent(view.geometry.width) : view.geometry.width;
+  const uint32_t height = draft ? draft_extent(view.geometry.height) : view.geometry.height;
+  if (draft && !view.draft_output) {
+    view.draft_output = gpu_.create_texture(
+        width, height, WGPUTextureFormat_RGBA8Unorm,
+        static_cast<WGPUTextureUsage>(WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc),
+        "view-draft-output");
+    view.draft_output_view.reset(wgpuTextureCreateView(view.draft_output.get(), nullptr));
+  }
+  WGPUTexture target = draft ? view.draft_output.get() : view.output.get();
+  WGPUTextureView target_view = draft ? view.draft_output_view.get() : view.output_view.get();
+  WGPUBuffer frame_uniform = draft ? view.draft_frame_uniform.get() : view.frame_uniform.get();
+
   const std::array<WGPUBindGroupEntry, 2> display_entries = {
-      texture_entry(0, source), buffer_entry(1, view.frame_uniform.get(), 0, sizeof(FrameUniform))};
+      texture_entry(0, source), buffer_entry(1, frame_uniform, 0, sizeof(FrameUniform))};
   const BindGroupHandle display = gpu_.create_bind_group(display_pipeline_.get(), display_entries);
   WGPUCommandEncoder encoder = gpu_.begin_commands("view-display");
-  gpu_.encode_fullscreen_pass(encoder, display_pipeline_.get(), display.get(),
-                              view.output_view.get());
+  gpu_.encode_fullscreen_pass(encoder, display_pipeline_.get(), display.get(), target_view);
   gpu_.submit(encoder);
   gpu_.wait_idle();
   gpu_.raise_pending_error();
   const auto rendered = clock::now();
 
-  const size_t bytes = static_cast<size_t>(view.geometry.width) * view.geometry.height * 4;
+  const size_t bytes = static_cast<size_t>(width) * height * 4;
   if (out.size() < offset + bytes) throw std::runtime_error("frame buffer too small");
-  gpu_.read_texture(view.output.get(), view.geometry.width, view.geometry.height, 4,
-                    std::span<uint8_t>(out.data() + offset, bytes));
+  gpu_.read_texture(target, width, height, 4, std::span<uint8_t>(out.data() + offset, bytes));
   const auto read = clock::now();
 
   RenderTiming timing;

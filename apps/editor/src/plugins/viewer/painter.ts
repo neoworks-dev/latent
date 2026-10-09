@@ -16,6 +16,7 @@ import {
   type FrameDrawMarks,
   type FrameLayer,
   type FrameSink,
+  type FrameSize,
   type FrameTransform,
   IDENTITY_FRAME_TRANSFORM,
   type ImageTransform,
@@ -98,11 +99,15 @@ function link(gl: WebGL2RenderingContext): WebGLProgram {
   return program;
 }
 
-/** One layer's texture and the size it was allocated at. */
+/**
+ * One layer's texture: the size it was allocated at, and the size of the view its frame was
+ * rendered for — larger than the texture for a draft, which is stretched over it.
+ */
 interface LayerTexture {
   texture: WebGLTexture;
   width: number;
   height: number;
+  view: FrameSize;
 }
 
 export class FramePainter implements FrameSink {
@@ -128,17 +133,18 @@ export class FramePainter implements FrameSink {
    * Uploads and draws one frame synchronously — no rAF, no reactive hop. Called straight
    * from the socket's message handler, so the pixels are on the GPU in the same task.
    */
-  draw(frame: EngineFrame, layer: FrameLayer): FrameDrawMarks {
+  draw(frame: EngineFrame, layer: FrameLayer, view: FrameSize): FrameDrawMarks {
     const drawStarted = performance.now();
     const gl = this.gl;
     if (!gl || !this.program || gl.isContextLost()) {
       return { drawStarted, uploaded: drawStarted, drawn: drawStarted };
     }
     const { width, height } = frame.header;
-    // The canvas is the detail layer's size; the base layer is mapped onto it whatever its
+    // The canvas is the detail layer's view; the base layer is mapped onto it whatever its
     // own size, so a base frame only sizes the canvas while there is no detail layer.
-    if (layer === "detail" || !this.detail) this.resizeCanvas(gl, width, height);
+    if (layer === "detail" || !this.detail) this.resizeCanvas(gl, view.width, view.height);
     const target = this.ensureLayer(gl, layer, width, height);
+    target.view = view;
     gl.activeTexture(layer === "detail" ? gl.TEXTURE0 : gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, target.texture);
     gl.texSubImage2D(
@@ -217,10 +223,11 @@ export class FramePainter implements FrameSink {
     const showBase = base !== null && baseMap !== null;
     gl.uniform2i(this.layersLocation, this.detail ? 1 : 0, showBase ? 1 : 0);
     if (showBase) {
-      // The map is in pixels; the shader works in uv on both ends, so the canvas size goes
-      // in on the right and the base texture's size comes off on the left.
+      // The map is in view pixels; the shader works in uv on both ends, so the canvas size
+      // goes in on the right and the base frame's view size comes off on the left.
+      const { width: baseWidth, height: baseHeight } = base.view;
       const uv = multiplyImageTransforms(
-        multiplyImageTransforms([1 / base.width, 0, 0, 0, 1 / base.height, 0, 0, 0, 1], baseMap),
+        multiplyImageTransforms([1 / baseWidth, 0, 0, 0, 1 / baseHeight, 0, 0, 0, 1], baseMap),
         [canvasWidth, 0, 0, 0, canvasHeight, 0, 0, 0, 1],
       );
       // GLSL wants a mat3 column by column; the matrix is row-major.
@@ -255,6 +262,8 @@ export class FramePainter implements FrameSink {
   ): LayerTexture {
     const current = layer === "detail" ? this.detail : this.base;
     if (current && current.width === width && current.height === height) return current;
+    // A draft and a full frame of the same view alternate on every drag, so the texture is
+    // reallocated at each switch; immutable storage cannot be resized in place.
     if (current) gl.deleteTexture(current.texture);
     const texture = gl.createTexture();
     if (!texture) throw new Error("webgl2: could not create a texture");
@@ -267,7 +276,7 @@ export class FramePainter implements FrameSink {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    const made = { texture, width, height };
+    const made = { texture, width, height, view: { width, height } };
     if (layer === "detail") {
       this.detail = made;
     } else {

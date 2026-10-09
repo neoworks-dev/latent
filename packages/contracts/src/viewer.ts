@@ -24,6 +24,12 @@ export interface FrameTransform {
 
 export const IDENTITY_FRAME_TRANSFORM: FrameTransform = { scale: 1, x: 0, y: 0 };
 
+/** A width and a height in frame pixels. */
+export interface FrameSize {
+  width: number;
+  height: number;
+}
+
 /**
  * Which of the painter's two layers a frame goes into. `detail` is the frame of the current
  * zoom and pan; `base` is a fitted frame of the whole photo, drawn wherever the detail frame
@@ -39,7 +45,12 @@ export type FrameLayer = "detail" | "base";
  * first — usually back to the identity, because fresh pixels already carry the viewport.
  */
 export interface FrameSink {
-  draw(frame: EngineFrame, layer: FrameLayer): FrameDrawMarks;
+  /**
+   * `view` is the size of the view the frame was rendered for. A draft frame (view.render
+   * `draft`) is half of it each way and is stretched over it; every rect and matrix the
+   * engine sends is in the view's pixels either way.
+   */
+  draw(frame: EngineFrame, layer: FrameLayer, view: FrameSize): FrameDrawMarks;
   /**
    * `transform` moves the detail layer. `baseMap` takes a canvas pixel to a pixel of the
    * base layer's frame (`baseLayerMap`); `null` leaves the base layer out.
