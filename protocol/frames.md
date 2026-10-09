@@ -11,7 +11,7 @@ All multi-byte integers little-endian. Every binary frame starts with a 4-byte A
 | 8 | 4 | height (u32) |
 | 12 | 4 | seq (u32), monotonically increasing per view |
 | 16 | 4 | viewId (u32), which `view.open` this belongs to |
-| 20 | 4 | format (u32): 0 = rgba8 sRGB |
+| 20 | 4 | format (u32): 0 = rgba8 sRGB, 3 = rgba8 sRGB in shared memory |
 | 24 | 8 | reserved |
 | 32 | w·h·4 | pixels, row-major, tightly packed |
 
@@ -24,6 +24,14 @@ a frame has to say goes in the JSON result of the call that produced it, not her
 `width`/`height` are the whole view, letterbox included. The image sits inside it at
 `ViewRenderResult.contentRect` — the frame's pixels outside that rect are background, not
 photo. The rect is in the JSON result and not in the header for exactly the reason above.
+
+A view opened with `sharedMemory: true` and granted it sends every `LFRM` with `format` 3
+and nothing after the 32 bytes: the `w·h·4` pixels, laid out exactly as for format 0, are at
+offset 0 of the file `ViewOpenResult.sharedMemory[seq % 2]`. The engine writes the file
+before it sends the header, and writes that slot again only for `seq + 2`, which takes two
+more `view.render` calls from the client; a client that reads the slot in the message that
+announces it, and asks for the next render after that, always reads a whole frame. The file
+may be longer than the frame (a draft after a full frame), so read exactly `w·h·4` bytes.
 
 A `view.render` with `draft: true` sends a frame of `ceil(w/2)×ceil(h/2)`, each pixel the
 average of the 2×2 view pixels it covers, and its header carries those smaller numbers. The

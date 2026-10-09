@@ -42,6 +42,9 @@ namespace {
 constexpr int kProtocolVersion = 1;
 constexpr std::string_view kEngineVersion = "0.1.0";
 constexpr size_t kFrameHeaderBytes = 32;
+// `format` of an LFRM whose rgba8 pixels are in the view's shared-memory slot `seq % 2`
+// rather than after the header (protocol/frames.md).
+constexpr uint32_t kFrameFormatShared = 3;
 constexpr int kInvalidParams = -32602;
 constexpr int kMethodNotFound = -32601;
 constexpr int kEngineFailure = -32000;
@@ -501,7 +504,9 @@ Server::Server(Renderer& renderer, ServerOptions options)
       options_(std::move(options)),
       catalog_(options_.catalog_path.empty() ? Catalog::default_path() : options_.catalog_path),
       mask_detector_(make_mask_detector()),
-      depth_estimator_(make_depth_estimator()) {}
+      depth_estimator_(make_depth_estimator()) {
+  sweep_stale_shared_frames();
+}
 
 Server::~Server() {
   // The worker and the interpreter must stop reaching into the engine before it dies, and
@@ -1203,9 +1208,16 @@ nlohmann::json Server::handle_view_open(const nlohmann::json& params) {
   view.photo_id = photo.id;
   renderer_.open_view(view.id, photo.id, require_size(params, "width"),
                       require_size(params, "height"));
+  if (optional_flag(params, "sharedMemory", false)) view.shared = SharedFrames::create(view.id);
+  nlohmann::json result = {{"viewId", view.id}};
+  // Left out when the slots could not be made, which is the client's cue to stay on the
+  // socket.
+  if (view.shared) {
+    result["sharedMemory"] = {view.shared->slots[0].path(), view.shared->slots[1].path()};
+  }
   const uint32_t view_id = view.id;
   views_.emplace(view_id, std::move(view));
-  return {{"viewId", view_id}};
+  return result;
 }
 
 nlohmann::json Server::handle_view_close(const nlohmann::json& params) {
@@ -1252,9 +1264,22 @@ nlohmann::json Server::handle_view_render(const nlohmann::json& params, Peer* pe
   geometry = renderer_.view_geometry(view.id);
   ++view.seq;
   view.has_frame = true;
-  write_frame_header(view.frame, "LFRM", frame_width, frame_height, view.seq, view.id, 0);
-  peer->send(std::string_view(reinterpret_cast<const char*>(view.frame.data()), view.frame.size()),
-             uWS::OpCode::BINARY);
+  if (view.shared) {
+    // The pixels into the slot first, then a header-only frame that names it: by the time
+    // the client hears about the slot, it holds the whole frame.
+    view.shared->slot_for(view.seq).write(
+        std::span<const uint8_t>(view.frame).subspan(kFrameHeaderBytes));
+    write_frame_header(view.frame, "LFRM", frame_width, frame_height, view.seq, view.id,
+                       kFrameFormatShared);
+    peer->send(
+        std::string_view(reinterpret_cast<const char*>(view.frame.data()), kFrameHeaderBytes),
+        uWS::OpCode::BINARY);
+  } else {
+    write_frame_header(view.frame, "LFRM", frame_width, frame_height, view.seq, view.id, 0);
+    peer->send(
+        std::string_view(reinterpret_cast<const char*>(view.frame.data()), view.frame.size()),
+        uWS::OpCode::BINARY);
+  }
   // The revision the pixels came from, so a client that coalesced drags can tell whether
   // the frame it holds is the newest state or one render behind. `contentRect` is where
   // the image sits inside that frame: crop and rotate change its aspect, so the letterbox
