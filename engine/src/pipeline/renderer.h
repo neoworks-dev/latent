@@ -71,6 +71,11 @@ enum class OpKind : uint32_t {
 
 OpKind op_kind(std::string_view name);
 
+// One side of a draft frame: half the view's, rounded up so the last odd pixel has a home.
+constexpr uint32_t draft_extent(uint32_t full) {
+  return (full + 1) / 2;
+}
+
 struct RenderTiming {
   double render_ms = 0;
   double readback_ms = 0;
@@ -141,8 +146,11 @@ class Renderer {
   // as usual — which is what the crop tool draws its overlay on; rotate, flip and
   // Transform still apply because they move the whole image (protocol view.render
   // `geometry: "full"`).
+  // `draft` writes a frame of draft_extent() each way, every pixel the average of the 2×2
+  // block of view pixels it covers (protocol view.render `draft`); everything about the
+  // view's geometry stays in full-size view pixels.
   RenderTiming render(uint32_t view_id, const Stack& stack, std::vector<uint8_t>& out,
-                      size_t offset, bool bypass_crop = false);
+                      size_t offset, bool bypass_crop = false, bool draft = false);
 
   // An AI component's raster: mask.detect's output, or the PNG cache reloaded when the
   // photo was opened. Held per photo and resampled into whatever size a view needs, so it

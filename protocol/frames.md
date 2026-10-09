@@ -25,6 +25,11 @@ a frame has to say goes in the JSON result of the call that produced it, not her
 `ViewRenderResult.contentRect` — the frame's pixels outside that rect are background, not
 photo. The rect is in the JSON result and not in the header for exactly the reason above.
 
+A `view.render` with `draft: true` sends a frame of `ceil(w/2)×ceil(h/2)`, each pixel the
+average of the 2×2 view pixels it covers, and its header carries those smaller numbers. The
+JSON result still describes the full view, so a client stretches a draft over the view and
+reads every rect and matrix exactly as for a full frame.
+
 ## `LMSK` — mask raster (engine → UI)
 
 Same header as `LFRM`; `viewId` holds the `viewId` the preview was sized for (0 when

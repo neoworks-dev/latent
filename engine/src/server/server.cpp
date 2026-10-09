@@ -397,6 +397,26 @@ void write_frame_header(std::vector<uint8_t>& frame, const char* magic, uint32_t
   std::memset(frame.data() + 24, 0, 8);
 }
 
+// The histogram of a view's last frame. The frame's own header says how big it is — a draft
+// is half the view each way (view.render `draft`) — and the photo's rect is scaled to it.
+Histogram view_frame_histogram(const std::vector<uint8_t>& frame, const ViewGeometry& geometry) {
+  if (frame.size() < kFrameHeaderBytes || geometry.width == 0 || geometry.height == 0) return {};
+  uint32_t width = 0;
+  uint32_t height = 0;
+  std::memcpy(&width, frame.data() + 4, sizeof(width));
+  std::memcpy(&height, frame.data() + 8, sizeof(height));
+  const auto scale_x = [&](int64_t value) {
+    return static_cast<int32_t>(value * width / geometry.width);
+  };
+  const auto scale_y = [&](int64_t value) {
+    return static_cast<int32_t>(value * height / geometry.height);
+  };
+  return compute_histogram(std::span<const uint8_t>(frame).subspan(kFrameHeaderBytes), width,
+                           height, scale_x(geometry.content_x), scale_y(geometry.content_y),
+                           static_cast<uint32_t>(scale_x(geometry.content_width)),
+                           static_cast<uint32_t>(scale_y(geometry.content_height)));
+}
+
 // `ui`, `history` and `load` describe one socket's own action; every other socket is told
 // `external`. A script or an agent is nobody's action, so its source reaches everyone.
 std::string_view source_for_peer(std::string_view source, bool is_origin) {
@@ -1217,17 +1237,22 @@ nlohmann::json Server::handle_view_render(const nlohmann::json& params, Peer* pe
 
   const std::optional<Viewport> viewport = viewport_param(params);
   if (viewport) renderer_.set_viewport(view.id, *viewport);
+  // Half the pixels each way while the client is dragging (protocol view.render `draft`).
+  // Not sticky: a draft is one frame, and the next render without it is a full one.
+  const bool draft = optional_flag(params, "draft", false);
 
   ViewGeometry geometry = renderer_.view_geometry(view.id);
-  view.frame.resize(kFrameHeaderBytes + static_cast<size_t>(geometry.width) * geometry.height * 4);
+  const uint32_t frame_width = draft ? draft_extent(geometry.width) : geometry.width;
+  const uint32_t frame_height = draft ? draft_extent(geometry.height) : geometry.height;
+  view.frame.resize(kFrameHeaderBytes + static_cast<size_t>(frame_width) * frame_height * 4);
   const RenderTiming timing = renderer_.render(view.id, found->second.history.current(), view.frame,
-                                               kFrameHeaderBytes, bypass_crop);
+                                               kFrameHeaderBytes, bypass_crop, draft);
   // The render is what resolves the geometry — a crop edit or the bypass changes the image
   // rect inside the frame — so the rect goes out after it, never the one from before.
   geometry = renderer_.view_geometry(view.id);
   ++view.seq;
   view.has_frame = true;
-  write_frame_header(view.frame, "LFRM", geometry.width, geometry.height, view.seq, view.id, 0);
+  write_frame_header(view.frame, "LFRM", frame_width, frame_height, view.seq, view.id, 0);
   peer->send(std::string_view(reinterpret_cast<const char*>(view.frame.data()), view.frame.size()),
              uWS::OpCode::BINARY);
   // The revision the pixels came from, so a client that coalesced drags can tell whether
@@ -1238,10 +1263,7 @@ nlohmann::json Server::handle_view_render(const nlohmann::json& params, Peer* pe
   // Counted from the frame that just went out, so the readout belongs to these pixels.
   // StackGetResult's histogram is the same numbers from whatever the view drew last, which
   // is one render behind an edit; the panel reads this one.
-  const Histogram histogram =
-      compute_histogram(std::span<const uint8_t>(view.frame).subspan(kFrameHeaderBytes),
-                        geometry.width, geometry.height, geometry.content_x, geometry.content_y,
-                        geometry.content_width, geometry.content_height);
+  const Histogram histogram = view_frame_histogram(view.frame, geometry);
   return {{"seq", view.seq},
           {"width", geometry.width},
           {"height", geometry.height},
@@ -2329,11 +2351,7 @@ nlohmann::json Server::stack_state(const PhotoState& photo) {
   annotate_generative_stale(state["stack"], photo.history.current());
   for (const auto& [view_id, view] : views_) {
     if (view.photo_id != photo.id || !view.has_frame) continue;
-    const ViewGeometry geometry = renderer_.view_geometry(view_id);
-    const Histogram histogram =
-        compute_histogram(std::span<const uint8_t>(view.frame).subspan(kFrameHeaderBytes),
-                          geometry.width, geometry.height, geometry.content_x, geometry.content_y,
-                          geometry.content_width, geometry.content_height);
+    const Histogram histogram = view_frame_histogram(view.frame, renderer_.view_geometry(view_id));
     state["histogram"] = histogram_to_json(histogram);
     break;
   }
