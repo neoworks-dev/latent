@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   applyImageTransform,
+  baseLayerMap,
   containRect,
   contentRectFor,
   FIT_VIEWPORT,
@@ -11,6 +12,7 @@ import {
   type ImageTransform,
   imagePoint,
   invertImageTransform,
+  multiplyImageTransforms,
   oneToOneScale,
   panViewport,
   transformImageMatrix,
@@ -289,5 +291,40 @@ describe("the panels the client floats over the frame", () => {
     const zoomed = zoomViewport(frame(FITTED, 1, [0.5, 0.5], PANEL), 2, 300, 300);
     expect(zoomed.centerX).toBeCloseTo(1 / 3, 3);
     expect(zoomed.fit).toBe(false);
+  });
+});
+
+describe("the base layer under a zoomed frame", () => {
+  test("multiplying runs the right-hand matrix first", () => {
+    const scale: ImageTransform = [2, 0, 0, 0, 2, 0, 0, 0, 1];
+    const shift: ImageTransform = [1, 0, 10, 0, 1, 20, 0, 0, 1];
+    const point = applyImageTransform(multiplyImageTransforms(scale, shift), 1, 1);
+    expect(point).toEqual({ x: 22, y: 42 });
+  });
+
+  test("a canvas pixel of a 4x zoom lands on the base pixel of the same photo point", () => {
+    // Zoomed 4x about the image point (0.25, 0.5): that point sits in the middle of the
+    // 900×600 canvas, and the image spans 3600×2400 pixels.
+    const zoomed: ImageTransform = [3600, 0, 450 - 900, 0, 2400, 300 - 1200, 0, 0, 1];
+    const map = baseLayerMap(FITTED, zoomed);
+    const centre = applyImageTransform(map, 450, 300);
+    expect(centre.x).toBeCloseTo(225);
+    expect(centre.y).toBeCloseTo(300);
+    // The canvas corner the pan uncovered is still photo in the base frame.
+    const corner = applyImageTransform(map, 0, 0);
+    expect(corner.x).toBeCloseTo(112.5);
+    expect(corner.y).toBeCloseTo(225);
+  });
+
+  test("an unmoved fitted frame maps onto itself", () => {
+    const map = baseLayerMap(FITTED, FITTED);
+    expect(applyImageTransform(map, 123, 456).x).toBeCloseTo(123);
+    expect(applyImageTransform(map, 123, 456).y).toBeCloseTo(456);
+  });
+
+  test("a crop in the frame on screen still finds the uncropped base pixel", () => {
+    const map = baseLayerMap(FITTED, CROPPED);
+    // x 900 on the cropped frame is image x 0.5, which the fitted base has at 450.
+    expect(applyImageTransform(map, 900, 0).x).toBeCloseTo(450);
   });
 });

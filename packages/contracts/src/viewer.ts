@@ -25,15 +25,28 @@ export interface FrameTransform {
 export const IDENTITY_FRAME_TRANSFORM: FrameTransform = { scale: 1, x: 0, y: 0 };
 
 /**
- * The canvas' painter. `draw` uploads one engine frame and reports how long each part took;
- * `setTransform` redraws the frame already uploaded under a client-side zoom or pan, which
- * is how a gesture reaches the screen in the event that caused it rather than a round trip
- * later. A frame is drawn under whatever transform was last set, so the caller sets it
+ * Which of the painter's two layers a frame goes into. `detail` is the frame of the current
+ * zoom and pan; `base` is a fitted frame of the whole photo, drawn wherever the detail frame
+ * does not reach, so a pan or a zoom out uncovers a softer picture rather than the letterbox.
+ */
+export type FrameLayer = "detail" | "base";
+
+/**
+ * The canvas' painter. `draw` uploads one engine frame into a layer and reports how long each
+ * part took; `setTransform` redraws what is already uploaded under a client-side zoom or pan,
+ * which is how a gesture reaches the screen in the event that caused it rather than a round
+ * trip later. A frame is drawn under whatever transform was last set, so the caller sets it
  * first — usually back to the identity, because fresh pixels already carry the viewport.
  */
 export interface FrameSink {
-  draw(frame: EngineFrame): FrameDrawMarks;
-  setTransform(transform: FrameTransform): void;
+  draw(frame: EngineFrame, layer: FrameLayer): FrameDrawMarks;
+  /**
+   * `transform` moves the detail layer. `baseMap` takes a canvas pixel to a pixel of the
+   * base layer's frame (`baseLayerMap`); `null` leaves the base layer out.
+   */
+  setTransform(transform: FrameTransform, baseMap: ImageTransform | null): void;
+  /** Forgets the detail layer, so the base layer shows everywhere from the next draw on. */
+  dropDetail(): void;
 }
 
 /**
@@ -143,6 +156,31 @@ export function invertImageTransform(m: ImageTransform): ImageTransform {
     (m[1] * m[6] - m[0] * m[7]) * k,
     (m[0] * m[4] - m[1] * m[3]) * k,
   ];
+}
+
+/** `a` after `b`: the matrix that takes a point through `b` first, then through `a`. */
+export function multiplyImageTransforms(a: ImageTransform, b: ImageTransform): ImageTransform {
+  return [
+    a[0] * b[0] + a[1] * b[3] + a[2] * b[6],
+    a[0] * b[1] + a[1] * b[4] + a[2] * b[7],
+    a[0] * b[2] + a[1] * b[5] + a[2] * b[8],
+    a[3] * b[0] + a[4] * b[3] + a[5] * b[6],
+    a[3] * b[1] + a[4] * b[4] + a[5] * b[7],
+    a[3] * b[2] + a[4] * b[5] + a[5] * b[8],
+    a[6] * b[0] + a[7] * b[3] + a[8] * b[6],
+    a[6] * b[1] + a[7] * b[4] + a[8] * b[7],
+    a[6] * b[2] + a[7] * b[5] + a[8] * b[8],
+  ];
+}
+
+/**
+ * A canvas pixel → the pixel of the base layer's frame showing the same point of the photo.
+ * Both matrices go image → frame pixel, so the map runs back to the image through the one
+ * on screen and forward through the base frame's. The two frames differ only in their
+ * viewport, which is why lens distortion — absent from both matrices — cancels out.
+ */
+export function baseLayerMap(base: ImageTransform, shown: ImageTransform): ImageTransform {
+  return multiplyImageTransforms(base, invertImageTransform(shown));
 }
 
 /**
