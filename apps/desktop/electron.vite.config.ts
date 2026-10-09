@@ -10,7 +10,7 @@ export default defineConfig({
     build: {
       rollupOptions: {
         input: { index: "src/preload/index.ts" },
-        // Sandboxed preload scripts only run CommonJS.
+        // CommonJS keeps the preload loadable if the window is ever sandboxed again.
         output: { format: "cjs", entryFileNames: "index.cjs" },
       },
     },

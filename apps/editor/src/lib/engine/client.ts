@@ -1,7 +1,9 @@
 // WebSocket client for latentd: JSON-RPC 2.0 on text frames, LFRM pixels on binary
-// frames. Reconnects on its own; pending calls reject when the socket drops.
+// frames, or in shared memory when the desktop bridge can read it. Reconnects on its own;
+// pending calls reject when the socket drops.
 import type {
   DepthListener,
+  LatentDesktopBridge,
   EngineClient,
   EngineConnectionState,
   FrameListener,
@@ -9,20 +11,25 @@ import type {
   ThumbnailListener,
 } from "@latent/contracts";
 import {
+  FRAME_FORMAT_SHARED,
   FRAME_HEADER_BYTES,
   FRAME_MAGIC_DEPTH,
   FRAME_MAGIC_MASK,
   FRAME_MAGIC_THUMBNAIL,
+  type FrameHeader,
   frameBody,
   type MethodMap,
   type MethodName,
   type NotificationMap,
   parseFrameHeader,
+  type ViewOpenResult,
 } from "@latent/protocol";
 
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  /** A `view.open` that asked for shared memory: its result names the view's slots. */
+  opensSharedView: boolean;
 }
 
 interface RpcMessage {
@@ -46,8 +53,13 @@ export class WebSocketEngineClient implements EngineClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
   private readonly openWaiters = new Set<() => void>();
+  /** Each shared-memory view's two slot paths, indexed by `seq % 2`. */
+  private readonly sharedSlots = new Map<number, [string, string]>();
 
-  constructor(private readonly url: string) {
+  constructor(
+    private readonly url: string,
+    private readonly readSharedFrame?: LatentDesktopBridge["readSharedFrame"],
+  ) {
     this.connect();
   }
 
@@ -70,9 +82,13 @@ export class WebSocketEngineClient implements EngineClient {
       return Promise.reject(new Error(`engine not connected (${method})`));
     }
     const id = this.nextId++;
+    // Every view this client opens takes its pixels through shared memory when it can read
+    // them: the frame path is the transport's business, not the viewer's.
+    const opensSharedView = method === "view.open" && this.readSharedFrame !== undefined;
+    const sent = opensSharedView ? { ...params, sharedMemory: true } : params;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
-      socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, opensSharedView });
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params: sent }));
     });
   }
 
@@ -135,6 +151,8 @@ export class WebSocketEngineClient implements EngineClient {
     );
     socket.addEventListener("close", () => {
       this.state = "closed";
+      // The views died with the connection, and their slot files with them.
+      this.sharedSlots.clear();
       this.failPending(new Error("engine connection closed"));
       if (this.disposed) return;
       this.reconnectTimer = setTimeout(() => this.connect(), 1000);
@@ -151,8 +169,15 @@ export class WebSocketEngineClient implements EngineClient {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(`${message.error.code}: ${message.error.message}`));
-      else pending.resolve(message.result);
+      if (message.error) {
+        pending.reject(new Error(`${message.error.code}: ${message.error.message}`));
+        return;
+      }
+      if (pending.opensSharedView) {
+        const opened = message.result as ViewOpenResult;
+        if (opened.sharedMemory) this.sharedSlots.set(opened.viewId, opened.sharedMemory);
+      }
+      pending.resolve(message.result);
       return;
     }
     if (message.method) {
@@ -164,7 +189,6 @@ export class WebSocketEngineClient implements EngineClient {
 
   private receiveFrame(buffer: ArrayBuffer, receivedAt: number): void {
     const header = parseFrameHeader(buffer);
-    const parsedAt = performance.now();
     if (header.magic === FRAME_MAGIC_THUMBNAIL) {
       const listeners = this.thumbnailListeners.get(header.target);
       if (!listeners) return;
@@ -183,9 +207,24 @@ export class WebSocketEngineClient implements EngineClient {
     }
     const listeners = this.frameListeners.get(header.target);
     if (!listeners) return;
-    // A view, not a copy: the painter uploads straight out of the socket's buffer.
-    const pixels = new Uint8Array(buffer, FRAME_HEADER_BYTES, header.width * header.height * 4);
+    const pixels =
+      header.format === FRAME_FORMAT_SHARED
+        ? this.sharedPixels(header)
+        : // A view, not a copy: the painter uploads straight out of the socket's buffer.
+          new Uint8Array(buffer, FRAME_HEADER_BYTES, header.width * header.height * 4);
+    // After the slot read, so the frame trace's parse stage carries what shared memory costs.
+    const parsedAt = performance.now();
     for (const listener of listeners) listener({ header, pixels, receivedAt, parsedAt });
+  }
+
+  private sharedPixels(header: FrameHeader): Uint8Array {
+    const slots = this.sharedSlots.get(header.target);
+    if (!slots || !this.readSharedFrame) {
+      throw new Error(`view ${header.target} sent a shared-memory frame this client did not open`);
+    }
+    // The engine rewrites this slot only two renders on, and the next render is asked for
+    // after this frame is handled (protocol/frames.md), so the read is never torn.
+    return this.readSharedFrame(slots[header.seq % 2], header.width * header.height * 4);
   }
 
   private failPending(error: Error): void {

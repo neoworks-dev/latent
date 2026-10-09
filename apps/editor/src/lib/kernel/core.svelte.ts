@@ -42,7 +42,7 @@ export const enginePlugin: Plugin.Object<{ url: string }> = {
   name: "engine",
   apply(ctx: Context, config) {
     ctx.effect(() => {
-      const client = new WebSocketEngineClient(config.url);
+      const client = new WebSocketEngineClient(config.url, window.latentDesktop?.readSharedFrame);
       const dispose = ctx.provide("engine", client);
       return () => {
         dispose();

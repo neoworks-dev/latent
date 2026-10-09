@@ -12,6 +12,8 @@ export const FRAME_MAGIC_DEPTH = "LDPT";
 export const FRAME_FORMAT_RGBA8 = 0;
 export const FRAME_FORMAT_JPEG = 1;
 export const FRAME_FORMAT_R8 = 2;
+/** rgba8 sRGB like 0, but in the view's shared-memory slot `seq % 2` and not after the header. */
+export const FRAME_FORMAT_SHARED = 3;
 
 export interface FrameHeader {
   magic: string;
@@ -20,7 +22,7 @@ export interface FrameHeader {
   seq: number;
   /** viewId for LFRM and LMSK (0 when the mask was not sized for a view), photoId for LTHM. */
   target: number;
-  /** 0 = rgba8 sRGB pixels, 1 = jpeg bytes, 2 = r8 mask coverage. */
+  /** 0 = rgba8 sRGB pixels, 1 = jpeg bytes, 2 = r8 mask coverage, 3 = rgba8 in shared memory. */
   format: number;
 }
 
