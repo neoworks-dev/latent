@@ -110,6 +110,7 @@
         "catalog.changed",
         "job.progress",
         "photo.resolution",
+        "photo.shown",
         "python.output",
         "python.finished",
         "depth.changed"
@@ -124,6 +125,7 @@
         "catalog.changed",
         "job.progress",
         "photo.resolution",
+        "photo.shown",
         "python.output",
         "python.finished",
         "depth.changed"
@@ -1763,6 +1765,15 @@
           "type": "integer",
           "description": "How many ids the engine recorded. The hint is kept whether or not a preview job is running."
         }
+      }
+    },
+    "PhotoShownParams": {
+      "description": "The engine opened a photo because an agent asked it to (the open_photo tool), and every client should show it. The photo is open in the engine when this is sent, so a client opens it as usual (photo.open answers at once for a photo that is open) and brings it into its viewer. Sent again when the photo was already open, because the agent moved to it.",
+      "type": "object",
+      "required": ["photoId", "path"],
+      "properties": {
+        "photoId": { "$ref": "#/definitions/PhotoId" },
+        "path": { "type": "string" }
       }
     },
     "PhotoResolutionParams": {

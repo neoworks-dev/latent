@@ -757,7 +757,12 @@ std::optional<nlohmann::json> Server::handle_photo_open(const nlohmann::json& pa
     throw RpcError(kInvalidParams, "no such file: " + path);
   }
   for (const auto& [id, open] : photos_) {
-    if (open.path == file) return photo_open_result(open);
+    if (open.path != file) continue;
+    // Opening an open photo again makes it the current one: the photo scripts and tools mean
+    // when they name none.
+    last_opened_photo_ = id;
+    catalog_.set_last_photo(id);
+    return photo_open_result(open);
   }
 
   // The decode is ~530 ms for 24 MP: it belongs on the worker, and the upload it feeds has
@@ -2505,12 +2510,14 @@ void Server::send_thumbnail(Peer* peer, int64_t photo_id, const std::vector<uint
 }
 
 void Server::reply_result(const Responder& responder, const nlohmann::json& result) {
+  if (responder.settle) responder.settle(result, "");
   if (responder.id.is_null() || !peer_alive(responder.peer)) return;
   const nlohmann::json reply = {{"jsonrpc", "2.0"}, {"id", responder.id}, {"result", result}};
   responder.peer->send(reply.dump(), uWS::OpCode::TEXT);
 }
 
 void Server::reply_error(const Responder& responder, int code, const std::string& message) {
+  if (responder.settle) responder.settle(nlohmann::json(), message);
   if (responder.id.is_null() || !peer_alive(responder.peer)) return;
   const nlohmann::json reply = {
       {"jsonrpc", "2.0"}, {"id", responder.id}, {"error", {{"code", code}, {"message", message}}}};
@@ -2740,6 +2747,61 @@ std::vector<uint8_t> Server::render_mask_png(int64_t photo_id, const std::string
   }
   renderer_.close_view(view_id);
   return encode_gray_png(image);
+}
+
+nlohmann::json Server::find_photos(const std::string& query_text, int limit, int offset) {
+  CatalogQuery query;
+  query.query = query_text;
+  // The Library's default order, with the same tie-break, so paging is stable.
+  query.sort = "capturedAt";
+  query.descending = true;
+  query.limit = limit;
+  query.offset = offset;
+  const CatalogPage page = catalog_.list(query);
+  nlohmann::json photos = nlohmann::json::array();
+  for (const CatalogPhoto& photo : page.photos) {
+    nlohmann::json entry = {{"photoId", photo.id},
+                            {"filename", photo.filename},
+                            {"path", photo.path},
+                            {"camera", photo.camera},
+                            {"open", photos_.contains(photo.id)}};
+    if (!photo.captured_at.empty()) entry["capturedAt"] = photo.captured_at;
+    photos.push_back(entry);
+  }
+  return {{"photos", photos}, {"total", page.total}};
+}
+
+void Server::show_photo(int64_t photo_id, const std::string& path,
+                        std::function<void(int64_t, const std::string&)> done) {
+  std::string file = path;
+  if (photo_id > 0) {
+    const std::optional<CatalogPhoto> row = catalog_.get(photo_id);
+    if (!row.has_value()) {
+      done(0, "no photo with id " + std::to_string(photo_id) + " in the catalog");
+      return;
+    }
+    file = row->path;
+  }
+  Responder responder;
+  responder.settle = [this, done](const nlohmann::json& result, const std::string& error) {
+    if (!error.empty()) {
+      done(0, error);
+      return;
+    }
+    const int64_t opened = result.at("photoId").get<int64_t>();
+    // The engine owns what is open; the UI only follows to it.
+    broadcast({{"jsonrpc", "2.0"},
+               {"method", "photo.shown"},
+               {"params", {{"photoId", opened}, {"path", photos_.at(opened).path}}}});
+    done(opened, "");
+  };
+  try {
+    const std::optional<nlohmann::json> opened = handle_photo_open({{"path", file}}, responder);
+    // Already open: answered at once. Otherwise the worker answers through the responder.
+    if (opened.has_value()) responder.settle(*opened, "");
+  } catch (const RpcError& error) {
+    done(0, error.what());
+  }
 }
 
 nlohmann::json Server::catalog_list(int limit) {

@@ -53,6 +53,7 @@ export type MethodName =
   | "catalog.changed"
   | "job.progress"
   | "photo.resolution"
+  | "photo.shown"
   | "python.output"
   | "python.finished"
   | "depth.changed";
@@ -65,6 +66,7 @@ export type NotificationName =
   | "catalog.changed"
   | "job.progress"
   | "photo.resolution"
+  | "photo.shown"
   | "python.output"
   | "python.finished"
   | "depth.changed";
@@ -241,6 +243,7 @@ export interface LatentProtocol {
   CatalogImportResult?: CatalogImportResult;
   PreviewPrioritizeParams?: PreviewPrioritizeParams;
   PreviewPrioritizeResult?: PreviewPrioritizeResult;
+  PhotoShownParams?: PhotoShownParams;
   PhotoResolutionParams?: PhotoResolutionParams;
   CatalogListParams?: CatalogListParams;
   CatalogListResult?: CatalogListResult;
@@ -1150,6 +1153,13 @@ export interface PreviewPrioritizeResult {
    * How many ids the engine recorded. The hint is kept whether or not a preview job is running.
    */
   prioritized: number;
+}
+/**
+ * The engine opened a photo because an agent asked it to (the open_photo tool), and every client should show it. The photo is open in the engine when this is sent, so a client opens it as usual (photo.open answers at once for a photo that is open) and brings it into its viewer. Sent again when the photo was already open, because the agent moved to it.
+ */
+export interface PhotoShownParams {
+  photoId: PhotoId;
+  path: string;
 }
 /**
  * A photo the engine opened from its cached preview now has the full-resolution decode behind it. The frame the client holds came off the proxy, so the views of this photo need re-rendering to show the sharp one. Sent only for a photo that was opened from a preview, and only once.

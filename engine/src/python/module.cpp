@@ -8,8 +8,12 @@
 #include "ops/registry.h"
 #include "python/json_convert.h"
 
+#include <chrono>
+
 #include <algorithm>
 #include <exception>
+#include <future>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -991,6 +995,42 @@ PYBIND11_EMBEDDED_MODULE(latent, module) {
         return json_to_python(on_engine([&] { return engine().catalog_list(limit); }));
       },
       py::arg("limit") = 200);
+  module.def(
+      "_find_photos",
+      [](const std::string& query, int limit, int offset) {
+        return json_to_python(
+            on_engine([&] { return engine().find_photos(query, limit, offset); }));
+      },
+      py::arg("query"), py::arg("limit") = 50, py::arg("offset") = 0);
+  // Opens a photo and has every UI show it. The server thread cannot wait for the decode it
+  // would have to run, so this is only for another thread: the MCP server's.
+  module.def(
+      "_show_photo",
+      [](const py::object& photo_id, const py::object& path) {
+        if (engine().on_server_thread()) {
+          throw std::runtime_error("latent: a script cannot open a photo for the UI to show");
+        }
+        using Opened = std::pair<int64_t, std::string>;
+        // Shared, because the callback may outlive this call if the wait below times out.
+        auto outcome = std::make_shared<std::promise<Opened>>();
+        std::future<Opened> answer = outcome->get_future();
+        const int64_t id = photo_id.is_none() ? 0 : photo_id.cast<int64_t>();
+        const std::string file = path.is_none() ? std::string() : path.cast<std::string>();
+        on_engine([&] {
+          engine().show_photo(id, file, [outcome](int64_t opened, const std::string& error) {
+            outcome->set_value({opened, error});
+          });
+          return true;
+        });
+        const py::gil_scoped_release release;
+        if (answer.wait_for(std::chrono::seconds(120)) != std::future_status::ready) {
+          throw std::runtime_error("latent: the photo did not open within 120 s");
+        }
+        const auto [opened, error] = answer.get();
+        if (opened <= 0) throw std::runtime_error(error);
+        return opened;
+      },
+      py::arg("photo_id") = py::none(), py::arg("path") = py::none());
   module.def(
       "_preview_jpeg",
       [](const py::object& photo_id, uint32_t max_size, const py::object& region) {

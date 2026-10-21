@@ -40,6 +40,7 @@ _UNDOABLE = ToolAnnotations(destructive_hint=False)
 # come back as <jobs_finished>.
 INSTRUCTIONS = """Latent is a raw photo editor. Its edits are an ordered op-stack per photo.
 
+- The tools act on the photo open in Latent, which the user is looking at. When the user names a photo, find it with find_photos (a search over file name and camera) and open it with open_photo, so Latent shows it, then work on it. For a batch, do that for each photo in turn: open_photo, edit, check with render_preview, next photo. Pass photo_id to a tool when the photo is not the one you opened last.
 - Read a photo's stack with get_stack. Change it only with run_python, against the `latent` module. Every run_python call carries an `explanation`: one plain sentence the user reads instead of your code, saying what the script does and why. Look at the result with render_preview; pass mask=["<op id>"] to see a layer's mask.
 - Every edit is a step in the photo's undo history. To take back a change you made, call undo once per step.
 - A <selection> with a box is a region in image space: [x0, y0, x1, y1], 0..1 over the uncropped photo, the space masks use. whole_photo="true" means the request is about the entire photo.
@@ -48,7 +49,7 @@ INSTRUCTIONS = """Latent is a raw photo editor. Its edits are an ordered op-stac
 - Adding, replacing or removing content is generative: generative_fill (repaint from a prompt) and generative_remove (erase). Call generative_status first; if ComfyUI is not running, say so instead of trying. For a named thing pass select="the cat". For a selected box, make the op yourself with run_python: `op = latent.photo.stack.add("generative_fill", prompt="...", seed=0, model="")` (or "remove" without a prompt), `cid = op.mask.add("objects", box=[...])`, `latent.photo.masks.detect(op.id, cid)`; once the component is ready, call the tool with op_id.
 - Mask detection, generative fill and remove, and depth estimates run as background jobs. Never poll for them. Once you have started one in Latent's Assistant, end your turn with one short sentence saying what you are waiting for: when every job has finished you get a message <jobs_finished>…</jobs_finished> saying how each went, and carry on from there.
 - Images attached after a selection are references from the user (a look to match, an object to add), not the photo being edited.
-- Keep one request in one layer, and adjust it rather than stacking new ones. Do not export, merge, or touch other photos unless asked.
+- Keep one request in one layer, and adjust it rather than stacking new ones. Do not export, merge, or touch photos the user did not ask about.
 - For tone (exposure, contrast, clipping, "too dark", "blown out"), read get_histogram before and after: its zones map onto the blacks, shadows, exposure, highlights and whites ops.
 - render_preview takes region=[x0, y0, x1, y1] in image space and renders it from the full-resolution photo. Zoom in to judge detail, noise or an edge, and to compare a part of the photo with a reference image.
 - Check the result with render_preview before you answer. Answers in Latent's Assistant are one or two short sentences."""
@@ -182,8 +183,47 @@ def render_preview(
 
 @server.tool(annotations=_READS)
 def list_photos() -> list[dict[str, Any]]:
-    """The catalog's photos, newest import first."""
+    """The catalog's photos, newest import first, at most 200. To find a named photo, use
+    find_photos instead."""
     return latent._list_photos()
+
+
+@server.tool(annotations=_READS)
+def find_photos(query: str = "", limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    """Search the catalog the way the Library's search box does: photos whose file name or
+    camera contains `query`, case-insensitive; an empty `query` lists everything. Newest
+    capture first.
+
+    Returns `{photos, total}`. Each photo has `photoId`, `filename`, `path`, `camera`,
+    `capturedAt` and `open` (whether the engine has it open, which the other tools need).
+    `total` counts every match, so when it is more than `limit` pass `offset` for the next
+    page. Open a match with `open_photo`.
+    """
+    return latent._find_photos(query, max(1, min(limit, 200)), max(0, offset))
+
+
+# Reads, by the harness contract: it changes no photo. It does change what the user is looking
+# at, which is the point, and is not something undo takes back.
+@server.tool(annotations=_READS)
+def open_photo(photo_id: int | None = None, path: str | None = None) -> dict[str, Any]:
+    """Open a photo and show it to the user: Latent switches to it. Pass the `photoId` of a
+    `find_photos` match, or the `path` of a file that is not catalogued yet.
+
+    From then on the photo is the open one, so tools called without a `photo_id` act on it.
+    Opening a photo that is already open just moves the user back to it. Returns the photo's
+    `photoId`, `filename`, `path`, `width` and `height`.
+    """
+    if (photo_id is None) == (path is None):
+        raise ToolError("pass either photo_id or path")
+    opened = latent._show_photo(photo_id, path)
+    photo = next(candidate for candidate in latent.photos() if candidate.id == opened)
+    return {
+        "photoId": photo.id,
+        "filename": photo.filename,
+        "path": photo.path,
+        "width": photo.width,
+        "height": photo.height,
+    }
 
 
 def _generative(op: str, tool: str, photo_id: int | None, arguments: dict[str, Any]) -> Any:

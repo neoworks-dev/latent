@@ -69,6 +69,7 @@ export interface NotificationMap {
   "catalog.changed": G.CatalogChangedParams;
   "job.progress": G.JobProgressParams;
   "photo.resolution": G.PhotoResolutionParams;
+  "photo.shown": G.PhotoShownParams;
   "python.output": G.PythonOutputParams;
   "python.finished": G.PythonFinishedParams;
   "depth.changed": G.DepthChangedParams;
@@ -133,6 +134,7 @@ export const notifications: readonly NotificationName[] = [
   "catalog.changed",
   "job.progress",
   "photo.resolution",
+  "photo.shown",
   "python.output",
   "python.finished",
   "depth.changed",

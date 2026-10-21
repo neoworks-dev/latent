@@ -88,6 +88,8 @@ export class CatalogState {
         this.scheduleReload();
       }),
       engine.on("job.progress", (params) => this.trackJob(params)),
+      // An agent opened a photo in the engine: the viewer follows, so the user sees it.
+      engine.on("photo.shown", (params) => void this.follow(params.photoId)),
     );
   }
 
@@ -240,6 +242,35 @@ export class CatalogState {
     if (!photo) return;
     this.openRow = photo;
     await this.viewer.open(photo.path);
+  }
+
+  /** The photo an agent opened last, until the viewer has it; null when it has caught up. */
+  private followed: number | null = null;
+  private following = false;
+
+  /**
+   * Opens the photo the engine was asked to show. An agent working through a batch opens one
+   * after another faster than the viewer can, and the viewer's own open does not take being
+   * interleaved: so this goes one photo at a time, and skips straight to the latest.
+   */
+  private async follow(photoId: number): Promise<void> {
+    this.followed = photoId;
+    if (this.following) return;
+    this.following = true;
+    try {
+      while (this.followed !== null && this.followed !== this.viewer.photoId) {
+        const wanted: number = this.followed;
+        await this.loadRow(wanted);
+        const row = this.openRow;
+        if (row?.photoId !== wanted) return;
+        this.gridVisible = false;
+        await this.viewer.open(row.path);
+        if (this.followed === wanted) this.followed = null;
+      }
+    } finally {
+      this.following = false;
+      this.followed = null;
+    }
   }
 
   /** Enter in the grid: open what is selected and go back to the edit view. */

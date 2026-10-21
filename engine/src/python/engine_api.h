@@ -61,6 +61,16 @@ class EngineApi {
   virtual std::vector<uint8_t> render_preview_jpeg(int64_t photo_id, uint32_t max_size,
                                                    std::optional<PreviewRegion> region) = 0;
   virtual nlohmann::json catalog_list(int limit) = 0;
+  // The catalog rows whose file name or camera contains `query` (what the Library's search box
+  // matches), newest capture first: `{ photos: [...], total }`, each row with `open`.
+  virtual nlohmann::json find_photos(const std::string& query, int limit, int offset) = 0;
+
+  // Opens a catalog photo (by id, or the file at `path` when `photo_id` is 0) the way photo.open
+  // does, then tells every UI to show it (`photo.shown`). Returns at once: `done` runs later on
+  // the server thread with the photo's id, or 0 and why it failed. The decode is on a worker, so
+  // a caller on another thread waits for `done` outside run_on_server_thread.
+  virtual void show_photo(int64_t photo_id, const std::string& path,
+                          std::function<void(int64_t, const std::string&)> done) = 0;
 
   // `photo.masks.detect(op_id, component_id)`: starts the AI rasterisation of one
   // component and returns its jobId. The component is `pending` when this returns.

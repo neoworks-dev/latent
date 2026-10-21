@@ -355,6 +355,7 @@ Engine → UI, no `id`. Calling one as a method is a `-32601` error.
 | `engine.log` | `level`, `message`, `photoId?` | Engine-side diagnostics worth showing |
 | `catalog.changed` | `photoIds`, `reason` | `import` / `rating` / `flag` / `collection` / `edit` / `remove` |
 | `job.progress` | `jobId`, `kind`, `done`, `total`, `finished`, `parentJobId?`, `state?`, `message?`, `error?` | Long-running work |
+| `photo.shown` | `photoId`, `path` | An agent opened a photo through the `open_photo` MCP tool: it is open in the engine, so a UI opens it as usual and shows it |
 | `python.output` | `runId`, `stream`, `text` | Output a still-running script produced |
 | `python.finished` | `runId`, `durationMs`, `ok` | That run ended — after its last output, before its result |
 

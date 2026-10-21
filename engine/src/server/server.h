@@ -92,6 +92,9 @@ class Server : public EngineApi {
   std::vector<uint8_t> render_zoomed_jpeg(int64_t photo_id, uint32_t max_size,
                                           const PreviewRegion& region);
   nlohmann::json catalog_list(int limit) override;
+  nlohmann::json find_photos(const std::string& query, int limit, int offset) override;
+  void show_photo(int64_t photo_id, const std::string& path,
+                  std::function<void(int64_t, const std::string&)> done) override;
   int64_t detect_mask(int64_t photo_id, const std::string& op_id,
                       const std::string& component_id) override;
   int64_t estimate_depth(int64_t photo_id) override;
@@ -112,6 +115,9 @@ class Server : public EngineApi {
   struct Responder {
     Peer* peer = nullptr;
     nlohmann::json id;
+    // A request the engine makes of itself has no socket to answer on: this hears the result,
+    // or the error message, instead.
+    std::function<void(const nlohmann::json& result, const std::string& error)> settle;
   };
 
   struct PhotoState {

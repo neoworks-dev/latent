@@ -1590,6 +1590,7 @@ assert(
   JSON.stringify(toolNames) ===
     JSON.stringify([
       "export",
+      "find_photos",
       "generative_fill",
       "generative_remove",
       "generative_status",
@@ -1600,6 +1601,7 @@ assert(
       "merge_panorama",
       "merge_preview",
       "merge_star_trail",
+      "open_photo",
       "render_preview",
       "run_python",
       "undo",
@@ -1613,7 +1615,15 @@ const hints = Object.fromEntries(
     JSON.stringify(tool.annotations ?? null),
   ]),
 );
-const reads = ["get_stack", "get_histogram", "render_preview", "list_photos", "generative_status"];
+const reads = [
+  "get_stack",
+  "get_histogram",
+  "render_preview",
+  "list_photos",
+  "find_photos",
+  "open_photo",
+  "generative_status",
+];
 for (const name of [...reads, "merge_preview"]) {
   assert(hints[name] === '{"readOnlyHint":true}', `${name} should be a read, got ${hints[name]}`);
 }
@@ -2147,6 +2157,115 @@ assert(
   "the restored history does not end on the op.remove made before the close",
 );
 assert(restored.histogram === undefined, "no view has rendered this photo yet");
+
+// An agent finds the photo the user names and opens it, and the UI is told to show it
+// (find_photos, open_photo). A batch is that loop over many photos.
+const toolCall = (id: number, name: string, args: unknown) =>
+  mcp({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+const found = await timed("mcp find_photos", () =>
+  toolCall(300, "find_photos", { query: "dsc001" }),
+);
+const sampleHit = found.result.structuredContent.photos.find((row: any) => row.photoId === photoId);
+assert(sampleHit, `find_photos should find the sample by part of its name: ${JSON.stringify(found.result)}`);
+assert(sampleHit.filename === "DSC00120.ARW" && sampleHit.open === true, "the sample is an open DSC00120.ARW");
+assert(sampleHit.path.endsWith("/DSC00120.ARW"), "find_photos must give the file's path");
+assert(found.result.structuredContent.total >= 1, "find_photos must count the matches");
+const shouting = await toolCall(301, "find_photos", { query: "DSC00120" });
+assert(
+  shouting.result.structuredContent.photos.some((row: any) => row.photoId === photoId),
+  "find_photos is case-insensitive, like the Library's search",
+);
+const nothing = await toolCall(302, "find_photos", { query: "no-such-photo-xyz" });
+assert(
+  nothing.result.structuredContent.total === 0 && nothing.result.structuredContent.photos.length === 0,
+  "find_photos should find nothing for a name nobody has",
+);
+const paged = await toolCall(303, "find_photos", { query: "dsc001", limit: 1, offset: 5000 });
+assert(paged.result.structuredContent.photos.length === 0, "offset past the end lists nothing");
+
+const showns = (): any[] => ui.notifications.filter((n) => n.method === "photo.shown");
+const openedBefore = showns().length;
+const refused = await toolCall(304, "open_photo", {});
+assert(refused.result.isError === true, "open_photo needs a photo_id or a path");
+const unknown = await toolCall(305, "open_photo", { photo_id: 999999 });
+assert(unknown.result.isError === true, "open_photo on a photo the catalog does not have must fail");
+assert(showns().length === openedBefore, "a refused open_photo must not move the UI");
+
+// Closed, it is found as not open; open_photo brings it back, sidecar and all, and says so.
+await ui.call("photo.close", { photoId });
+const closedHit = (
+  await toolCall(306, "find_photos", { query: "DSC00120" })
+).result.structuredContent.photos.find((row: any) => row.photoId === photoId);
+assert(closedHit && closedHit.open === false, "a closed photo is found, with open false");
+const reopenedByAgent = await timed("mcp open_photo (by id)", () =>
+  toolCall(307, "open_photo", { photo_id: photoId }),
+);
+assert(
+  reopenedByAgent.result.structuredContent.photoId === photoId &&
+    reopenedByAgent.result.structuredContent.filename === "DSC00120.ARW",
+  `open_photo answered ${JSON.stringify(reopenedByAgent.result)}`,
+);
+await waitFor("photo.shown for the reopened photo", () => showns().length === openedBefore + 1);
+assert(
+  showns().at(-1)!.params.photoId === photoId && showns().at(-1)!.params.path === samplePath,
+  `photo.shown names the wrong photo: ${JSON.stringify(showns().at(-1))}`,
+);
+assert(
+  (await ui.call("stack.get", { photoId })).stack.length === 1,
+  "open_photo must open the photo with its sidecar stack",
+);
+await toolCall(308, "open_photo", { photo_id: photoId });
+await waitFor("photo.shown again for a photo that is already open", () => showns().length === openedBefore + 2);
+
+// A batch: three photos the catalog knows, found by name, then opened one after another, each
+// edited without naming its id (the open photo is the one the tools mean) and checked.
+const batchFolder = `${scratch}/batch`;
+mkdirSync(batchFolder, { recursive: true });
+const batchPaths = [1, 2, 3].map((number) => `${batchFolder}/trip-${number}.ARW`);
+const tripIds: number[] = [];
+for (const batchPath of batchPaths) {
+  copyFileSync(samplePath, batchPath);
+  const catalogued = await ui.call("photo.open", { path: batchPath });
+  tripIds.push(catalogued.photoId);
+  await ui.call("photo.close", { photoId: catalogued.photoId });
+}
+const trip = (await toolCall(309, "find_photos", { query: "TRIP-" })).result.structuredContent;
+assert(trip.total === 3 && trip.photos.every((row: any) => row.open === false), "the batch is found, closed");
+const shownBeforeBatch = showns().length;
+for (const [at, row] of trip.photos.entries()) {
+  const opened = await toolCall(310 + at * 10, "open_photo", { photo_id: row.photoId });
+  assert(opened.result.structuredContent.photoId === row.photoId, "open_photo opened another photo");
+  await toolCall(311 + at * 10, "run_python", {
+    code: `latent.photo.develop.exposure = ${at + 1}`,
+    explanation: "Brighten the open photo",
+  });
+}
+await waitFor("photo.shown for each photo of the batch", () => showns().length === shownBeforeBatch + 3);
+for (const [at, row] of trip.photos.entries()) {
+  const stack = await toolCall(350 + at, "get_stack", { photo_id: row.photoId });
+  const exposure = stack.result.structuredContent.stack.find((op: any) => op.op === "exposure");
+  assert(
+    exposure && exposure.params.value === at + 1,
+    `batch photo ${row.photoId} got ${JSON.stringify(exposure)}, not exposure ${at + 1}`,
+  );
+}
+const stillThere = (await toolCall(360, "find_photos", { query: "trip-" })).result.structuredContent;
+assert(stillThere.photos.every((row: any) => row.open === true), "the batch stays open until closed");
+for (const id of tripIds) await ui.call("photo.close", { photoId: id });
+await ui.call("catalog.remove", { photoIds: tripIds });
+
+// The last photo opened is the one the tools mean when they name none, even if it was already
+// open: the user is looking at it.
+await toolCall(361, "open_photo", { photo_id: photoId });
+const current = await toolCall(362, "run_python", {
+  code: "latent.photo.id",
+  explanation: "Read the current photo",
+});
+assert(
+  current.result.structuredContent.value === String(photoId),
+  `the photo open_photo showed should be the current one, got ${current.result.structuredContent.value}`,
+);
+console.log(`  find_photos and open_photo: found, opened by id, a batch of ${tripIds.length} edited`);
 
 await timed("photo.close", () => ui.call("photo.close", { photoId }));
 
