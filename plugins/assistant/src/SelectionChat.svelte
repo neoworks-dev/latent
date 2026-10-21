@@ -5,7 +5,15 @@
   // so it can take text and images; the box itself is overlay drawing.
   import type { OverlayMap, OverlayPointer } from "@latent/contracts";
   import { kernelContext } from "@latent/contracts";
-  import { Button, LoadingSpinner, Select, type IconComponent } from "@neoworks-dev/ui";
+  import {
+    Button,
+    LoadingSpinner,
+    Select,
+    StatusBadge,
+    type IconComponent,
+  } from "@neoworks-dev/ui";
+  import { untrack } from "svelte";
+  import ArrowLeftIcon from "phosphor-svelte/lib/ArrowLeftIcon";
   import ArrowUpIcon from "phosphor-svelte/lib/ArrowUpIcon";
   import OpenAiLogoIcon from "phosphor-svelte/lib/OpenAiLogoIcon";
   import PaperclipIcon from "phosphor-svelte/lib/PaperclipIcon";
@@ -19,6 +27,7 @@
     chatWidth,
     dockedPosition,
     placedPosition,
+    sessionTitle,
     transcriptHeight,
     type Box,
     type ChangeRow,
@@ -65,6 +74,8 @@
   const transcriptMax = $derived(transcriptHeight(view, ctx.panes.safeArea));
 
   const active = $derived(ctx.panes.mode === ASSISTANT_MODE);
+  /** The session being read, when the chat shows one that is not the open photo's. */
+  const viewed = $derived(assistant.sessions.find((session) => session.id === assistant.viewing));
   const box = $derived(assistant.target === "photo" ? null : assistant.target);
 
   /** The selection's bounds on screen. Re-read on every zoom, pan, resize or crop. */
@@ -117,6 +128,11 @@
     if (dropped) assistant.place(dropped);
   }
 
+  const placeholder = $derived.by(() => {
+    if (assistant.viewing !== null) return "Continue this session";
+    if (assistant.target === "photo") return "What should change in the photo? /clear starts over";
+    return "What should change here? /clear starts over";
+  });
   const harnessOptions = $derived(
     assistant.harnesses.map((harness) => ({
       value: harness.name,
@@ -302,8 +318,10 @@
     return viewer.overlay.setCursor("crosshair");
   });
 
+  // `showPhoto` reads the state it moves, so the effect depends on the photo and nothing else.
   $effect(() => {
-    void assistant.showPhoto(viewer.photoId);
+    const photoId = viewer.photoId;
+    untrack(() => void assistant.showPhoto(photoId));
   });
 
   // A selection opens the chat to type into: every new one puts the cursor there.
@@ -393,6 +411,29 @@
             </button>
           {/if}
         </div>
+        {#if assistant.viewing !== null}
+          <!-- Another session of the daemon, not this photo's: say so, and the way back. -->
+          <div
+            class="flex items-center gap-2 border-b border-line px-3 pb-2"
+            data-assistant-viewing={assistant.viewing}
+          >
+            <span class="min-w-0 flex-1 truncate text-default">
+              {viewed ? sessionTitle(viewed) : "Session"}
+            </span>
+            {#if viewed}
+              <StatusBadge tone={viewed.state === "running" ? "amber" : "neutral"}
+                >{viewed.state}</StatusBadge
+              >
+            {/if}
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={ArrowLeftIcon}
+              onclick={() => (viewer.photoId === null ? assistant.hide() : assistant.backToPhoto())}
+              >{viewer.photoId === null ? "Close" : "Back to this photo's session"}</Button
+            >
+          </div>
+        {/if}
         <!-- Once there is a conversation the box grows upward to hold it, so replies read
              on the box and not on the photo. -->
         {#if assistant.items.length > 0}
@@ -485,9 +526,7 @@
         {/if}
         <textarea
           class="h-24 resize-none bg-transparent px-3 pt-3 text-sm text-default outline-none placeholder:text-faint"
-          placeholder={assistant.target === "photo"
-            ? "What should change in the photo? /clear starts over"
-            : "What should change here? /clear starts over"}
+          {placeholder}
           bind:this={input}
           bind:value={instruction}
           onkeydown={onKeyDown}

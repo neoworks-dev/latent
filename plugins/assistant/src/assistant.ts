@@ -22,6 +22,8 @@ export type PermissionRequest = Extract<SessionEvent, { type: "permission_reques
 /** One harness the session can run on, and the models, efforts and modes it offers. */
 export type HarnessSettings = Awaited<ReturnType<Client["sessionSettings"]>>["harnesses"][number];
 export type ConfigOption = HarnessSettings["options"][number];
+/** One of the daemon's sessions, as it lists them: title, state, last activity. */
+export type SessionInfo = Client["sessions"]["value"][number];
 
 /** `[x0, y0, x1, y1]`, 0..1 over the uncropped photo — the space masks are stored in. */
 export type Box = [number, number, number, number];
@@ -45,6 +47,32 @@ export function boxFromDrag(start: Point, end: Point): Box | null {
   ];
   if (box[2] - box[0] < MINIMUM_BOX || box[3] - box[1] < MINIMUM_BOX) return null;
   return box;
+}
+
+/** The daemon's sessions, the one that did something last first. */
+export function sortSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
+  return [...sessions].sort((left, right) => right.lastActivity - left.lastActivity);
+}
+
+/** What a session goes by in a list: its title, else the last thing said in it. */
+export function sessionTitle(session: SessionInfo): string {
+  if (session.title) return session.title;
+  if (session.preview) return session.preview;
+  return "Untitled session";
+}
+
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+
+/** When a session last did something, as "5 min ago", and the date once it is a week old. */
+export function activityLabel(timestamp: number, now: number): string {
+  const age = Math.max(0, now - timestamp);
+  if (age < MINUTE) return "just now";
+  if (age < HOUR) return `${Math.floor(age / MINUTE)} min ago`;
+  if (age < DAY) return `${Math.floor(age / HOUR)} h ago`;
+  if (age < 7 * DAY) return `${Math.floor(age / DAY)} d ago`;
+  return new Date(timestamp).toISOString().slice(0, 10);
 }
 
 /**
@@ -174,6 +202,8 @@ const TOOL_LABELS: Record<string, string> = {
   merge_star_trail: "Star trail merge",
   merge_preview: "Merge preview",
   undo: "Undid a step",
+  find_photos: "Searched the catalog",
+  open_photo: "Opened a photo",
 };
 
 /**

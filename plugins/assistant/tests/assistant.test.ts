@@ -18,7 +18,11 @@ import {
   placedPosition,
   PLACEMENT_KEY,
   saveConversation,
+  activityLabel,
+  sessionTitle,
+  sortSessions,
   type SessionEvent,
+  type SessionInfo,
   toolInput,
   toolLabel,
   type TranscriptItem,
@@ -49,11 +53,56 @@ describe("selection", () => {
   });
 });
 
+describe("sessions list", () => {
+  const session = (
+    id: string,
+    lastActivity: number,
+    rest: Partial<SessionInfo> = {},
+  ): SessionInfo => ({
+    id,
+    cwd: "/",
+    createdAt: 0,
+    lastActivity,
+    lastSeq: 0,
+    state: "idle",
+    queued: 0,
+    ...rest,
+  });
+
+  test("the session that did something last comes first, and the input is left alone", () => {
+    const listed = [session("old", 1), session("new", 3), session("middle", 2)];
+    expect(sortSessions(listed).map((entry) => entry.id)).toEqual(["new", "middle", "old"]);
+    expect(listed.map((entry) => entry.id)).toEqual(["old", "new", "middle"]);
+  });
+
+  test("a session goes by its title, else what was said last", () => {
+    expect(sessionTitle(session("a", 0, { title: "DSC00120.ARW", preview: "hi" }))).toBe(
+      "DSC00120.ARW",
+    );
+    expect(sessionTitle(session("a", 0, { preview: "Raise the exposure" }))).toBe(
+      "Raise the exposure",
+    );
+    expect(sessionTitle(session("a", 0))).toBe("Untitled session");
+  });
+
+  test("the last activity reads as a distance, and as a date after a week", () => {
+    const now = Date.UTC(2026, 9, 21, 12, 0, 0);
+    expect(activityLabel(now - 20_000, now)).toBe("just now");
+    expect(activityLabel(now - 5 * 60_000, now)).toBe("5 min ago");
+    expect(activityLabel(now - 3 * 3_600_000, now)).toBe("3 h ago");
+    expect(activityLabel(now - 2 * 86_400_000, now)).toBe("2 d ago");
+    expect(activityLabel(now - 30 * 86_400_000, now)).toBe("2026-09-21");
+    expect(activityLabel(now + 5000, now)).toBe("just now");
+  });
+});
+
 describe("tool names", () => {
   test("finds the Latent tool however the agent titles the call", () => {
     expect(latentToolName("mcp__latent__run_python")).toBe("run_python");
     expect(latentToolName("latent.export")).toBe("export");
     expect(latentToolName("latent.undo")).toBe("undo");
+    expect(latentToolName("latent.open_photo")).toBe("open_photo");
+    expect(latentToolName("mcp__latent__find_photos")).toBe("find_photos");
     expect(latentToolName("Bash")).toBeNull();
   });
 });

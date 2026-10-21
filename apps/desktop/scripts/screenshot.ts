@@ -2113,18 +2113,105 @@ if (flow === "catalog") {
   await window.waitForFunction(readoutIs, { op: "contrast", text: "0" }, { timeout: 10_000 });
   console.log("[shot] undo took the revert, then the whole preset, back off");
 } else if (flow === "assistant") {
+  const { connect: connectToDaemon } = await import("@neoworks-dev/neo-sdk");
   await window.waitForSelector('[data-rail-mode="assistant"]', { timeout: 30_000 });
   await window.locator('[data-rail-mode="assistant"]').click();
   await window.waitForSelector('[data-pane="assistant"][data-status="ready"]', { timeout: 60_000 });
   console.log("[shot] Assistant connected to the neo daemon");
+  // The button waits for an open photo: a chat opened before it would be closed again.
+  await window.waitForSelector("[data-pane='assistant'][data-open-photo]", { timeout: 60_000 });
+  const firstPhoto = Number(
+    await window.locator("[data-pane='assistant']").getAttribute("data-open-photo"),
+  );
   await window.getByRole("button", { name: "Ask about the whole photo" }).click();
   await window.waitForSelector("[data-assistant-chat]", { timeout: 10_000 });
-  // The photo's session is started when the chat opens; its harness picker fills from it.
+  // The photo's session is started when the chat opens; the pickers fill from it. A picker
+  // with nothing to offer reads "Select".
+  const settingsText = (): Promise<string> =>
+    window.locator("[data-assistant-settings]").innerText({ timeout: 2000 });
   await window.waitForFunction(
-    () => (document.querySelector("[data-assistant-settings]")?.textContent ?? "").trim() !== "",
+    () =>
+      (document.querySelector("[data-assistant-settings]")?.textContent ?? "")
+        .replace(/Select/g, "")
+        .trim() !== "",
     null,
     { timeout: 30_000 },
   );
+  console.log(`[shot] pickers: ${(await settingsText()).replace(/\n/g, " | ")}`);
+
+  // An agent opens other photos through the engine's MCP server, and the viewer follows. The
+  // pickers keep their choices on a photo that has no session yet.
+  const mcpUrl = (await engineCall<{ mcpUrl: string }>(engineUrl, "engine.hello", {})).result
+    .mcpUrl;
+  const mcpHeaders = {
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+  };
+  const mcpPost = async (body: unknown, session?: string): Promise<Response> =>
+    fetch(mcpUrl, {
+      method: "POST",
+      headers: session ? { ...mcpHeaders, "Mcp-Session-Id": session } : mcpHeaders,
+      body: JSON.stringify(body),
+    });
+  const initialized = await mcpPost({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "shot", version: "0" },
+    },
+  });
+  const mcpSession = initialized.headers.get("mcp-session-id") ?? "";
+  await mcpPost({ jsonrpc: "2.0", method: "notifications/initialized" }, mcpSession);
+  async function mcpTool(
+    name: string,
+    args: unknown,
+  ): Promise<{ structuredContent: { photoId: number } }> {
+    const response = await mcpPost(
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: args } },
+      mcpSession,
+    );
+    const text = await response.text();
+    const data = text.split("\n").find((line) => line.startsWith("data:"));
+    const answer: { result: { structuredContent: { photoId: number } } } = JSON.parse(
+      data ? data.slice(5) : text,
+    );
+    return answer.result;
+  }
+  const secondPath = join(scratchDir, "second.ARW");
+  copyFileSync(photoPath, secondPath);
+  const second = (await mcpTool("open_photo", { path: secondPath })).structuredContent;
+  const openPhoto = async (photoId: number): Promise<void> => {
+    await window.waitForSelector(`[data-pane="assistant"][data-open-photo="${photoId}"]`, {
+      timeout: 30_000,
+    });
+    // The chat closes with the photo it was about.
+    await window.waitForSelector("[data-assistant-chat]", { state: "detached", timeout: 10_000 });
+  };
+  await openPhoto(second.photoId);
+  console.log(`[shot] the agent opened photo ${second.photoId}; the viewer followed`);
+  // Asked about the new photo: the pickers are read as soon as the card is drawn, before its
+  // session can have answered.
+  const pickersAfter = await window.evaluate(async () => {
+    const asks = [...document.querySelectorAll("button")];
+    asks.find((button) => button.textContent?.includes("Ask about the whole photo"))?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return (document.querySelector("[data-assistant-settings]")?.textContent ?? "")
+      .replace(/Select/g, "")
+      .trim();
+  });
+  console.log(`[shot] pickers right after the switch: ${pickersAfter}`);
+  await capture(outputPath.replace(/\.png$/, "-switched.png"));
+  if (pickersAfter === "") throw new Error("the pickers went empty on a new photo");
+  // And back to the first photo, opened by its catalog id.
+  await mcpTool("open_photo", { photo_id: firstPhoto });
+  await openPhoto(firstPhoto);
+  await window.getByRole("button", { name: "Ask about the whole photo" }).click();
+  await window.waitForSelector("[data-assistant-chat]", { timeout: 10_000 });
+  console.log("[shot] the agent opened the first photo again; the viewer followed");
+
   await window.locator("[data-assistant-input]").fill("Raise the exposure by 0.3, nothing else.");
   await window.locator("[data-assistant-input]").press("Enter");
   console.log("[shot] sent; waiting for the daemon to ask before the first edit");
@@ -2157,6 +2244,114 @@ if (flow === "catalog") {
   if (!/exposure/i.test(summary)) throw new Error("the turn's summary names no exposure change");
   await capture(outputPath);
   console.log(`[shot] wrote ${outputPath}`);
+
+  // The daemon's sessions are listed, and the photo's own is marked.
+  const ownRow = window.locator("[data-assistant-sessions] [data-session]", {
+    hasText: "This photo",
+  });
+  await ownRow.first().waitFor({ timeout: 10_000 });
+  const ownSession = await ownRow.first().getAttribute("data-session");
+
+  // A session started elsewhere, as a terminal would: made here over the SDK, answered by
+  // the daemon's agent.
+  const daemon = await connectToDaemon({ client: "shot", waitForDaemon: true });
+  const outside = await daemon.createSession({ title: "Started in a terminal", cwd: homedir() });
+  const outsideDone = new Promise<void>((resolve) => {
+    daemon.subscribe(outside.id, {
+      onEvent: (event) => {
+        if (event.type === "turn_ended") resolve();
+      },
+    });
+  });
+  await daemon.input(outside.id, "Reply with the single word pong, nothing else.");
+  await outsideDone;
+  const outsideRow = window.locator(`[data-assistant-sessions] [data-session="${outside.id}"]`);
+  await outsideRow.waitFor({ timeout: 10_000 });
+  await window.waitForFunction(
+    (id) =>
+      document.querySelector(`[data-session="${id}"]`)?.getAttribute("data-session-state") ===
+      "idle",
+    outside.id,
+    { timeout: 30_000 },
+  );
+  await capture(outputPath.replace(/\.png$/, "-sessions.png"));
+
+  // Shown in the chat: replayed, with the way back to the photo's session.
+  await outsideRow.click();
+  const viewing = window.locator(`[data-assistant-viewing="${outside.id}"]`);
+  await viewing.waitFor({ timeout: 10_000 });
+  await window.waitForFunction(
+    () => /pong/i.test(document.querySelector("[data-assistant-transcript]")?.textContent ?? ""),
+    null,
+    { timeout: 30_000 },
+  );
+  console.log(`[shot] viewing "${(await viewing.innerText()).replace(/\n/g, " | ")}"`);
+  await capture(outputPath.replace(/\.png$/, "-viewing.png"));
+
+  // And continued from here.
+  await window.locator("[data-assistant-input]").fill("Now reply with the single word ping.");
+  await window.locator("[data-assistant-input]").press("Enter");
+  await window.waitForFunction(
+    () => /ping/i.test(document.querySelector("[data-assistant-transcript]")?.textContent ?? ""),
+    null,
+    { timeout: 120_000 },
+  );
+  await window.waitForSelector('[data-assistant-chat][data-running="false"]', {
+    timeout: 120_000,
+  });
+  const typed = await window
+    .locator("[data-assistant-transcript]")
+    .innerText()
+    .then((text) => text.split("Now reply with").length - 1);
+  if (typed !== 1) throw new Error(`the message typed here shows ${typed} times in the session`);
+  console.log("[shot] continued the session from Latent; the daemon has the exchange");
+
+  // The way back: the photo's conversation as it was, with the turn's summary and Undo.
+  await viewing.getByRole("button", { name: /Back to this photo/ }).click();
+  await viewing.waitFor({ state: "detached", timeout: 10_000 });
+  await window.waitForSelector("[data-assistant-summary]", { timeout: 10_000 });
+  const backRow = await window
+    .locator("[data-assistant-sessions] [data-session]", { hasText: "This photo" })
+    .first()
+    .getAttribute("data-session");
+  if (backRow !== ownSession) throw new Error("the photo's own session changed");
+  console.log("[shot] back on the photo's own session");
+  await daemon.close();
+
+  // A batch the way an agent does it: find, open, edit. The turn starts on the first photo and
+  // the agent moves to the second one; the viewer follows, the chat stays with its turn.
+  const found = (await mcpTool("find_photos", { query: "second" })).structuredContent;
+  console.log(`[shot] find_photos("second"): ${JSON.stringify(found)}`);
+  await window
+    .locator("[data-assistant-input]")
+    .fill(
+      `Find the photo whose file name contains "second" with find_photos, open it with open_photo, then lower its exposure by 0.1. Then say what you did in one sentence.`,
+    );
+  await window.locator("[data-assistant-input]").press("Enter");
+  const deadline = Date.now() + 300_000;
+  for (;;) {
+    if (Date.now() > deadline) throw new Error("the batch turn did not finish");
+    const approval = window.locator("[data-assistant-approval]");
+    if (await approval.count()) {
+      await approval.getByRole("button", { name: "Allow for this session" }).click();
+    }
+    const running = await window
+      .locator("[data-assistant-chat]")
+      .getAttribute("data-running", { timeout: 2000 });
+    if (running === "false") break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const transcript = await window.locator("[data-assistant-transcript]").innerText();
+  console.log(`[shot] batch transcript: ${transcript.replace(/\n/g, " | ").slice(0, 600)}`);
+  const followedTo = await window
+    .locator("[data-pane='assistant']")
+    .getAttribute("data-open-photo");
+  if (Number(followedTo) !== second.photoId) {
+    throw new Error(`the viewer is on ${followedTo}, not the photo the agent opened`);
+  }
+  if (!/Opened a photo/.test(transcript)) throw new Error("the agent never called open_photo");
+  await capture(outputPath.replace(/\.png$/, "-batch.png"));
+  console.log(`[shot] the viewer followed the agent to photo ${second.photoId}`);
 } else if (flow === "history") {
   await window.waitForSelector('[data-pane="presets"]', { timeout: 30_000 });
   await window.waitForSelector('[data-pane="history"] [data-history-step]', { timeout: 30_000 });

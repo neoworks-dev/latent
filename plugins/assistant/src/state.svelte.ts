@@ -17,10 +17,12 @@ import {
   loadPlacement,
   PLACEMENT_KEY,
   saveConversation,
+  sortSessions,
   type ConfigOption,
   type HarnessSettings,
   type PermissionRequest,
   type SessionEvent,
+  type SessionInfo,
   type Target,
   type TranscriptItem,
 } from "./assistant";
@@ -42,18 +44,41 @@ export const CLEAR_COMMAND = "/clear";
 /** Latent's name in the daemon; the agent reaches its tools through the engine's MCP server. */
 const APP = "latent";
 
+/** The photo's conversation while the chat shows another session, to be put back as it was. */
+interface ParkedConversation {
+  items: TranscriptItem[];
+  seq: number;
+  costUsd: number | null;
+  pending: PendingApproval | null;
+  running: boolean;
+}
+
 /**
  * The selection chat. The agent runs in the neo suite daemon, one session per photo, and acts on
  * the photo through the engine's MCP server, so its edits reach the stack like any other writer's
  * and this holds no edit state: only which session is the photo's, and the transcript built from
  * its events, kept across closing the chat and across restarts in localStorage.
+ *
+ * The chat can also show any other session of the daemon (`viewSession`), replayed and followed
+ * live, to read and continue one that was started in a terminal. The photo's own conversation
+ * waits in `parked` meanwhile.
  */
 export class AssistantState {
   status = $state<"connecting" | "ready" | "unavailable">("connecting");
   /** Why the assistant is unavailable, or why the last turn failed. */
   error = $state<string | null>(null);
-  /** What the photo's session can run on, with the current choices; empty until it has one. */
+  /**
+   * What the shown session can run on, with the current choices. Kept across photos: the
+   * daemon's choices are the defaults of every new session, so the pickers of a photo that has
+   * no session yet read the same, until its session is there to ask.
+   */
   harnesses = $state<HarnessSettings[]>([]);
+  /** The daemon's sessions, the one that did something last first. */
+  sessions = $state<SessionInfo[]>([]);
+  /** The open photo's own session, once it has one. */
+  photoSession = $state<string | null>(null);
+  /** The session the chat shows when it is not the photo's own; null for the photo's. */
+  viewing = $state<string | null>(null);
   /** The selected region in image space, or the whole photo; the chat is open while there is one. */
   target = $state<Target | null>(null);
   /** Reference images for the next message. */
@@ -78,12 +103,21 @@ export class AssistantState {
   /** Plain fields: `showPhoto` runs from an effect and must not read state it writes. */
   private conversationPhoto: number | null = null;
   private photoFile: { path: string; filename: string } | null = null;
-  private sessionId: string | null = null;
   /** The session being started: opening the chat and sending right away must not start two. */
   private starting: Promise<string> | null = null;
   /** The last event of the session the transcript has folded in. */
   private seq = 0;
   private unsubscribeSession: Unsubscribe | null = null;
+  private unsubscribeSessions: Unsubscribe | null = null;
+  /** The photo's conversation, while another session is shown. */
+  private parked: ParkedConversation | null = null;
+  /** The photo an agent opened last through the engine, until the chat has seen the viewer move. */
+  private agentOpened: number | null = null;
+  /**
+   * An agent working through photos opened one in the middle of this chat's turn: the chat
+   * stays with the conversation it is in, and its turn runs on, until the user picks a photo.
+   */
+  private pinned = false;
   /** The last undo step a tool's changes were read up to. */
   private historyIndex = 0;
   /** Where the history stood when this chat's turn started; null for a turn from elsewhere. */
@@ -91,7 +125,7 @@ export class AssistantState {
   /** The agent's jobs still running, by jobId, and how the finished ones went. */
   private activeJobs: number[] = [];
   private jobOutcomes: string[] = [];
-  private readonly unsubscribeJobs: () => void;
+  private readonly unsubscribes: (() => void)[];
 
   constructor(
     private readonly engine: EngineClient,
@@ -99,13 +133,24 @@ export class AssistantState {
     private readonly storage: Pick<Storage, "getItem" | "setItem">,
   ) {
     this.placement = loadPlacement(storage);
-    this.unsubscribeJobs = engine.on("job.progress", (params) => this.onJob(params));
+    this.unsubscribes = [
+      engine.on("job.progress", (params) => this.onJob(params)),
+      // Before the viewer follows it, so a photo switch can tell the agent's from the user's.
+      engine.on("photo.shown", (params) => {
+        this.agentOpened = params.photoId;
+      }),
+    ];
   }
 
   /** A drag dropped the chat here; null puts it back next to the selection. */
   place(position: { left: number; top: number } | null): void {
     this.placement = position;
     this.storage.setItem(PLACEMENT_KEY, JSON.stringify(position));
+  }
+
+  /** The session the chat shows: another one being read, else the photo's own. */
+  get shownSession(): string | null {
+    return this.viewing ?? this.photoSession;
   }
 
   /** The harness the session runs on now. */
@@ -155,9 +200,14 @@ export class AssistantState {
       }
       this.client = client;
       this.status = "ready";
+      // The client lists the sessions on connect and keeps them current.
+      this.sessions = sortSessions(client.sessions.value);
+      this.unsubscribeSessions = client.sessions.on((list) => {
+        this.sessions = sortSessions(list);
+      });
       // A photo opened while connecting: its session can be followed now.
       if (this.photoFile) await client.setContext({ photo: this.photoFile.path });
-      if (this.sessionId) this.follow(this.sessionId);
+      if (this.shownSession) this.follow(this.shownSession);
     } catch (error) {
       this.fail(`The neo daemon is unreachable: ${String(error)}`);
     }
@@ -165,7 +215,24 @@ export class AssistantState {
 
   /** The chat follows the open photo: each photo has its own session. */
   async showPhoto(photoId: number | null): Promise<void> {
-    if (photoId === this.conversationPhoto) return;
+    const openedByAgent = photoId !== null && photoId === this.agentOpened;
+    this.agentOpened = null;
+    if (photoId === this.conversationPhoto) {
+      this.pinned = false;
+      return;
+    }
+    // The agent opened this photo during its own turn: it carries on where it is.
+    if (openedByAgent && this.running && this.viewing === null) {
+      this.pinned = true;
+      return;
+    }
+    this.pinned = false;
+    if (this.viewing !== null) {
+      // Reading another session: only the photo's own conversation moves, behind it.
+      this.park(photoId);
+      await this.loadPhotoFile(photoId);
+      return;
+    }
     await this.stop();
     this.leaveSession();
     this.conversationPhoto = photoId;
@@ -173,12 +240,17 @@ export class AssistantState {
     const stored = photoId === null ? null : loadConversation(this.storage, photoId);
     this.items = stored?.items ?? [];
     this.costUsd = stored?.costUsd ?? null;
-    this.sessionId = stored?.sessionId ?? null;
+    this.photoSession = stored?.sessionId ?? null;
     this.seq = stored?.seq ?? 0;
-    this.harnesses = [];
     this.target = null;
     this.references = [];
     this.error = null;
+    await this.loadPhotoFile(photoId);
+    if (this.photoSession && this.viewing === null) this.follow(this.photoSession);
+  }
+
+  /** The photo's file, for its session's title and folder and for what the agent is told is open. */
+  private async loadPhotoFile(photoId: number | null): Promise<void> {
     if (photoId === null) return;
     try {
       const photo = await this.engine.call("catalog.get", { photoId });
@@ -188,18 +260,100 @@ export class AssistantState {
     } catch {
       // A photo the catalog doesn't know gets a session without a title or folder.
     }
-    if (this.sessionId) this.follow(this.sessionId);
+  }
+
+  /** The user moved to another photo while another session is shown: its conversation waits. */
+  private park(photoId: number | null): void {
+    const stored = photoId === null ? null : loadConversation(this.storage, photoId);
+    this.conversationPhoto = photoId;
+    this.photoFile = null;
+    this.photoSession = stored?.sessionId ?? null;
+    this.parked = {
+      items: stored?.items ?? [],
+      seq: stored?.seq ?? 0,
+      costUsd: stored?.costUsd ?? null,
+      pending: null,
+      running: false,
+    };
   }
 
   /** Point the chat at a box or the whole photo. The conversation carries on. */
   select(target: Target): void {
+    const photoId = this.viewer.photoId;
     // The chat is about the open photo: without one there is nothing to send to.
-    if (this.viewer.photoId === null) return;
+    if (photoId === null) return;
+    if (this.pinned) {
+      // The viewer is on a photo the agent opened: the selection is about that one.
+      void this.showPhoto(photoId).then(() => this.open(target));
+      return;
+    }
+    this.open(target);
+  }
+
+  private open(target: Target): void {
+    this.backToPhoto();
     this.target = target;
     // Opening the chat starts the photo's session, so the pickers have something to show.
     this.ensureSession().catch((error: unknown) => {
       this.error = String(error);
     });
+  }
+
+  /** Show another session of the daemon in the chat: its events replayed, then followed live. */
+  viewSession(session: string): void {
+    if (!this.client) return;
+    if (session === this.photoSession && this.viewing === null) {
+      this.target ??= "photo";
+      return;
+    }
+    if (session === this.photoSession) {
+      this.backToPhoto();
+      return;
+    }
+    if (session === this.viewing) return;
+    if (this.viewing === null) this.parkShown();
+    this.unsubscribeSession?.();
+    this.unsubscribeSession = null;
+    this.viewing = session;
+    this.items = [];
+    this.seq = 0;
+    this.costUsd = null;
+    this.pending = null;
+    this.running = false;
+    this.error = null;
+    this.references = [];
+    this.target ??= "photo";
+    this.follow(session);
+  }
+
+  /** The chat shows the open photo's own session again, as it was left. */
+  backToPhoto(): void {
+    if (this.viewing === null) return;
+    const parked = this.parked;
+    this.parked = null;
+    this.unsubscribeSession?.();
+    this.unsubscribeSession = null;
+    this.viewing = null;
+    this.items = parked?.items ?? [];
+    this.seq = parked?.seq ?? 0;
+    this.costUsd = parked?.costUsd ?? null;
+    this.pending = parked?.pending ?? null;
+    this.running = parked?.running ?? false;
+    this.error = null;
+    this.references = [];
+    // Whatever happened while away is replayed from where the transcript stopped.
+    if (this.photoSession) this.follow(this.photoSession);
+    void this.wake();
+  }
+
+  private parkShown(): void {
+    this.parked = {
+      items: this.items,
+      seq: this.seq,
+      costUsd: this.costUsd,
+      pending: this.pending,
+      running: this.running,
+    };
   }
 
   /** Attach images, past the limit ignored; anything that is not an image is skipped. */
@@ -221,6 +375,7 @@ export class AssistantState {
 
   /** Hide the chat. The conversation stays and the next selection picks it up again. */
   hide(): void {
+    this.backToPhoto();
     this.target = null;
     this.references = [];
     this.error = null;
@@ -230,12 +385,11 @@ export class AssistantState {
   async clear(): Promise<void> {
     await this.stop();
     this.leaveSession();
-    this.sessionId = null;
+    this.photoSession = null;
     this.seq = 0;
     this.items = [];
     this.costUsd = null;
     this.error = null;
-    this.harnesses = [];
     if (this.conversationPhoto !== null)
       saveConversation(this.storage, this.conversationPhoto, null);
   }
@@ -258,7 +412,7 @@ export class AssistantState {
   /** Answers the question on screen with one of its options. */
   async decide(option: string): Promise<void> {
     const client = this.client;
-    const session = this.sessionId;
+    const session = this.shownSession;
     const pending = this.pending;
     this.pending = null;
     if (!client || !session || !pending) return;
@@ -270,11 +424,16 @@ export class AssistantState {
   }
 
   async send(instruction: string): Promise<void> {
+    if (this.viewing !== null) {
+      await this.sendToViewed(instruction);
+      return;
+    }
     if (instruction.trim() === CLEAR_COMMAND) {
       await this.clear();
       return;
     }
-    const photoId = this.viewer.photoId;
+    // Pinned, the viewer is on a photo the agent opened and this is still the earlier one's.
+    const photoId = this.pinned ? this.conversationPhoto : this.viewer.photoId;
     const target = this.target;
     if (!this.client || photoId === null || !target || this.running || !instruction.trim()) return;
     // The chat's effect moves the conversation with the photo; a send in between waits.
@@ -297,14 +456,26 @@ export class AssistantState {
   }
 
   /**
+   * Sends to the session being read as it is typed, with no selection to tell it about. Its
+   * message comes back as an event, so it is not drawn twice.
+   */
+  private async sendToViewed(instruction: string): Promise<void> {
+    if (!this.client || this.running || !instruction.trim()) return;
+    const references = this.references;
+    this.references = [];
+    await this.turn(null, instruction.trim(), references);
+  }
+
+  /**
    * A detection or a fill the agent started: tracked until it finishes, so the agent can end
    * its turn instead of polling, and be woken once every one of them is done.
    */
   private onJob(params: JobProgressParams): void {
     if (agentJobLabel(params.kind) === null) return;
     if (!params.finished) {
-      // Only jobs that start during a turn are the agent's; the user's own are not.
-      if (this.running && !this.activeJobs.includes(params.jobId))
+      // Only jobs that start during a turn are the agent's; the user's own are not. And a
+      // turn of a session being read from elsewhere is not this chat's.
+      if (this.running && this.viewing === null && !this.activeJobs.includes(params.jobId))
         this.activeJobs.push(params.jobId);
       return;
     }
@@ -317,17 +488,18 @@ export class AssistantState {
   /** Every job the agent waited on is done: tell it how they went and let it carry on. */
   private async wake(): Promise<void> {
     const photoId = this.conversationPhoto;
-    if (!this.waiting || this.running || this.activeJobs.length > 0) return;
+    if (!this.waiting || this.running || this.activeJobs.length > 0 || this.viewing !== null)
+      return;
     this.waiting = false;
     const outcomes = this.jobOutcomes;
     this.jobOutcomes = [];
-    if (photoId === null || photoId !== this.viewer.photoId) return;
+    if (photoId === null || (!this.pinned && photoId !== this.viewer.photoId)) return;
     this.note(`${outcomes.join(", ")} — continuing.`);
     await this.turn(photoId, jobsFinishedPrompt(outcomes), []);
   }
 
   /** Sends one message; the turn ends with the session's `turn_ended` (see `onEvent`). */
-  private async turn(photoId: number, text: string, references: Reference[]): Promise<void> {
+  private async turn(photoId: number | null, text: string, references: Reference[]): Promise<void> {
     const client = this.client;
     if (!client) return;
     this.error = null;
@@ -335,9 +507,13 @@ export class AssistantState {
     this.waiting = false;
     this.jobOutcomes = [];
     try {
-      const session = await this.ensureSession();
-      this.historyIndex = (await this.engine.call("history.list", { photoId })).index;
-      this.turnStart = this.historyIndex;
+      const session = this.viewing ?? (await this.ensureSession());
+      // What the turn leaves on the photo is read back from its history; a session read from
+      // elsewhere has no photo of this chat's.
+      if (photoId !== null) {
+        this.historyIndex = (await this.engine.call("history.list", { photoId })).index;
+        this.turnStart = this.historyIndex;
+      }
       // The daemon takes images as files: its asset store keeps them.
       const stored = await Promise.all(
         references.map((reference, at) =>
@@ -391,12 +567,14 @@ export class AssistantState {
     this.waiting = false;
     this.activeJobs = [];
     this.jobOutcomes = [];
-    if (this.client && this.sessionId && this.running) await this.client.cancel(this.sessionId);
+    const session = this.shownSession;
+    if (this.client && session && this.running) await this.client.cancel(session);
   }
 
   dispose(): void {
     this.disposed = true;
-    this.unsubscribeJobs();
+    for (const unsubscribe of this.unsubscribes) unsubscribe();
+    this.unsubscribeSessions?.();
     void this.stop().then(() => {
       this.leaveSession();
       return this.client?.close();
@@ -405,7 +583,7 @@ export class AssistantState {
 
   /** The photo's session, started when it has none: named after the photo, in its folder. */
   private ensureSession(): Promise<string> {
-    if (this.sessionId) return Promise.resolve(this.sessionId);
+    if (this.photoSession) return Promise.resolve(this.photoSession);
     this.starting ??= this.startSession().finally(() => {
       this.starting = null;
     });
@@ -421,10 +599,30 @@ export class AssistantState {
       params.title = file.filename;
       params.cwd = file.path.slice(0, file.path.lastIndexOf("/")) || "/";
     }
+    const photoId = this.conversationPhoto;
     const session = await client.createSession(params);
-    this.sessionId = session.id;
+    if (photoId !== this.conversationPhoto) {
+      // The user moved on while it started: it is still that photo's, for when they return.
+      if (photoId !== null) {
+        saveConversation(this.storage, photoId, {
+          sessionId: session.id,
+          seq: 0,
+          items: [],
+          costUsd: null,
+        });
+      }
+      return session.id;
+    }
+    this.photoSession = session.id;
+    // Not followed while another session is on screen: it is read from here when it returns.
+    if (this.viewing !== null) {
+      if (this.parked) this.parked.seq = 0;
+      return session.id;
+    }
     this.seq = 0;
     this.follow(session.id);
+    // Remembered at once, so coming back to the photo finds its session before it has had a turn.
+    if (photoId !== null) this.persist(photoId);
     return session.id;
   }
 
@@ -440,9 +638,14 @@ export class AssistantState {
       },
       onLive: () => void this.loadSettings(),
       onError: () => {
+        if (this.viewing === session) {
+          this.backToPhoto();
+          this.error = "The daemon no longer has that session.";
+          return;
+        }
         // The daemon no longer has it (another data dir): the next message starts a new one.
         this.leaveSession();
-        this.sessionId = null;
+        this.photoSession = null;
         this.seq = 0;
         this.note("The earlier conversation is gone: the next message starts a new one.");
       },
@@ -458,10 +661,13 @@ export class AssistantState {
   }
 
   private onEvent(event: SessionEvent): void {
-    const photoId = this.conversationPhoto;
+    // A session read from elsewhere has no photo of this chat's to summarize or to undo.
+    const viewed = this.viewing !== null;
+    const photoId = viewed ? null : this.conversationPhoto;
     if (event.type === "user_message") {
       // This chat shows its own messages as typed; one from another pane starts a turn here too.
-      if (event.app === APP) return;
+      // A session being read has none typed here, and a replay holds this chat's from before.
+      if (!viewed && event.app === APP) return;
       this.running = true;
       this.items = [...this.items, { kind: "user", text: event.shown ?? event.text }];
       return;
@@ -488,7 +694,7 @@ export class AssistantState {
       return;
     }
     if (event.type === "turn_ended") {
-      if (photoId !== null) void this.endTurn(photoId, event);
+      void this.endTurn(photoId, event);
       return;
     }
     const address = this.address;
@@ -501,13 +707,14 @@ export class AssistantState {
   }
 
   private async endTurn(
-    photoId: number,
+    photoId: number | null,
     event: Extract<SessionEvent, { type: "turn_ended" }>,
   ): Promise<void> {
     this.running = false;
     this.pending = null;
     if (event.stopReason === "cancelled") this.note("Stopped.");
     if (event.error) this.error = event.error;
+    if (photoId === null) return;
     const turnStart = this.turnStart;
     this.turnStart = null;
     if (turnStart !== null) await this.summarize(photoId, turnStart);
@@ -535,7 +742,7 @@ export class AssistantState {
   }
 
   private persist(photoId: number): void {
-    const session = this.sessionId;
+    const session = this.photoSession;
     if (!session || photoId !== this.conversationPhoto) return;
     saveConversation(this.storage, photoId, {
       sessionId: session,
@@ -545,12 +752,12 @@ export class AssistantState {
     });
   }
 
-  /** A `/harness`, `/model` or `/effort` for the photo's session; the daemon logs the change. */
+  /** A `/harness`, `/model` or `/effort` for the shown session; the daemon logs the change. */
   private async command(text: string): Promise<void> {
     const client = this.client;
     if (!client) return;
     try {
-      const session = await this.ensureSession();
+      const session = this.viewing ?? (await this.ensureSession());
       await client.input(session, text, { app: APP });
     } catch (error) {
       this.error = String(error);
@@ -559,12 +766,12 @@ export class AssistantState {
 
   private async loadSettings(): Promise<void> {
     const client = this.client;
-    const session = this.sessionId;
+    const session = this.shownSession;
     if (!client || !session) return;
     try {
       // `known`: never start a guest's adapter just to fill the pickers.
       const settings = await client.sessionSettings(session, true);
-      if (session === this.sessionId) this.harnesses = settings.harnesses;
+      if (session === this.shownSession) this.harnesses = settings.harnesses;
     } catch {
       // No list is fine: the harness's defaults still work.
     }
