@@ -5,6 +5,13 @@ It runs inside latentd's embedded interpreter on a daemon thread, streamable HTT
 (`run_python`) — there is deliberately no `add_op` tool, because the op-stack has one
 write path.
 
+HARNESS CONTRACT (neoworks-dev/harness#34). The neo daemon reads only MCP's standard tool
+annotations to decide whether to ask before a call: `readOnlyHint: true` is a read and never
+asks; `destructiveHint: false` is an edit that lands in Latent's undo history, so the
+`undo` tool (or the user's Ctrl+Z) takes it back; a tool with neither (`export`, the merges)
+cannot be taken back, and the daemon asks before it runs in every mode but auto. Undo stays
+here: there is no revert tool and no result `_meta`.
+
 THREADING: every tool body below calls into the C++ module, which hands the work to the
 engine's server thread and releases the GIL while it waits (see engine/src/python/
 module.cpp). Tool bodies must therefore never touch engine state directly.
@@ -20,7 +27,13 @@ from typing import Any
 
 import latent
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.types import Image
+from mcp.types import ToolAnnotations
+
+_READS = ToolAnnotations(read_only_hint=True)
+# An edit that goes through the op-stack's one write path, so it is a history step.
+_UNDOABLE = ToolAnnotations(destructive_hint=False)
 
 server = MCPServer(
     "latent",
@@ -28,12 +41,13 @@ server = MCPServer(
         "Latent is a raw photo editor whose edits are an ordered op-stack. Read state with "
         "get_stack/list_photos, change it by running Python against the `latent` module with "
         "run_python (e.g. `latent.photo.develop.exposure += 0.5`), and look at the result with "
-        "render_preview."
+        "render_preview. Every edit is a step in the photo's undo history: to take back a change "
+        "you made, call undo once per step you want gone."
     ),
 )
 
 
-@server.tool()
+@server.tool(annotations=_UNDOABLE)
 def run_python(code: str, explanation: str, photo_id: int | None = None) -> dict[str, Any]:
     """Run Python against the live engine. The `latent` module is already imported.
 
@@ -51,7 +65,25 @@ def run_python(code: str, explanation: str, photo_id: int | None = None) -> dict
     return latent._run_code(code, photo_id, tool="run_python")
 
 
-@server.tool()
+@server.tool(annotations=_UNDOABLE)
+def undo(photo_id: int | None = None) -> dict[str, Any]:
+    """Undo the photo's last history step, the same as Ctrl+Z in the editor.
+
+    An edit is one or more steps: call this once per step to take a change back, and look at
+    `get_stack` or `render_preview` in between. `undone` is false when there was nothing left.
+    """
+    photo = None
+    if photo_id is not None:
+        open_photos = latent.photos()
+        photo = next((open_photo for open_photo in open_photos if open_photo.id == photo_id), None)
+        if photo is None:
+            raise ToolError(f"photo {photo_id} is not open")
+    undone = latent.undo(photo)
+    state = latent._stack_state(photo_id)
+    return {"photoId": state["photoId"], "undone": undone, "canUndo": state["canUndo"]}
+
+
+@server.tool(annotations=_READS)
 def get_stack(photo_id: int | None = None) -> dict[str, Any]:
     """The photo's op-stack, revision, undo state, histogram and clipping percentages."""
     return latent._stack_state(photo_id)
@@ -94,7 +126,7 @@ def _channel_summary(bins: list[int]) -> dict[str, Any]:
     }
 
 
-@server.tool()
+@server.tool(annotations=_READS)
 def get_histogram(photo_id: int | None = None) -> dict[str, Any]:
     """The histogram of the photo as the viewer last drew it, display-referred (0 black, 1 white).
 
@@ -114,7 +146,7 @@ def get_histogram(photo_id: int | None = None) -> dict[str, Any]:
     }
 
 
-@server.tool()
+@server.tool(annotations=_READS)
 def render_preview(
     photo_id: int | None = None,
     max_size: int = 1024,
@@ -139,7 +171,7 @@ def render_preview(
     return Image(data=latent._preview_jpeg(photo_id, max_size, region), format="jpeg")
 
 
-@server.tool()
+@server.tool(annotations=_READS)
 def list_photos() -> list[dict[str, Any]]:
     """The catalog's photos, newest import first."""
     return latent._list_photos()
@@ -161,7 +193,7 @@ def _generative(op: str, tool: str, photo_id: int | None, arguments: dict[str, A
     return json.loads(answer["stdout"] or "{}")
 
 
-@server.tool()
+@server.tool(annotations=_UNDOABLE)
 def generative_fill(
     prompt: str,
     select: str | None = None,
@@ -185,7 +217,7 @@ def generative_fill(
     )
 
 
-@server.tool()
+@server.tool(annotations=_UNDOABLE)
 def generative_remove(
     select: str | None = None,
     op_id: str | None = None,
@@ -203,7 +235,7 @@ def generative_remove(
     )
 
 
-@server.tool()
+@server.tool(annotations=_READS)
 def generative_status() -> dict[str, Any]:
     """Which backend is selected, whether the `comfy` CLI is installed and its server is
     running, which graphs are shipped and which of them have their weights. Check this
@@ -325,7 +357,7 @@ def merge_star_trail(
     )
 
 
-@server.tool()
+@server.tool(annotations=_READS)
 def merge_preview(kind: str, photo_ids: list[int], long_edge: int = 1024) -> dict[str, Any]:
     """The same merge from the embedded JPEGs: seconds, a PNG, and no catalog row.
 

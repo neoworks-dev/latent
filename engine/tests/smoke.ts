@@ -1602,9 +1602,27 @@ assert(
       "merge_star_trail",
       "render_preview",
       "run_python",
+      "undo",
     ]),
   "wrong MCP tool set",
 );
+// The neo daemon asks before a call from these hints alone (neoworks-dev/harness#34).
+const hints = Object.fromEntries(
+  toolList.result.tools.map((tool: { name: string; annotations?: unknown }) => [
+    tool.name,
+    JSON.stringify(tool.annotations ?? null),
+  ]),
+);
+const reads = ["get_stack", "get_histogram", "render_preview", "list_photos", "generative_status"];
+for (const name of [...reads, "merge_preview"]) {
+  assert(hints[name] === '{"readOnlyHint":true}', `${name} should be a read, got ${hints[name]}`);
+}
+for (const name of ["run_python", "generative_fill", "generative_remove", "undo"]) {
+  assert(hints[name] === '{"destructiveHint":false}', `${name} should be undoable, got ${hints[name]}`);
+}
+for (const name of ["export", "merge_hdr", "merge_panorama", "merge_star_trail"]) {
+  assert(hints[name] === "null", `${name} should carry no hints, got ${hints[name]}`);
+}
 
 const beforeAgent = mean(ui.frame!.pixels);
 const agentRun = await timed("mcp run_python", () =>
@@ -1805,6 +1823,51 @@ assert(
   JSON.parse(listed.result.content[0].text).photoId === photoId,
   "list_photos should show the open photo",
 );
+
+// The agent takes its own edit back with undo, the same step back Ctrl+Z takes.
+const exposureOf = async (id: number): Promise<string> => {
+  const read = await mcp({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: {
+      name: "run_python",
+      arguments: { code: "latent.photo.develop.exposure", explanation: "Read the exposure", photo_id: photoId },
+    },
+  });
+  return read.result.structuredContent.value;
+};
+const exposureBefore = await exposureOf(7);
+await mcp({
+  jsonrpc: "2.0",
+  id: 8,
+  method: "tools/call",
+  params: {
+    name: "run_python",
+    arguments: { code: "latent.photo.develop.exposure = 1.25", explanation: "Brighten", photo_id: photoId },
+  },
+});
+assert((await exposureOf(9)) === "1.25", "the agent's edit did not land");
+const agentUndone = await timed("mcp undo", () =>
+  mcp({
+    jsonrpc: "2.0",
+    id: 10,
+    method: "tools/call",
+    params: { name: "undo", arguments: { photo_id: photoId } },
+  }),
+);
+assert(agentUndone.result.structuredContent.undone === true, `undo should undo: ${JSON.stringify(agentUndone.result)}`);
+assert(
+  (await exposureOf(11)) === exposureBefore,
+  `undo should put the exposure back to ${exposureBefore}`,
+);
+const notOpen = await mcp({
+  jsonrpc: "2.0",
+  id: 12,
+  method: "tools/call",
+  params: { name: "undo", arguments: { photo_id: 999999 } },
+});
+assert(notOpen.result.isError === true, "undo on a photo that isn't open must fail");
 
 // ---- catalog --------------------------------------------------------------------------
 const importStarted = performance.now();
