@@ -1,13 +1,14 @@
 <script lang="ts">
-  // The Assistant column: what the mode does and whether the harness sidecar is there. The
+  // The Assistant column: what the mode does and whether the neo daemon is there. The
   // conversation itself floats over the photo, next to the region it is about.
   import { kernelContext } from "@latent/contracts";
-  import { Button, LoadingSpinner, StatusBadge } from "@neoworks-dev/ui";
+  import { Button, LoadingSpinner } from "@neoworks-dev/ui";
   import FrameCornersIcon from "phosphor-svelte/lib/FrameCornersIcon";
-  import { HARNESS_LABELS } from "./assistant";
 
   const { paneId: _paneId }: { paneId: string } = $props();
-  const assistant = kernelContext().assistant;
+  const ctx = kernelContext();
+  const assistant = ctx.assistant;
+  const viewer = ctx.viewer;
 </script>
 
 <div
@@ -18,7 +19,7 @@
   {#if assistant.status === "connecting"}
     <span class="flex items-center gap-2 text-muted">
       <LoadingSpinner size={12} label="connecting" />
-      Starting the harness sidecar…
+      Connecting to neo…
     </span>
   {:else if assistant.status === "unavailable"}
     <p class="text-red" data-assistant-error>{assistant.error}</p>
@@ -28,13 +29,11 @@
       of it, then say what to do. Paste or drop images into the chat as references. The agent edits
       through the same stack you do: every change is a layer you can undo.
     </p>
-    <Button size="sm" icon={FrameCornersIcon} onclick={() => assistant.select("photo")}
-      >Ask about the whole photo</Button
+    <Button
+      size="sm"
+      icon={FrameCornersIcon}
+      disabled={viewer.photoId === null}
+      onclick={() => assistant.select("photo")}>Ask about the whole photo</Button
     >
-    <div class="flex flex-wrap gap-1">
-      {#each assistant.harnesses as harness (harness.id)}
-        <StatusBadge tone="green">{HARNESS_LABELS[harness.id]}</StatusBadge>
-      {/each}
-    </div>
   {/if}
 </div>

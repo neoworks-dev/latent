@@ -22,14 +22,14 @@ function readSharedFrame(path: string, byteLength: number): Uint8Array {
   return pixels;
 }
 
-// The renderer talks to the engine and the harness sidecar directly over their WebSockets;
+// The renderer talks to the engine and the suite daemon directly over their WebSockets;
 // the bridge carries what the page cannot do itself: learn the endpoints, open native
 // dialogs, and read frame pixels the engine put in shared memory instead of on the socket.
 contextBridge.exposeInMainWorld("latentDesktop", {
   platform: process.platform,
   engineEndpoint: (): Promise<string | null> => ipcRenderer.invoke("engine:endpoint"),
-  harnessEndpoint: (): Promise<{ url: string; token: string } | null> =>
-    ipcRenderer.invoke("harness:endpoint"),
+  daemonAddress: (): Promise<{ url: string; token: string } | null> =>
+    ipcRenderer.invoke("daemon:address"),
   pickFiles: (): Promise<string[]> => ipcRenderer.invoke("dialog:pickFiles"),
   pickDirectory: (): Promise<string | null> => ipcRenderer.invoke("dialog:pickDirectory"),
   readSharedFrame,

@@ -1,6 +1,6 @@
 /**
  * The Electron preload bridge, as the renderer sees it. It carries only what the page cannot
- * do itself — the engine and harness endpoints, the native dialogs and the shared-memory
+ * do itself — where the engine and the suite daemon are, the native dialogs and the shared-memory
  * frame slots; everything else goes over those sockets. Declared here so plugins see the same shape the
  * app does.
  */
@@ -8,10 +8,10 @@ export interface LatentDesktopBridge {
   platform: string;
   engineEndpoint(): Promise<string | null>;
   /**
-   * The agent harness sidecar (`neoworks-harness serve`) and the token it wants; null when
-   * it failed to start or `@neoworks/harness` is not installed.
+   * The neo suite daemon the Assistant's agent runs in: its loopback URL and token, started
+   * with `suite up` when it wasn't running. Null when there is no `suite` to start it with.
    */
-  harnessEndpoint(): Promise<{ url: string; token: string } | null>;
+  daemonAddress(): Promise<{ url: string; token: string } | null>;
   pickFiles(): Promise<string[]>;
   pickDirectory(): Promise<string | null>;
   /**

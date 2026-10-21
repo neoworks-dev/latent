@@ -4,7 +4,7 @@
 //
 //   node apps/desktop/scripts/screenshot.ts [--out /tmp/latent-ui.png] [--engine mock|real]
 //                                           [--photo /path/to/raw]
-//   [--flow slider|panels|curve|mixer|masks|generative|enhance|relight|planes|crop|zoom|pan|merge|catalog|library]
+//   [--flow slider|panels|curve|mixer|masks|generative|enhance|relight|planes|crop|zoom|pan|merge|catalog|library|assistant]
 //                                           [--dir <import directory>]
 //                                           [--display vnc|native] [--hold]
 //
@@ -33,6 +33,11 @@
 // `--flow presets` drives the Presets pane: a shipped group unfolded, a preset applied, and
 // the panel column and the History pane checked afterwards — a preset is one whole-stack
 // write, so twelve sliders move in one undo step.
+//
+// `--flow assistant` asks the Assistant about the whole photo in the neo daemon that
+// `SUITE_SOCKET` points at (start one with its own socket and data dir; never the user's).
+// It writes the daemon's question before the agent's first edit to `-approval.png`, allows it
+// for the session, and waits for the turn's summary to name the exposure it raised.
 //
 // `--flow history` branches the History pane: a preset applied and undone, another applied
 // in its place, the graph shot with the first one on a lane of its own (`-branch.png`),
@@ -125,6 +130,7 @@ const flowOutputs: Record<string, string> = {
   planes: "/tmp/latent-planes.png",
   zoom: "/tmp/latent-zoom.png",
   presets: "/tmp/latent-presets.png",
+  assistant: "/tmp/latent-assistant.png",
 };
 const defaultOutput = flowOutputs[flow] ?? "/tmp/latent-ui.png";
 const outputPath = argument("--out", defaultOutput);
@@ -2106,6 +2112,51 @@ if (flow === "catalog") {
   await window.keyboard.press("Control+z");
   await window.waitForFunction(readoutIs, { op: "contrast", text: "0" }, { timeout: 10_000 });
   console.log("[shot] undo took the revert, then the whole preset, back off");
+} else if (flow === "assistant") {
+  await window.waitForSelector('[data-rail-mode="assistant"]', { timeout: 30_000 });
+  await window.locator('[data-rail-mode="assistant"]').click();
+  await window.waitForSelector('[data-pane="assistant"][data-status="ready"]', { timeout: 60_000 });
+  console.log("[shot] Assistant connected to the neo daemon");
+  await window.getByRole("button", { name: "Ask about the whole photo" }).click();
+  await window.waitForSelector("[data-assistant-chat]", { timeout: 10_000 });
+  // The photo's session is started when the chat opens; its harness picker fills from it.
+  await window.waitForFunction(
+    () => (document.querySelector("[data-assistant-settings]")?.textContent ?? "").trim() !== "",
+    null,
+    { timeout: 30_000 },
+  );
+  await window.locator("[data-assistant-input]").fill("Raise the exposure by 0.3, nothing else.");
+  await window.locator("[data-assistant-input]").press("Enter");
+  console.log("[shot] sent; waiting for the daemon to ask before the first edit");
+
+  // A new session starts in `ask`: the daemon asks before an edit Latent can undo.
+  await window
+    .waitForSelector("[data-assistant-approval]", { timeout: 180_000 })
+    .catch(async (error: unknown) => {
+      await capture(outputPath.replace(/\.png$/, "-failed.png"));
+      const pane = await window.locator('[data-pane="assistant"]').innerText({ timeout: 2000 });
+      console.log(`[shot] no question; the Assistant pane reads: ${pane.replace(/\n/g, " | ")}`);
+      const chats = await window.locator("[data-assistant-chat]").count();
+      console.log(`[shot] ${chats} chat card(s) on screen`);
+      throw error;
+    });
+  const question = (await window.locator("[data-assistant-approval]").innerText()).trim();
+  console.log(`[shot] asked: ${question.replace(/\n/g, " | ")}`);
+  await capture(outputPath.replace(/\.png$/, "-approval.png"));
+  await window
+    .locator("[data-assistant-approval]")
+    .getByRole("button", { name: "Allow for this session" })
+    .click();
+
+  await window.waitForSelector("[data-assistant-summary]", { timeout: 240_000 });
+  await window.waitForSelector('[data-assistant-chat][data-running="false"]', {
+    timeout: 240_000,
+  });
+  const summary = await window.locator("[data-assistant-summary]").last().innerText();
+  console.log(`[shot] turn summary: ${summary.replace(/\n/g, " | ")}`);
+  if (!/exposure/i.test(summary)) throw new Error("the turn's summary names no exposure change");
+  await capture(outputPath);
+  console.log(`[shot] wrote ${outputPath}`);
 } else if (flow === "history") {
   await window.waitForSelector('[data-pane="presets"]', { timeout: 30_000 });
   await window.waitForSelector('[data-pane="history"] [data-history-step]', { timeout: 30_000 });

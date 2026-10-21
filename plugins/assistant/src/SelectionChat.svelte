@@ -6,7 +6,6 @@
   import type { OverlayMap, OverlayPointer } from "@latent/contracts";
   import { kernelContext } from "@latent/contracts";
   import { Button, LoadingSpinner, Select, type IconComponent } from "@neoworks-dev/ui";
-  import type { Effort, HarnessId } from "@neoworks/harness/client";
   import ArrowUpIcon from "phosphor-svelte/lib/ArrowUpIcon";
   import OpenAiLogoIcon from "phosphor-svelte/lib/OpenAiLogoIcon";
   import PaperclipIcon from "phosphor-svelte/lib/PaperclipIcon";
@@ -19,8 +18,6 @@
     chatPosition,
     chatWidth,
     dockedPosition,
-    EFFORT_LABELS,
-    HARNESS_LABELS,
     placedPosition,
     transcriptHeight,
     type Box,
@@ -31,7 +28,6 @@
   import Markdown from "./Markdown.svelte";
   import ToolCall from "./ToolCall.svelte";
   import TurnSummary from "./TurnSummary.svelte";
-  import PiIcon from "./icons/PiIcon.svelte";
   import { MAX_REFERENCES } from "./references";
 
   const { paneId: _paneId }: { paneId: string } = $props();
@@ -39,10 +35,10 @@
   const assistant = ctx.assistant;
   const viewer = ctx.viewer;
 
-  const HARNESS_ICONS: Record<HarnessId, IconComponent> = {
+  // neo has no logo of its own yet.
+  const HARNESS_ICONS: Partial<Record<string, IconComponent>> = {
     claude: ClaudeIcon,
     codex: OpenAiLogoIcon,
-    pi: PiIcon,
   };
 
   let viewerWidth = $state(0);
@@ -123,25 +119,25 @@
 
   const harnessOptions = $derived(
     assistant.harnesses.map((harness) => ({
-      value: harness.id,
-      label: HARNESS_LABELS[harness.id],
-      icon: HARNESS_ICONS[harness.id],
+      value: harness.name,
+      label: harness.title,
+      icon: HARNESS_ICONS[harness.name],
     })),
   );
+  // What the session's harness offers, as the daemon lists it; empty until the session has one.
+  const model = $derived(assistant.option("model"));
+  const effort = $derived(assistant.option("thought_level"));
   const modelOptions = $derived([
     { value: "", label: "Default model" },
-    ...(assistant.models[assistant.settings.harness] ?? []).map((model) => ({
-      value: model.id,
-      label: model.name,
-      description: model.description,
+    ...(model?.values ?? []).map((value) => ({
+      value: value.value,
+      label: value.name,
+      description: value.description,
     })),
   ]);
   const effortOptions = $derived([
     { value: "", label: "Default effort" },
-    ...(
-      assistant.harnesses.find((harness) => harness.id === assistant.settings.harness)?.efforts ??
-      []
-    ).map((effort) => ({ value: effort, label: EFFORT_LABELS[effort] })),
+    ...(effort?.values ?? []).map((value) => ({ value: value.value, label: value.name })),
   ]);
 
   function corners(box: Box, map: OverlayMap): { x: number; y: number }[] {
@@ -452,11 +448,14 @@
             class="mx-3 mt-3 flex items-center gap-2 rounded-md bg-hover px-2 py-1"
             data-assistant-approval
           >
-            <span class="min-w-0 flex-1 truncate">Allow {assistant.pending.title}?</span>
-            <Button size="sm" onclick={() => assistant.pending?.decide(true)}>Allow</Button>
-            <Button size="sm" variant="ghost" onclick={() => assistant.pending?.decide(false)}
-              >Reject</Button
-            >
+            <span class="min-w-0 flex-1 truncate">{assistant.pending.title}</span>
+            {#each assistant.pending.options as option (option.id)}
+              <Button
+                size="sm"
+                variant={option.kind.startsWith("allow") ? "surface" : "ghost"}
+                onclick={() => void assistant.decide(option.id)}>{option.name}</Button
+              >
+            {/each}
           </div>
         {/if}
 
@@ -518,14 +517,14 @@
             <Select
               size="sm"
               variant="ghost"
-              value={assistant.settings.harness}
+              value={assistant.harness?.name ?? ""}
               options={harnessOptions}
-              onChange={(value) => void assistant.setHarness(String(value) as HarnessId)}
+              onChange={(value) => void assistant.setHarness(String(value))}
             />
             <Select
               size="sm"
               variant="ghost"
-              value={assistant.settings.model}
+              value={model?.current ?? ""}
               options={modelOptions}
               filter={searchOptions}
               onChange={(value) => void assistant.setModel(String(value))}
@@ -533,9 +532,9 @@
             <Select
               size="sm"
               variant="ghost"
-              value={assistant.settings.effort}
+              value={effort?.current ?? ""}
               options={effortOptions}
-              onChange={(value) => void assistant.setEffort(String(value) as Effort | "")}
+              onChange={(value) => void assistant.setEffort(String(value))}
             />
           </div>
           {#if assistant.costUsd !== null}

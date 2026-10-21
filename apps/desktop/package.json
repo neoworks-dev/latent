@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@latent/protocol": "workspace:*",
-    "@neoworks/harness": "link:@neoworks/harness"
+    "@neoworks-dev/neo-sdk": "link:@neoworks-dev/neo-sdk"
   },
   "devDependencies": {
     "electron": "^43.4.1",

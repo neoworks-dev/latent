@@ -23,7 +23,7 @@
     "@latent/protocol": "workspace:*",
     "@neoworks-dev/ui": "link:@neoworks-dev/ui",
     "@neoworks/extension-system": "link:@neoworks/extension-system",
-    "@neoworks/harness": "link:@neoworks/harness",
+    "@neoworks-dev/neo-sdk": "link:@neoworks-dev/neo-sdk",
     "marked": "^18.0.14",
     "phosphor-svelte": "^3.1.0"
   },

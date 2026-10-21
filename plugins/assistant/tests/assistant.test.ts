@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { HistoryStep, OpDefinition } from "@latent/protocol";
-import type { SessionUpdate } from "@neoworks/harness/client";
 import {
   agentJobLabel,
-  applyUpdate,
-  asksFirst,
+  applyEvent,
   boxFromDrag,
   buildPrompt,
   changeRows,
@@ -16,13 +14,11 @@ import {
   latentToolName,
   loadConversation,
   loadPlacement,
-  loadSettings,
   netChangeRows,
   placedPosition,
   PLACEMENT_KEY,
   saveConversation,
-  saveSettings,
-  SETTINGS_KEY,
+  type SessionEvent,
   toolInput,
   toolLabel,
   type TranscriptItem,
@@ -53,53 +49,27 @@ describe("selection", () => {
   });
 });
 
-describe("approvals", () => {
-  test("finds the Latent tool however the harness titles the call", () => {
+describe("tool names", () => {
+  test("finds the Latent tool however the agent titles the call", () => {
     expect(latentToolName("mcp__latent__run_python")).toBe("run_python");
     expect(latentToolName("latent.export")).toBe("export");
-    expect(latentToolName("export (latent)")).toBe("export");
+    expect(latentToolName("latent.undo")).toBe("undo");
     expect(latentToolName("Bash")).toBeNull();
-  });
-
-  test("writes of files and new photos ask; reads and undoable edits do not", () => {
-    expect(asksFirst("mcp__latent__run_python")).toBe(false);
-    expect(asksFirst("mcp__latent__render_preview")).toBe(false);
-    expect(asksFirst("mcp__latent__merge_preview")).toBe(false);
-    expect(asksFirst("mcp__latent__export")).toBe(true);
-    expect(asksFirst("mcp__latent__merge_hdr")).toBe(true);
-    expect(asksFirst("something else")).toBe(true);
-  });
-});
-
-describe("settings", () => {
-  test("round-trip through storage, with defaults for what is missing", () => {
-    const values = new Map<string, string>();
-    const storage = {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => void values.set(key, value),
-    };
-    expect(loadSettings(storage)).toEqual({ harness: "claude", model: "", effort: "" });
-    saveSettings(storage, { harness: "pi", model: "openai-codex/gpt-6-luna", effort: "low" });
-    expect(loadSettings(storage)).toEqual({
-      harness: "pi",
-      model: "openai-codex/gpt-6-luna",
-      effort: "low",
-    });
-    values.set(SETTINGS_KEY, "{not json");
-    expect(loadSettings(storage).harness).toBe("claude");
   });
 });
 
 describe("transcript", () => {
-  const chunk = (text: string): SessionUpdate => ({
-    sessionUpdate: "agent_message_chunk",
-    content: { type: "text", text },
+  const chunk = (text: string): SessionEvent => ({
+    type: "agent_message_chunk",
+    messageId: "m1",
+    text,
   });
+  const noImages = (): undefined => undefined;
 
   test("text chunks join into one reply per turn", () => {
     let items: TranscriptItem[] = [{ kind: "user", text: "darker" }];
-    items = applyUpdate(items, chunk("Done, "));
-    items = applyUpdate(items, chunk("the dragon is darker."));
+    items = applyEvent(items, chunk("Done, "), noImages);
+    items = applyEvent(items, chunk("the dragon is darker."), noImages);
     expect(items).toEqual([
       { kind: "user", text: "darker" },
       { kind: "assistant", text: "Done, the dragon is darker." },
@@ -108,47 +78,62 @@ describe("transcript", () => {
 
   test("tool calls show up and settle", () => {
     let items: TranscriptItem[] = [];
-    items = applyUpdate(items, {
-      sessionUpdate: "tool_call",
-      toolCallId: "t1",
-      title: "mcp__latent__run_python",
-    });
-    items = applyUpdate(items, {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "t1",
-      status: "completed",
-    });
-    expect(items).toEqual([
-      { kind: "tool", id: "t1", title: "mcp__latent__run_python", status: "done" },
-    ]);
+    items = applyEvent(
+      items,
+      {
+        type: "tool_call",
+        toolCallId: "t1",
+        title: "latent.get_stack",
+        kind: "other",
+        status: "pending",
+      },
+      noImages,
+    );
+    items = applyEvent(
+      items,
+      { type: "tool_call_update", toolCallId: "t1", status: "completed" },
+      noImages,
+    );
+    expect(items).toEqual([{ kind: "tool", id: "t1", title: "latent.get_stack", status: "done" }]);
   });
 
   test("a tool keeps what it was given and what it answered", () => {
     let items: TranscriptItem[] = [];
-    items = applyUpdate(items, {
-      sessionUpdate: "tool_call",
-      toolCallId: "t1",
-      title: "mcp__latent__render_preview",
-      rawInput: { max_size: 512 },
-    });
-    items = applyUpdate(items, {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "t1",
-      status: "failed",
-      content: [
-        { type: "content", content: { type: "text", text: "no photo open" } },
-        { type: "content", content: { type: "image", data: "AAAA", mimeType: "image/jpeg" } },
-      ],
-    });
+    // neo calls an app's tool through tools_call: the chat shows the tool's own arguments.
+    items = applyEvent(
+      items,
+      {
+        type: "tool_call",
+        toolCallId: "t1",
+        title: "latent.render_preview",
+        kind: "other",
+        status: "pending",
+        rawInput: { name: "latent.render_preview", args: { max_size: 512 } },
+      },
+      noImages,
+    );
+    items = applyEvent(
+      items,
+      {
+        type: "tool_call_update",
+        toolCallId: "t1",
+        status: "failed",
+        content: [
+          { type: "text", text: "no photo open" },
+          { type: "image", src: "asset://img-0123456789ab", mimeType: "image/jpeg" },
+        ],
+      },
+      (src) => `http://daemon/assets/${src.slice("asset://".length)}`,
+    );
     expect(items).toEqual([
       {
         kind: "tool",
         id: "t1",
-        title: "mcp__latent__render_preview",
+        title: "latent.render_preview",
         status: "failed",
         input: { max_size: 512 },
         output: "no photo open",
-        image: "data:image/jpeg;base64,AAAA",
+        image: "http://daemon/assets/img-0123456789ab",
       },
     ]);
   });
@@ -372,17 +357,17 @@ describe("conversations", () => {
     const storage = memory();
     saveConversation(storage, 12, {
       sessionId: "s1",
-      harness: "claude",
+      seq: 40,
       costUsd: 0.1,
       items: [
         { kind: "user", text: "warmer", images: ["data:image/png;base64,AA"] },
         { kind: "tool", id: "t1", title: "render_preview", status: "done", image: "data:x" },
       ],
     });
-    saveConversation(storage, 3, { sessionId: "s2", harness: "pi", costUsd: null, items: [] });
+    saveConversation(storage, 3, { sessionId: "s2", seq: 0, costUsd: null, items: [] });
     expect(loadConversation(storage, 12)).toEqual({
       sessionId: "s1",
-      harness: "claude",
+      seq: 40,
       costUsd: 0.1,
       items: [
         { kind: "user", text: "warmer" },
@@ -399,7 +384,7 @@ describe("conversations", () => {
     for (let photoId = 1; photoId <= 25; photoId++) {
       saveConversation(storage, photoId, {
         sessionId: `s${photoId}`,
-        harness: "claude",
+        seq: 0,
         costUsd: null,
         items: [],
       });

@@ -1,6 +1,5 @@
-// Pure assistant logic: the selection box, what the agent is told, which of its tool calls
-// need the user, and how the harness's event stream becomes a chat transcript. No engine,
-// no sidecar, no DOM.
+// Pure assistant logic: the selection box, what the agent is told, and how the daemon's session
+// events become a chat transcript. No engine, no daemon connection, no DOM.
 // Before @latent/contracts on purpose: this is the first file tsc checks, and when the
 // contracts load before the kernel does, their `Context` augmentation (engine, panes,
 // viewer, …) does not take and index.ts fails to typecheck.
@@ -15,7 +14,14 @@ import type {
   OpDefinition,
   OpParamSpec,
 } from "@latent/protocol";
-import type { Effort, HarnessId, SessionUpdate } from "@neoworks/harness/client";
+import type { Client, SubscribeOptions } from "@neoworks-dev/neo-sdk";
+
+/** One event of a daemon session (the protocol's SessionEvent, which the SDK doesn't re-export). */
+export type SessionEvent = Parameters<SubscribeOptions["onEvent"]>[0];
+export type PermissionRequest = Extract<SessionEvent, { type: "permission_request" }>;
+/** One harness the session can run on, and the models, efforts and modes it offers. */
+export type HarnessSettings = Awaited<ReturnType<Client["sessionSettings"]>>["harnesses"][number];
+export type ConfigOption = HarnessSettings["options"][number];
 
 /** `[x0, y0, x1, y1]`, 0..1 over the uncropped photo — the space masks are stored in. */
 export type Box = [number, number, number, number];
@@ -25,12 +31,6 @@ export type Target = Box | "photo";
 
 /** The rail mode the assistant's column lives on. */
 export const ASSISTANT_MODE = "assistant";
-
-export const HARNESS_LABELS: Record<HarnessId, string> = {
-  claude: "Claude Code",
-  codex: "Codex",
-  pi: "pi",
-};
 
 /** A drag shorter than this, as a fraction of the photo, is a click, not a selection. */
 const MINIMUM_BOX = 0.01;
@@ -47,67 +47,19 @@ export function boxFromDrag(start: Point, end: Point): Box | null {
   return box;
 }
 
-export interface AssistantSettings {
-  harness: HarnessId;
-  /** Empty for the harness's own default. */
-  model: string;
-  /** Empty for the harness's own default. */
-  effort: Effort | "";
-}
-
-export const SETTINGS_KEY = "latent.assistant.v1";
-
-const DEFAULT_SETTINGS: AssistantSettings = { harness: "claude", model: "", effort: "" };
-
-export function loadSettings(storage: Pick<Storage, "getItem">): AssistantSettings {
-  const stored = storage.getItem(SETTINGS_KEY);
-  if (!stored) return DEFAULT_SETTINGS;
-  try {
-    const parsed: unknown = JSON.parse(stored);
-    if (typeof parsed !== "object" || parsed === null) return DEFAULT_SETTINGS;
-    // Written by this build or an older one; each field is kept only if it still makes sense.
-    const entry = parsed as Partial<Record<keyof AssistantSettings, unknown>>;
-    return {
-      harness: isHarness(entry.harness) ? entry.harness : DEFAULT_SETTINGS.harness,
-      model: typeof entry.model === "string" ? entry.model : DEFAULT_SETTINGS.model,
-      effort: isEffort(entry.effort) ? entry.effort : DEFAULT_SETTINGS.effort,
-    };
-  } catch {
-    return DEFAULT_SETTINGS;
-  }
-}
-
-function isHarness(value: unknown): value is HarnessId {
-  return typeof value === "string" && Object.hasOwn(HARNESS_LABELS, value);
-}
-
-/** Every `Effort` the harness accepts, labelled for the picker. */
-export const EFFORT_LABELS: Record<Effort, string> = {
-  low: "Low",
-  medium: "Medium",
-  high: "High",
-  xhigh: "Extra high",
-  max: "Max",
-  ultracode: "Ultracode",
-};
-
-function isEffort(value: unknown): value is Effort | "" {
-  return typeof value === "string" && (value === "" || Object.hasOwn(EFFORT_LABELS, value));
-}
-
-export function saveSettings(storage: Pick<Storage, "setItem">, settings: AssistantSettings): void {
-  storage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-}
-
-/** One photo's conversation: the harness session to resume and what the chat showed. */
+/**
+ * One photo's conversation: its daemon session, the last event the chat has seen of it, and what
+ * the chat showed (with the turn summaries and change rows the daemon doesn't know about).
+ */
 export interface Conversation {
   sessionId: string;
-  harness: HarnessId;
+  seq: number;
   items: TranscriptItem[];
   costUsd: number | null;
 }
 
-export const CONVERSATIONS_KEY = "latent.assistant.conversations.v1";
+// v1 held sidecar sessions, which the daemon can't resume.
+export const CONVERSATIONS_KEY = "latent.assistant.conversations.v2";
 
 /** localStorage holds a few MB: the most recent photos only, and no pictures. */
 const MAX_CONVERSATIONS = 20;
@@ -165,26 +117,6 @@ function forStorage(conversation: Conversation): Conversation {
   return { ...conversation, items };
 }
 
-/**
- * Replaces the harness's own system prompt entirely: this agent edits one photo through
- * Latent's MCP server and has no shell and no files, so a coding agent's instructions
- * would only cost tokens and mislead it.
- */
-export const SYSTEM_PROMPT = `You edit a photo in Latent, a raw photo editor, through its MCP tools. The user says what to change, either in a region they selected or across the whole photo.
-
-- The edits are an ordered op-stack. Read it with get_stack. Change it only with run_python, against the \`latent\` module. Every run_python call carries an \`explanation\`: one plain sentence the user reads instead of your code, saying what the script does and why. Look at the result with render_preview; pass mask=["<op id>"] to see a layer's mask.
-- A <selection> with a box is a region in image space: [x0, y0, x1, y1], 0..1 over the uncropped photo, the space masks use. whole_photo="true" means the request is about the entire photo.
-- A whole-photo change goes on the stack directly: \`latent.photo.stack.add("vibrance", value=20)\`, or the develop settings: \`latent.photo.develop.exposure = 0.3\`.
-- A local change is one layer: \`layer = latent.photo.stack.group()\`, a mask on it, adjustments inside it. Mask the selected thing with \`cid = layer.mask.add("objects", box=[x0, y0, x1, y1])\` then \`latent.photo.masks.detect(layer.id, cid)\`, or name it: \`layer.mask.add("text", prompt="dragon")\` and detect. Then add adjustments: \`layer.add("exposure", value=-0.6)\`. Op names and ranges follow Lightroom: exposure, contrast, highlights, shadows, whites, blacks, temperature, tint, vibrance, saturation, texture, clarity, dehaze.
-- Adding, replacing or removing content is generative: generative_fill (repaint from a prompt) and generative_remove (erase). Call generative_status first; if ComfyUI is not running, say so instead of trying. For a named thing pass select="the cat". For the selected box, make the op yourself with run_python — \`op = latent.photo.stack.add("generative_fill", prompt="...", seed=0, model="")\` (or "remove" without a prompt), \`cid = op.mask.add("objects", box=[...])\`, \`latent.photo.masks.detect(op.id, cid)\` — once the component is ready, call the tool with op_id.
-- Mask detection, generative fill and remove, and depth estimates run as background jobs. Never poll for them. Once you have started one, end your turn with one short sentence saying what you are waiting for. When every job has finished you get a message <jobs_finished>…</jobs_finished> saying how each went; carry on from there.
-- Images attached after the selection are references from the user (a look to match, an object to add), not the photo being edited.
-- Every write is an undo step the user sees. Keep one request in one layer, and adjust it rather than stacking new ones.
-- Do not export, merge, or touch other photos unless asked.
-- For tone — exposure, contrast, clipping, "too dark", "blown out" — read get_histogram before and after: its zones map onto the blacks, shadows, exposure, highlights and whites ops.
-- render_preview takes region=[x0, y0, x1, y1] in the selection's image space and renders it from the full-resolution photo. Zoom in to judge detail, noise or an edge, and to compare a part of the photo side by side with a reference image.
-- Check the result with render_preview before you answer. Answer in one or two short sentences.`;
-
 const JOB_LABELS: Partial<Record<JobProgressParams["kind"], string>> = {
   mask: "mask detection",
   generative: "generative run",
@@ -241,11 +173,12 @@ const TOOL_LABELS: Record<string, string> = {
   merge_panorama: "Panorama merge",
   merge_star_trail: "Star trail merge",
   merge_preview: "Merge preview",
+  undo: "Undid a step",
 };
 
 /**
  * What a tool row is called: the agent's own explanation of a script, else the Latent
- * tool's label, else the harness's title.
+ * tool's label, else the title the agent gave the call.
  */
 export function toolLabel(title: string, input?: unknown): string {
   const name = latentToolName(title);
@@ -261,13 +194,9 @@ export function toolLabel(title: string, input?: unknown): string {
   return TOOL_LABELS[name] ?? title;
 }
 
-/** They write files or new photos; everything else is a read or an undoable edit. */
-const ASKS_FIRST = new Set(["export", "merge_hdr", "merge_panorama", "merge_star_trail"]);
-
 /**
- * The Latent tool a permission request is about. Harnesses title an MCP call differently —
- * `mcp__latent__export`, `latent.export`, `export (latent)` — so look for the name as a
- * whole token.
+ * The Latent tool a call is about. Agents title an MCP call differently — `latent.export` for
+ * neo, `mcp__latent__export` for a guest — so look for the name as a whole token.
  */
 export function latentToolName(title: string): string | null {
   for (const token of title.split(/[^a-z0-9_]+/i)) {
@@ -275,13 +204,6 @@ export function latentToolName(title: string): string | null {
     if (Object.hasOwn(TOOL_LABELS, name)) return name;
   }
   return null;
-}
-
-/** Whether the user is asked before this call runs. Unknown tools always ask. */
-export function asksFirst(title: string): boolean {
-  const name = latentToolName(title);
-  if (name === null) return true;
-  return ASKS_FIRST.has(name);
 }
 
 export interface ToolItem {
@@ -310,53 +232,60 @@ export type TranscriptItem =
    */
   | { kind: "summary"; index: number; steps: HistoryStep[]; undone: boolean };
 
-type ToolCallContent = NonNullable<
-  Extract<SessionUpdate, { sessionUpdate: "tool_call_update" }>["content"]
->;
+type ToolCallUpdate = Extract<SessionEvent, { type: "tool_call_update" }>;
 
-/** The text and the last image of a tool's answer. */
-function toolOutput(content: ToolCallContent): Pick<ToolItem, "output" | "image"> {
+/** The text and the last image of a tool's answer; `imageUrl` turns an image's src into a URL. */
+function toolOutput(
+  content: NonNullable<ToolCallUpdate["content"]>,
+  imageUrl: (src: string) => string | undefined,
+): Pick<ToolItem, "output" | "image"> {
   const texts: string[] = [];
   let image: string | undefined;
   for (const entry of content) {
-    if (entry.type !== "content") continue;
-    const block = entry.content;
-    if (block.type === "text") texts.push(block.text);
-    if (block.type === "image") image = `data:${block.mimeType};base64,${block.data}`;
+    if (entry.type === "text") texts.push(entry.text);
+    if (entry.type === "image") image = imageUrl(entry.src);
   }
   return { output: texts.length > 0 ? texts.join("\n") : undefined, image };
 }
 
-/** One `session/update` folded into the transcript; text chunks join the reply they belong to. */
-export function applyUpdate(items: TranscriptItem[], update: SessionUpdate): TranscriptItem[] {
-  if (update.sessionUpdate === "agent_message_chunk") {
-    if (update.content.type !== "text") return items;
+/** neo calls an app's tool through `tools_call {name, args}`: what the chat shows is `args`. */
+function callInput(rawInput: unknown): unknown {
+  if (typeof rawInput !== "object" || rawInput === null) return rawInput;
+  if (!("name" in rawInput) || !("args" in rawInput)) return rawInput;
+  return rawInput.args;
+}
+
+/** One session event folded into the transcript; text chunks join the reply they belong to. */
+export function applyEvent(
+  items: TranscriptItem[],
+  event: SessionEvent,
+  imageUrl: (src: string) => string | undefined,
+): TranscriptItem[] {
+  if (event.type === "agent_message_chunk") {
     const last = items.at(-1);
     if (last?.kind === "assistant") {
-      return [...items.slice(0, -1), { kind: "assistant", text: last.text + update.content.text }];
+      return [...items.slice(0, -1), { kind: "assistant", text: last.text + event.text }];
     }
-    return [...items, { kind: "assistant", text: update.content.text }];
+    return [...items, { kind: "assistant", text: event.text }];
   }
-  if (update.sessionUpdate === "tool_call") {
-    return [
-      ...items,
-      {
-        kind: "tool",
-        id: update.toolCallId,
-        title: update.title,
-        status: "running",
-        input: update.rawInput,
-      },
-    ];
+  if (event.type === "tool_call") {
+    const tool: ToolItem = {
+      kind: "tool",
+      id: event.toolCallId,
+      title: event.title,
+      status: "running",
+      input: callInput(event.rawInput),
+    };
+    return [...items, tool];
   }
-  if (update.sessionUpdate !== "tool_call_update") return items;
+  if (event.type !== "tool_call_update") return items;
   return items.map((item) => {
-    if (item.kind !== "tool" || item.id !== update.toolCallId) return item;
-    const next: ToolItem = { ...item, title: update.title ?? item.title };
-    if (update.rawInput !== undefined) next.input = update.rawInput;
-    if (update.content) Object.assign(next, toolOutput(update.content));
-    if (update.status === "completed") next.status = "done";
-    if (update.status === "failed") next.status = "failed";
+    if (item.kind !== "tool" || item.id !== event.toolCallId) return item;
+    const next: ToolItem = { ...item, title: event.title ?? item.title };
+    if (event.rawInput !== undefined) next.input = callInput(event.rawInput);
+    if (event.content) Object.assign(next, toolOutput(event.content, imageUrl));
+    if (event.status === "completed") next.status = "done";
+    if (event.status === "failed") next.status = "failed";
     return next;
   });
 }

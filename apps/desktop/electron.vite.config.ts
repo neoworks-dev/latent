@@ -4,7 +4,11 @@ import { defineConfig } from "electron-vite";
 // electron-vite 5 externalizes dependencies by default.
 export default defineConfig({
   main: {
-    build: { rollupOptions: { input: { index: "src/main/index.ts" } } },
+    build: {
+      rollupOptions: { input: { index: "src/main/index.ts" } },
+      // Linked TypeScript source, not built JavaScript: bundled, so Node never loads a .ts file.
+      externalizeDeps: { exclude: ["@neoworks-dev/neo-sdk"] },
+    },
   },
   preload: {
     build: {
