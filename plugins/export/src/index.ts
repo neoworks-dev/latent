@@ -2,6 +2,7 @@
 // edit state — it fills in `export.run`'s params, starts the job and watches its progress.
 import type { Context, Plugin } from "@neoworks/extension-system";
 import ExportPane from "./ExportPane.svelte";
+import HeaderExport from "./HeaderExport.svelte";
 import { ExportState } from "./state.svelte";
 
 declare module "@neoworks/extension-system" {
@@ -27,6 +28,16 @@ export const exportPlugin: Plugin.Object<void> = {
         order: 10,
         mode: "export",
         component: ExportPane,
+      }),
+    );
+    ctx.effect(() =>
+      ctx.panes.register({
+        id: "header-export",
+        title: "Export",
+        region: "header",
+        align: "end",
+        order: 10,
+        component: HeaderExport,
       }),
     );
   },

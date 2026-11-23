@@ -59,47 +59,26 @@ describe("chrome", () => {
     expect(showsRegion("none", "right")).toBe(false);
     expect(showsRegion("none", "center")).toBe(true);
   });
+
+  test("the header stays with the tools and goes with Shift+Tab", () => {
+    expect(showsRegion("all", "header")).toBe(true);
+    expect(showsRegion("sides", "header")).toBe(true);
+    expect(showsRegion("none", "header")).toBe(false);
+  });
 });
 
 describe("the viewer's safe area", () => {
-  test("is the window minus the cards that float over it", () => {
-    const { gutter, left, right, rail } = PANE_LAYOUT;
-    expect(viewerSafeArea("all", true, 96)).toEqual({
-      left: gutter * 2 + left,
-      top: gutter,
-      right: gutter * 3 + right + rail,
-      bottom: gutter * 2 + 96,
-    });
+  test("is the whole viewer: the panels sit outside it", () => {
+    const none = { left: 0, top: 0, right: 0, bottom: 0 };
+    expect(viewerSafeArea("all")).toEqual(none);
+    expect(viewerSafeArea("sides")).toEqual(none);
+    expect(viewerSafeArea("none")).toEqual(none);
   });
 
-  test("a hidden card leaves only the gutter behind", () => {
-    const { gutter, right, rail } = PANE_LAYOUT;
-    // Tab: the left column and the filmstrip go, the right one stays.
-    expect(viewerSafeArea("sides", true, 96)).toEqual({
-      left: gutter,
-      top: gutter,
-      right: gutter * 3 + right + rail,
-      bottom: gutter,
-    });
-    // Shift+Tab: nothing floats, so the fitted photo has the whole window but the gutter.
-    expect(viewerSafeArea("none", true, 96)).toEqual({
-      left: gutter,
-      top: gutter,
-      right: gutter,
-      bottom: gutter,
-    });
-    // No pane registered for the left region at all.
-    expect(viewerSafeArea("all", false, 96).left).toBe(gutter);
-    // A footer that has not been measured yet is not a gap to keep clear.
-    expect(viewerSafeArea("all", true, 0).bottom).toBe(gutter);
-  });
-
-  test("an open rail flyout takes its own width off the right", () => {
-    const { gutter, right, rail, flyout } = PANE_LAYOUT;
-    expect(viewerSafeArea("all", true, 96, true).right).toBe(
-      gutter * 3 + right + rail + flyout + gutter,
-    );
-    // The flyout hangs off the rail, so hiding the rail hides it too.
-    expect(viewerSafeArea("none", true, 96, true).right).toBe(gutter);
+  test("an open rail flyout takes its own width and margins off the right", () => {
+    const { gutter, flyout } = PANE_LAYOUT;
+    expect(viewerSafeArea("all", true).right).toBe(flyout + gutter * 2);
+    // The flyout is part of the rail's region, so hiding the rail hides it too.
+    expect(viewerSafeArea("none", true).right).toBe(0);
   });
 });

@@ -10,10 +10,13 @@ export interface PaneDefinition {
   /**
    * Which shell region the pane belongs to. `rail` is not a column: the rail draws a button
    * for the pane and opens it as a flyout beside itself, which is what a panel needs that
-   * has to stay open while the Edit column is being used — Masks is one.
+   * has to stay open while the Edit column is being used — Masks is one. `header` is the
+   * bar along the top of the window, its panes laid out in `order` within their `align`.
    */
-  region: "center" | "right" | "bottom" | "left" | "rail";
+  region: "center" | "right" | "bottom" | "left" | "rail" | "header";
   order?: number;
+  /** Which third of the header a `header` pane sits in. The middle by default. */
+  align?: "start" | "center" | "end";
   /**
    * Rail mode this pane belongs to — "edit", "info", later "crop", "masks". A pane
    * without one is not mode-specific and shows whatever the rail is on.

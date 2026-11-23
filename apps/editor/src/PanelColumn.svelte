@@ -58,8 +58,9 @@
 
 <aside
   bind:this={column}
-  class="pointer-events-auto min-h-0 overflow-hidden rounded-lg border border-line bg-elevated
-         shadow-lg"
+  class="min-h-0 overflow-hidden border-line bg-elevated"
+  class:border-r={side === "left"}
+  class:border-l={side === "right"}
   data-floating={side}
 >
   <!-- The column scrolls far more often than the window does; the design system's

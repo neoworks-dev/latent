@@ -6,6 +6,8 @@ import type { Context, Plugin } from "@neoworks/extension-system";
 import { catalogShortcut } from "./catalog";
 import Filmstrip from "./Filmstrip.svelte";
 import Grid from "./Grid.svelte";
+import HeaderHistory from "./HeaderHistory.svelte";
+import HeaderSearch from "./HeaderSearch.svelte";
 import Info from "./Info.svelte";
 import JobStatus from "./JobStatus.svelte";
 import StripFilter from "./StripFilter.svelte";
@@ -64,8 +66,29 @@ export const catalogPlugin: Plugin.Object<void> = {
         component: Info,
       }),
     );
-    // Above the strip: search, the quick filters and the sort, so the page can be narrowed
-    // without opening the grid.
+    ctx.effect(() =>
+      ctx.panes.register({
+        id: "header-history",
+        title: "Undo and redo",
+        region: "header",
+        align: "start",
+        order: 10,
+        component: HeaderHistory,
+      }),
+    );
+    // The search box lives in the window's header, where it narrows the filmstrip and the
+    // grid alike.
+    ctx.effect(() =>
+      ctx.panes.register({
+        id: "search",
+        title: "Search",
+        region: "header",
+        order: 0,
+        component: HeaderSearch,
+      }),
+    );
+    // Above the strip: the quick filters and the sort, so the page can be narrowed without
+    // opening the grid.
     ctx.effect(() =>
       ctx.panes.register({
         id: "strip-filter",

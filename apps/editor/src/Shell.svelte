@@ -16,6 +16,7 @@
   import CropIcon from "phosphor-svelte/lib/CropIcon";
   import DropHalfIcon from "phosphor-svelte/lib/DropHalfIcon";
   import SelectionBackgroundIcon from "phosphor-svelte/lib/SelectionBackgroundIcon";
+  import SidebarSimpleIcon from "phosphor-svelte/lib/SidebarSimpleIcon";
   import SlidersHorizontalIcon from "phosphor-svelte/lib/SlidersHorizontalIcon";
   import SparkleIcon from "phosphor-svelte/lib/SparkleIcon";
   import SquaresFourIcon from "phosphor-svelte/lib/SquaresFourIcon";
@@ -95,21 +96,20 @@
     assistant: "Assistant",
   };
 
-  const showsLeft = $derived(left.length > 0 && showsRegion(chrome, "left"));
+  const header = $derived(ctx.panes.list("header"));
+  // The header's toggle for the left column; Tab hides it with the rest of the side panes.
+  let leftOpen = $state(true);
+  const showsLeft = $derived(leftOpen && left.length > 0 && showsRegion(chrome, "left"));
+  const showsHeader = $derived(showsRegion(chrome, "header"));
   const showsRight = $derived(showsRegion(chrome, "right"));
   const showsBottom = $derived(showsRegion(chrome, "bottom"));
 
   function columns(hasLeft: boolean, hasRight: boolean): string {
     const left = hasLeft ? `${PANE_LAYOUT.left}px 1fr` : "1fr";
     if (!hasRight) return left;
-    // The rail sits between the photo and the column it switches, and the column is flush
-    // with the right edge of the window.
-    return `${left} ${PANE_LAYOUT.rail}px ${PANE_LAYOUT.right}px`;
+    // The rail is the outermost track: the column it switches sits between it and the photo.
+    return `${left} ${PANE_LAYOUT.right}px ${PANE_LAYOUT.rail}px`;
   }
-
-  // The footer is as tall as the filmstrip and the status line make it, so the safe area
-  // has to measure it rather than assume a height.
-  let footerHeight = $state(0);
 
   // Both columns are cards: docked in an order the user drags, or floating over the viewer.
   // One layout each — a card belongs to the column it was registered for, and the two are
@@ -201,9 +201,7 @@
       window.removeEventListener("resize", report);
     };
   });
-  const safeArea = $derived(
-    viewerSafeArea(chrome, left.length > 0, footerHeight, flyout !== undefined),
-  );
+  const safeArea = $derived(viewerSafeArea(chrome, flyout !== undefined));
 
   // Published on the pane registry rather than pushed at the viewer: the shell knows the
   // layout, the viewer knows what to do with it, and the two never have to exist at the
@@ -234,27 +232,54 @@
   });
 </script>
 
-<!-- The viewer is the window: the frame fills it edge to edge and every pane floats on
-     top as a card. Zoomed in, the picture runs on behind them, which is the point. The
-     pane layer is a grid so the cards keep their tracks, and it lets pointer events
-     through everywhere it has no card — a wheel over the gap still zooms. -->
+<!-- The columns are attached to the window's edges, the full height of it, the picture sits
+     on the window's background between them, and the footer is attached under the picture
+     only. A card dragged out of a column, and an open rail flyout, float over the picture. -->
 <div
   bind:this={shell}
-  class="relative h-full bg-canvas text-default"
-  style:--viewer-safe-left="{safeArea.left}px"
-  style:--viewer-safe-right="{safeArea.right}px"
+  class="flex h-full flex-col bg-canvas text-default"
   data-chrome={chrome}
   data-mode={mode}
 >
-  <main class="absolute inset-0">
-    {#each center as pane (pane.id)}
+  {#snippet headerPanes(align: "start" | "center" | "end")}
+    {#each header.filter((pane) => (pane.align ?? "center") === align) as pane (pane.id)}
       {@const Pane = pane.component}
       <Pane paneId={pane.id} />
     {/each}
-  </main>
+  {/snippet}
+
+  <!-- The bar along the top. The registered header panes sit in its thirds; the left
+       column's toggle is the shell's own, since it is the shell that hides the column. -->
+  {#if showsHeader}
+    <header
+      class="grid shrink-0 grid-cols-[1fr_minmax(0,2fr)_1fr] items-center gap-2 border-b
+             border-line bg-elevated px-2 py-1"
+      data-floating="header"
+    >
+      <div class="flex items-center gap-1">
+        {#if left.length > 0}
+          <Tooltip text="{leftOpen ? 'Hide' : 'Show'} the left column" placement="bottom">
+            <Button
+              size="sm"
+              variant={leftOpen ? "surface" : "ghost"}
+              icon={SidebarSimpleIcon}
+              onclick={() => (leftOpen = !leftOpen)}
+            />
+          </Tooltip>
+        {/if}
+        {@render headerPanes("start")}
+      </div>
+      <div class="flex min-w-0 items-center justify-center gap-2">
+        {@render headerPanes("center")}
+      </div>
+      <div class="flex items-center justify-end gap-1">
+        {@render headerPanes("end")}
+      </div>
+    </header>
+  {/if}
 
   <div
-    class="pointer-events-none absolute inset-0 grid grid-rows-[1fr_auto] gap-2 p-2"
+    class="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)]"
     style:grid-template-columns={columns(showsLeft, showsRight)}
   >
     {#if showsLeft}
@@ -267,88 +292,71 @@
       />
     {/if}
 
-    <!-- The centre track is the hole the picture shows through: no card, no hit area. -->
-    <div></div>
+    <div class="flex min-h-0 min-w-0 flex-col">
+      <!-- Inset a little from the panels around it, so the picture does not touch them. -->
+      <div class="min-h-0 flex-1 p-2">
+        <div class="relative size-full">
+          <main class="absolute inset-0">
+            {#each center as pane (pane.id)}
+              {@const Pane = pane.component}
+              <Pane paneId={pane.id} />
+            {/each}
+          </main>
+
+          <!-- The open rail pane, hung off the viewer's right edge beside the column. It is not
+           a menu: nothing outside it closes it, because the whole point is to keep a mask
+           selected while its sliders are moved in the Edit column. -->
+          {#if flyout && showsRight}
+            {@const Flyout = flyout.component}
+            {@const Actions = flyout.headerActions}
+            <aside
+              class="absolute top-2 right-2 flex max-h-[80vh] flex-col overflow-hidden rounded-lg
+                 border border-line bg-elevated shadow-lg"
+              style:width="{PANE_LAYOUT.flyout}px"
+              data-floating="flyout"
+              data-rail-flyout={flyout.id}
+            >
+              <div class="flex items-center gap-1 border-b border-line-faint px-3 py-1.5">
+                <span class="min-w-0 flex-1 truncate text-xs font-semibold text-default">
+                  {flyout.title}
+                </span>
+                {#if Actions}
+                  <Actions paneId={flyout.id} />
+                {/if}
+                <Tooltip text="Close {flyout.title}" placement="left">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={XIcon}
+                    onclick={() => ctx.panes.setRailPane(null)}
+                  />
+                </Tooltip>
+              </div>
+              <FloatingScrollbar class="min-h-0 flex-1" axis="vertical">
+                <Flyout paneId={flyout.id} />
+              </FloatingScrollbar>
+            </aside>
+          {/if}
+        </div>
+      </div>
+
+      <!-- Bottom panes stack in `order`: the filmstrip, then the status line. -->
+      {#if showsBottom}
+        <footer
+          class="flex max-h-[45vh] flex-col overflow-hidden border-t border-line bg-elevated"
+          data-floating="bottom"
+        >
+          <FloatingScrollbar class="min-h-0 flex-1" axis="both">
+            {#each bottom as pane (pane.id)}
+              {@const Pane = pane.component}
+              <Pane paneId={pane.id} />
+            {/each}
+          </FloatingScrollbar>
+        </footer>
+      {/if}
+    </div>
 
     {#if showsRight}
-      <!-- Lightroom's right rail, on the inner edge of the column it switches: one icon per
-           mode, and the mode decides which panes the column beside it shows. Under them, the
-           rail panes: those open beside the rail instead of switching the column. -->
-      <div class="pointer-events-none relative self-start">
-        <nav
-          class="pointer-events-auto flex min-h-0 flex-col items-center gap-1 rounded-lg
-                 border border-line bg-elevated py-2 shadow-lg"
-          aria-label="Modes"
-          data-floating="rail"
-        >
-          {#each modes as entry (entry)}
-            {@const Icon = railIcons[entry] ?? SquaresFourIcon}
-            {@const label = railLabels[entry] ?? entry}
-            <span data-rail-mode={entry} data-active={mode === entry}>
-              <Tooltip text={label} placement="left">
-                <Button
-                  size="sm"
-                  variant={mode === entry ? "surface" : "ghost"}
-                  icon={Icon}
-                  onclick={() => ctx.panes.setMode(entry)}
-                />
-              </Tooltip>
-            </span>
-          {/each}
-          {#if railPanes.length > 0}
-            <span class="my-1 h-px w-5 bg-line"></span>
-          {/if}
-          {#each railPanes as pane (pane.id)}
-            {@const Icon = railIcons[pane.id] ?? SquaresFourIcon}
-            {@const open = flyout?.id === pane.id}
-            <span data-rail-pane={pane.id} data-open={open}>
-              <Tooltip text={pane.title} placement="left">
-                <Button
-                  size="sm"
-                  variant={open ? "surface" : "ghost"}
-                  icon={Icon}
-                  onclick={() => ctx.panes.setRailPane(open ? null : pane.id)}
-                />
-              </Tooltip>
-            </span>
-          {/each}
-        </nav>
-
-        <!-- The open rail pane, hung off the rail's left edge over the viewer. It is not a
-             menu: nothing outside it closes it, because the whole point is to keep a mask
-             selected while its sliders are moved in the Edit column. -->
-        {#if flyout}
-          {@const Flyout = flyout.component}
-          {@const Actions = flyout.headerActions}
-          <aside
-            class="pointer-events-auto absolute top-0 right-full mr-2 flex max-h-[80vh] flex-col
-                   overflow-hidden rounded-lg border border-line bg-elevated shadow-lg"
-            style:width="{PANE_LAYOUT.flyout}px"
-            data-floating="flyout"
-            data-rail-flyout={flyout.id}
-          >
-            <div class="flex items-center gap-1 border-b border-line-faint px-3 py-1.5">
-              <span class="min-w-0 flex-1 truncate text-xs font-semibold text-default">
-                {flyout.title}
-              </span>
-              {#if Actions}
-                <Actions paneId={flyout.id} />
-              {/if}
-              <Tooltip text="Close {flyout.title}" placement="left">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  icon={XIcon}
-                  onclick={() => ctx.panes.setRailPane(null)}
-                />
-              </Tooltip>
-            </div>
-            <FloatingScrollbar class="min-h-0 flex-1" axis="vertical">
-              <Flyout paneId={flyout.id} />
-            </FloatingScrollbar>
-          </aside>
-        {/if}
-      </div>
       <PanelColumn
         bind:this={rightColumn}
         side="right"
@@ -356,43 +364,67 @@
         layout={rightLayout}
         {mode}
       />
-    {/if}
 
-    <!-- Bottom panes stack in `order`: the filmstrip, then the status line. -->
-    <!-- Cards dragged out of the column. Loose over the viewer, snapped to each other and
-         to the column, and put back by dropping them on it or by the pin. -->
-    {#each floatingPanes as entry (entry.panel.id)}
-      <div
-        class="pointer-events-auto fixed z-overlay"
-        style:left="{entry.panel.x}px"
-        style:top="{entry.panel.y}px"
-        style:width="{entry.panel.width}px"
+      <!-- Lightroom's right rail, on the outer edge of the window: one icon per mode, and
+           the mode decides which panes the column beside it shows. Under them, the rail
+           panes: those open over the viewer instead of switching the column. -->
+      <nav
+        class="flex min-h-0 flex-col items-center gap-1 border-l border-line bg-elevated py-2"
+        aria-label="Modes"
+        data-floating="rail"
       >
-        <PanelCard
-          pane={entry.pane}
-          layout={entry.layout}
-          floating
-          inactive={entry.pane.mode !== undefined && entry.pane.mode !== mode}
-          docked={entry.docked}
-          midpoints={entry.midpoints}
-        />
-      </div>
-    {/each}
-
-    {#if showsBottom}
-      <footer
-        bind:clientHeight={footerHeight}
-        class="pointer-events-auto col-span-full flex max-h-[45vh] flex-col overflow-hidden
-               rounded-lg border border-line bg-elevated shadow-lg"
-        data-floating="bottom"
-      >
-        <FloatingScrollbar class="min-h-0 flex-1" axis="both">
-          {#each bottom as pane (pane.id)}
-            {@const Pane = pane.component}
-            <Pane paneId={pane.id} />
-          {/each}
-        </FloatingScrollbar>
-      </footer>
+        {#each modes as entry (entry)}
+          {@const Icon = railIcons[entry] ?? SquaresFourIcon}
+          {@const label = railLabels[entry] ?? entry}
+          <span data-rail-mode={entry} data-active={mode === entry}>
+            <Tooltip text={label} placement="left">
+              <Button
+                size="sm"
+                variant={mode === entry ? "surface" : "ghost"}
+                icon={Icon}
+                onclick={() => ctx.panes.setMode(entry)}
+              />
+            </Tooltip>
+          </span>
+        {/each}
+        {#if railPanes.length > 0}
+          <span class="my-1 h-px w-5 bg-line"></span>
+        {/if}
+        {#each railPanes as pane (pane.id)}
+          {@const Icon = railIcons[pane.id] ?? SquaresFourIcon}
+          {@const open = flyout?.id === pane.id}
+          <span data-rail-pane={pane.id} data-open={open}>
+            <Tooltip text={pane.title} placement="left">
+              <Button
+                size="sm"
+                variant={open ? "surface" : "ghost"}
+                icon={Icon}
+                onclick={() => ctx.panes.setRailPane(open ? null : pane.id)}
+              />
+            </Tooltip>
+          </span>
+        {/each}
+      </nav>
     {/if}
   </div>
+
+  <!-- Cards dragged out of the column. Loose over the viewer, snapped to each other and
+       to the column, and put back by dropping them on it or by the pin. -->
+  {#each floatingPanes as entry (entry.panel.id)}
+    <div
+      class="fixed z-overlay"
+      style:left="{entry.panel.x}px"
+      style:top="{entry.panel.y}px"
+      style:width="{entry.panel.width}px"
+    >
+      <PanelCard
+        pane={entry.pane}
+        layout={entry.layout}
+        floating
+        inactive={entry.pane.mode !== undefined && entry.pane.mode !== mode}
+        docked={entry.docked}
+        midpoints={entry.midpoints}
+      />
+    </div>
+  {/each}
 </div>

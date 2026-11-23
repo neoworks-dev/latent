@@ -1,13 +1,10 @@
 <script lang="ts">
-  // The filmstrip's own bar: search, the quick filters and the sort. What the library's
-  // column used to carry, minus the folder tree and the collections — those pick *which*
-  // photos and belong with the grid, these narrow what the strip under them is showing.
-  //
-  // Hand-built search box: the design system has no text field, so it is a bare input in a
-  // token-styled shell, the same one the library uses.
+  // The filmstrip's own bar: the quick filters and the sort. What the library's column used
+  // to carry, minus the folder tree and the collections — those pick *which* photos and
+  // belong with the grid, these narrow what the strip under them is showing. The search box
+  // is in the window's header.
   import { kernelContext } from "@latent/contracts";
   import { Button, Tooltip } from "@neoworks-dev/ui";
-  import MagnifyingGlassIcon from "phosphor-svelte/lib/MagnifyingGlassIcon";
   import SortAscendingIcon from "phosphor-svelte/lib/SortAscendingIcon";
   import SortDescendingIcon from "phosphor-svelte/lib/SortDescendingIcon";
   import SquaresFourIcon from "phosphor-svelte/lib/SquaresFourIcon";
@@ -41,31 +38,10 @@
   </Tooltip>
 
   <div
-    class="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-line bg-input px-2 py-1
-           focus-within:border-line-strong"
+    class="ml-auto flex gap-0.5 rounded-md bg-raised p-0.5"
+    role="group"
+    aria-label="Quick filters"
   >
-    <MagnifyingGlassIcon size={13} class="shrink-0 text-faint" />
-    <input
-      class="min-w-0 flex-1 bg-transparent text-default outline-none placeholder:text-faint"
-      placeholder="Search filename or camera"
-      value={catalog.filter.query ?? ""}
-      oninput={(event) => catalog.setQuery(event.currentTarget.value)}
-      data-catalog-search
-    />
-    {#if catalog.filter.query}
-      <button
-        type="button"
-        class="rounded-sm px-1 text-faint hover:text-default"
-        title="Clear search"
-        data-clear-search
-        onclick={() => catalog.setQuery("")}
-      >
-        ×
-      </button>
-    {/if}
-  </div>
-
-  <div class="flex gap-0.5 rounded-md bg-raised p-0.5" role="group" aria-label="Quick filters">
     {#each quickFilters as entry (entry.label)}
       {@const active = sameFilter(entry.filter, catalog.filter)}
       <button

@@ -387,7 +387,7 @@
           {#if assistant.placement}
             <button
               type="button"
-              class="absolute top-0.5 right-2 rounded-sm p-0.5 text-faint transition-colors hover:text-default"
+              class="absolute top-0.5 right-7 rounded-sm p-0.5 text-faint transition-colors hover:text-default"
               aria-label="Put the chat back by the selection"
               onpointerdown={(event) => event.stopPropagation()}
               onclick={() => assistant.place(null)}
@@ -396,6 +396,17 @@
               <PushPinIcon size={11} weight="bold" />
             </button>
           {/if}
+          <button
+            type="button"
+            class="absolute top-0.5 right-2 rounded-sm p-0.5 text-faint transition-colors hover:text-default"
+            aria-label="Hide the chat (Esc)"
+            title="Hide the chat (Esc)"
+            onpointerdown={(event) => event.stopPropagation()}
+            onclick={() => assistant.hide()}
+            data-assistant-hide
+          >
+            <XIcon size={11} weight="bold" />
+          </button>
         </div>
         <!-- Once there is a conversation the box grows upward to hold it, so replies read
              on the box and not on the photo. -->
